@@ -131,6 +131,44 @@
       }
     ]
   },
+  "qwen36": {
+    "repo": "Qwen/Qwen3.6-35B-A3B",
+    "revision": "995ad96eacd98c81ed38be0c5b274b04031597b0",
+    "template_sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+    "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+    "cases": {
+      "thinking": {
+        "rendered_sha256": "c2ba928ee33190de9d2bbb82fb68dfaed38a4ee345dcf675a3bc27f112f45b05",
+        "token_ids_le_u32_sha256": "11c0c78f89b1093eb12e04a2abda17e909e5a68345789d5e729c073b9429f81b",
+        "token_count": 14
+      },
+      "chat": {
+        "rendered_sha256": "323dbd5987839260d0dd3350d815ab3b5cdffe3c0a33b467c3579fe202e990f7",
+        "token_ids_le_u32_sha256": "f18ef8903baeb128acd6602394502b29c044153de2c4bdde5099f4225500e4b4",
+        "token_count": 16
+      },
+      "history_drop": {
+        "rendered_sha256": "ea0dc42bc76d66bb38fab09250bcf72f63c3bb1ec7098403a77a8c6452add6a5",
+        "token_ids_le_u32_sha256": "7868a53541665707ddc8b72b51a7f30656e3f78da04c019fe49183b147e71dfb",
+        "token_count": 28
+      },
+      "history_preserve": {
+        "rendered_sha256": "6fc054000bc6bedd03a3521bd92c59af85247ad7d3bb2013d97c1a25eea6bdee",
+        "token_ids_le_u32_sha256": "43067b07b0ea1aa4d8d4d3a4cd908c65fbafa62e209be0c84adf383d16959eea",
+        "token_count": 42
+      },
+      "tools": {
+        "rendered_sha256": "acab567a1e900a69b084c0309ef9291ceccaa50ba59b184bd6d3fd0e5b4581a2",
+        "token_ids_le_u32_sha256": "9cbadda4140440b2003fb0224534da4e5100382c91ace043caf6c6cb90595a35",
+        "token_count": 270
+      },
+      "system_tools": {
+        "rendered_sha256": "8a349915a19b289bf855a35301c139bc89a92bd47a8e5eb39f2d3d988ea9f9e5",
+        "token_ids_le_u32_sha256": "dfe660056c7043eda8ff1c751f91df2fae83fe65e1ff3a6b13c1ca5ea9e0973f",
+        "token_count": 272
+      }
+    }
+  },
   "deepseek": {
     "repo": "deepseek-ai/DeepSeek-V4-Flash-0731",
     "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",

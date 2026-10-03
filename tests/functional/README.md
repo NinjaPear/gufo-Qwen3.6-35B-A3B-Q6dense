@@ -32,6 +32,7 @@ once per row/mode below; no full benchmark sweep is needed.
 | Qwen27B Q4_K_XL | `off`, `dflash2` | `--dflash-model` |
 | Qwen27B Q8_K_XL | `off`, `dflash2` | `--dflash-model` |
 | Flash-Next Q4_K_XL | `off`, `mtp` | `--mtp-model` |
+| Qwen3.6 Q6dense | `off`, `mtp` | none (native MTP) |
 | DeepSeek Flash 0731 | `off`, `dspark` | `--dspark-model` |
 
 Keep the sidecar path in the `off` command to test the explicit override.

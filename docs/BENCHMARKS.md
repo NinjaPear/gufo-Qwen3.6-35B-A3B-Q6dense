@@ -6,6 +6,7 @@ results and qualification gaps live in:
 - [DeepSeek V4 Flash](models/deepseek-v4-flash/BENCHMARKS.md)
 - [Qwen3.8 27B](models/qwen3.8-27b/BENCHMARKS.md)
 - [Qwen3.8 Flash-Next](models/qwen3.8-flash-next/BENCHMARKS.md)
+- [Qwen3.6 35B-A3B](models/qwen3.6-35b-a3b/BENCHMARKS.md)
 - [Qwen3-TTS](models/qwen3-tts/BENCHMARKS.md)
 - [Qwen3-ASR](models/qwen3-asr/BENCHMARKS.md)
 - [MiniMax H3](models/minimax-h3/BENCHMARKS.md)

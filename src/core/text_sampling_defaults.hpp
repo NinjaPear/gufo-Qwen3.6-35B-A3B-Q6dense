@@ -8,7 +8,7 @@
 
 namespace gufo::sampling {
 
-enum class TextModelPreset { kUnspecified, kQwen38, kDeepSeekV4Flash };
+enum class TextModelPreset { kUnspecified, kQwen38, kQwen36, kDeepSeekV4Flash };
 
 // Presence is independent of value: an explicit zero must override a preset.
 struct SamplingOverrides {
@@ -35,6 +35,8 @@ inline TextModelPreset TextPreset(const core::ModelConfig& config) {
       (config.num_layers == 64 && config.hidden_size == 5120 &&
        config.vocab_size == 248320))
     return TextModelPreset::kQwen38;
+  if (config.architecture == "qwen35moe")
+    return TextModelPreset::kQwen36;
   return TextModelPreset::kUnspecified;
 }
 
@@ -55,6 +57,16 @@ inline SamplingConfig ResolveTextSampling(TextModelPreset model,
       result.temperature = 0.7F;
       result.top_p = 0.8F;
       result.presence_penalty = 1.5F;
+    }
+  }
+  // Qwen3.6-35B-A3B model card: general thinking and instruct modes both
+  // use presence penalty 1.5.
+  if (model == TextModelPreset::kQwen36) {
+    result.top_k = 20;
+    result.presence_penalty = 1.5F;
+    if (!thinking.value_or(true)) {
+      result.temperature = 0.7F;
+      result.top_p = 0.8F;
     }
   }
   if (supplied.temperature)
