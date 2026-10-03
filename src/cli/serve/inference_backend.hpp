@@ -22,6 +22,10 @@ namespace gufo::models::deepseek_v4_flash {
 class Model;
 }
 
+namespace gufo::models::qwen36_35b_a3b {
+class Model;
+}
+
 namespace gufo::models::qwen38_flash_next {
 class Model;
 }
@@ -104,6 +108,17 @@ public:
   /// request-owned sessions, the model's tokenizer, and host-memory
   /// continuation snapshots.
   bool load(std::shared_ptr<models::qwen38_flash_next::Model> model,
+            std::string* error, std::uint32_t max_context = 0,
+            std::size_t session_count = 1,
+            TextPrefillPolicy prefill_policy = {},
+            TextSchedulerPolicy scheduler_policy = {},
+            TextSpeculativeConfig speculative_config = {},
+            TextDiskCacheConfig disk_cache_config = {});
+
+  /// Installs a previously loaded Qwen3.6-35B-A3B model (text only; MTP from
+  /// the artifact's own draft block) with request-owned sessions and
+  /// host-memory continuation snapshots.
+  bool load(std::shared_ptr<models::qwen36_35b_a3b::Model> model,
             std::string* error, std::uint32_t max_context = 0,
             std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},

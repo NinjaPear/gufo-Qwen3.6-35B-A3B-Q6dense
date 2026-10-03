@@ -1,0 +1,227 @@
+{
+  "artifactType": "model-bench-table",
+  "fingerprint": {
+    "canonical": {
+      "cppStandard": "C++20",
+      "cpuArchitecture": "x86_64",
+      "cpuLogicalCores": 32,
+      "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "cpuPhysicalCores": 16,
+      "cxxCompiler": "GCC 15.3.0",
+      "gpuArchitecture": "gfx1151",
+      "gpuComputeUnits": 20,
+      "gpuDriver": "amdgpu",
+      "gpuName": "AMD Radeon 8060S Graphics",
+      "gpuPciId": "1002:1586",
+      "kernelRelease": "7.0.0-31-generic",
+      "memoryTotalBytes": 131891183616,
+      "memoryType": "LPDDR5X (Unified)",
+      "rocmVersion": "7.2.3",
+      "schemaVersion": "1.0.0"
+    },
+    "fingerprintId": "51021a2b54e6f0becf3be72f5060c34f61d9ac67c0808fd0858ca9723f6cd75d",
+    "schemaVersion": "1.0.0"
+  },
+  "measuredOn": "2026-10-03",
+  "mode": null,
+  "model": {
+    "id": "Qwen3.6-35B-A3B",
+    "variant": null
+  },
+  "notes": [
+    "llama.cpp: llama-server version: 0.4.1-dev (build 11069, commit 68d9053a)",
+    "pp2048/tg128; depth is a cached conversation prefix of synthetic text (8-token reply); measured turn task is recorded per row; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
+    "synthetic text: 1.160 tokens/word, template overhead 12 tokens"
+  ],
+  "referenceName": "llama.cpp",
+  "rows": {
+    "0": {
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 35227 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0",
+      "counts": [
+        {
+          "cache_n": 0,
+          "completion_sha256": "4cc042aaeaf59962f4a3e27718474d950c88240e35124404143365df9b49b28d",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2040
+        }
+      ],
+      "pp": 1319.49,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 58.16,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "12288": {
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 59325 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0",
+      "counts": [
+        {
+          "cache_n": 12265,
+          "completion_sha256": "5fe22b282b953fabafb56bb7da803f70a34e305f89d713d8256e992dc7c31c6c",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2060
+        }
+      ],
+      "pp": 1046.51,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 54.2,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "131072": {
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 35227 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0",
+      "counts": [
+        {
+          "cache_n": 130932,
+          "completion_sha256": "b7efc1fec8b55d72af57fe901382599cb09ba3bddf7dc83650335ea76e2771f9",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2047
+        }
+      ],
+      "pp": 394.52,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 33.24,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "16384": {
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 35227 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0",
+      "counts": [
+        {
+          "cache_n": 16324,
+          "completion_sha256": "9844add42f405e054f8ba788380948ab2ca1ed10adec709925d81c143b419140",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2047
+        }
+      ],
+      "pp": 1003.51,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 53.1,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "32768": {
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 35227 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0",
+      "counts": [
+        {
+          "cache_n": 32718,
+          "completion_sha256": "9e76c1018a2149daa010d022454574905ddaa9dcf3992f35e1f55e2cfe62b68a",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2029
+        }
+      ],
+      "pp": 816.27,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 48.95,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "4096": {
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 35227 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0",
+      "counts": [
+        {
+          "cache_n": 4095,
+          "completion_sha256": "d218493c264f2b046dc1cedd25c7f502cc0c0d2794311f069fd47c5b21246ad7",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2043
+        }
+      ],
+      "pp": 1203.09,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 55.69,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "65536": {
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 35227 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0",
+      "counts": [
+        {
+          "cache_n": 65447,
+          "completion_sha256": "953ac8038e19aed692a1b9a74bb6305314c649599803998d5a83aaf2baa29d90",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2058
+        }
+      ],
+      "pp": 598.99,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 42.08,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "8192": {
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 35227 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0",
+      "counts": [
+        {
+          "cache_n": 8184,
+          "completion_sha256": "f5a0b547b7e57ed62c9526c0aa9b9141ff47f915e23d7802d34082916f06b8bb",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2048
+        }
+      ],
+      "pp": 1133.07,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 55.4,
+      "tg_sd": null,
+      "workload": "prose"
+    }
+  },
+  "schemaVersion": 1,
+  "server": {
+    "command": [
+      "llama-server",
+      "-m",
+      "Qwen3.6-35B-A3B-Q6dense.gguf",
+      "-c",
+      "133760",
+      "-np",
+      "1",
+      "--port",
+      "59325",
+      "--host",
+      "127.0.0.1",
+      "--alias",
+      "bench",
+      "-ngl",
+      "999",
+      "-fa",
+      "on",
+      "--cache-reuse",
+      "0",
+      "--jinja",
+      "--reasoning",
+      "off",
+      "--cache-ram",
+      "0"
+    ]
+  },
+  "source": {
+    "buildMode": "nix-release",
+    "dirty": true,
+    "revision": "594a623913b4109e4499885e9f73ed4d4ad3698e"
+  },
+  "table": "single-ar",
+  "target": "reference"
+}

@@ -1,0 +1,136 @@
+#include "src/models/qwen36_35b_a3b/cpu_ops.hpp"
+
+#include <cmath>
+#include <cstring>
+#include <vector>
+
+#include "src/core/quant/ggml_dequant.hpp"
+
+namespace gufo::models::qwen36_35b_a3b::cpu {
+
+using core::GgmlType;
+
+void DequantizeRow(const TensorRef& t, std::uint64_t e, std::uint64_t row,
+                   float* out) {
+  const std::uint8_t* src = t.Expert(e) + row * t.RowBytes();
+  const std::size_t k = t.cols;
+  switch (t.type) {
+    case GgmlType::kF32:
+      std::memcpy(out, src, k * sizeof(float));
+      break;
+    case GgmlType::kF16:
+      for (std::size_t i = 0; i < k; ++i) {
+        std::uint16_t h = 0;
+        std::memcpy(&h, src + 2 * i, 2);
+        out[i] = gufo::quant::Fp16ToFloat(h);
+      }
+      break;
+    case GgmlType::kBF16:
+      for (std::size_t i = 0; i < k; ++i) {
+        std::uint16_t h = 0;
+        std::memcpy(&h, src + 2 * i, 2);
+        const std::uint32_t bits = static_cast<std::uint32_t>(h) << 16;
+        std::memcpy(out + i, &bits, 4);
+      }
+      break;
+    case GgmlType::kQ8_0:
+      gufo::quant::DequantizeQ8_0(src, out, k);
+      break;
+    case GgmlType::kQ4_K:
+      gufo::quant::DequantizeQ4_K(src, out, k);
+      break;
+    case GgmlType::kQ5_K:
+      gufo::quant::DequantizeQ5_K(src, out, k);
+      break;
+    case GgmlType::kQ6_K:
+      gufo::quant::DequantizeQ6_K(src, out, k);
+      break;
+    default:
+      std::memset(out, 0, k * sizeof(float));
+      break;
+  }
+}
+
+float DotRow(const TensorRef& t, std::uint64_t e, std::uint64_t row,
+             std::span<const float> x) {
+  std::vector<float> w(t.cols);
+  DequantizeRow(t, e, row, w.data());
+  double acc = 0.0;
+  for (std::size_t i = 0; i < t.cols; ++i) {
+    acc += static_cast<double>(w[i]) * x[i];
+  }
+  return static_cast<float>(acc);
+}
+
+void MatVec(const TensorRef& t, std::uint64_t e, std::span<const float> x,
+            std::span<float> y) {
+  const auto rows = static_cast<std::int64_t>(t.rows);
+#pragma omp parallel
+  {
+    std::vector<float> w(t.cols);
+#pragma omp for schedule(static)
+    for (std::int64_t r = 0; r < rows; ++r) {
+      DequantizeRow(t, e, static_cast<std::uint64_t>(r), w.data());
+      double acc = 0.0;
+      for (std::size_t i = 0; i < t.cols; ++i) {
+        acc += static_cast<double>(w[i]) * x[i];
+      }
+      y[static_cast<std::size_t>(r)] = static_cast<float>(acc);
+    }
+  }
+}
+
+void RmsNorm(std::span<float> x, const float* w, float eps) {
+  double ss = 0.0;
+  for (float v : x) {
+    ss += static_cast<double>(v) * v;
+  }
+  const float scale =
+      1.0F /
+      std::sqrt(static_cast<float>(ss / static_cast<double>(x.size())) + eps);
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    x[i] = x[i] * scale * (w != nullptr ? w[i] : 1.0F);
+  }
+}
+
+void L2Norm(std::span<float> x, float eps) {
+  double ss = 0.0;
+  for (float v : x) {
+    ss += static_cast<double>(v) * v;
+  }
+  const float scale = 1.0F / std::sqrt(static_cast<float>(ss) + eps);
+  for (float& v : x) {
+    v *= scale;
+  }
+}
+
+float Sigmoid(float x) noexcept {
+  return 1.0F / (1.0F + std::exp(-x));
+}
+float Silu(float x) noexcept {
+  return x * Sigmoid(x);
+}
+float Softplus(float x) noexcept {
+  return x > 20.0F ? x : std::log1p(std::exp(x));
+}
+
+void Rope(float* x, std::uint32_t heads, std::uint32_t head_dim,
+          std::uint32_t rotary_dim, std::uint32_t pos, float theta) {
+  const std::uint32_t half = rotary_dim / 2;
+  for (std::uint32_t h = 0; h < heads; ++h) {
+    float* v = x + static_cast<std::size_t>(h) * head_dim;
+    for (std::uint32_t i = 0; i < half; ++i) {
+      const float freq = std::pow(theta, -2.0F * static_cast<float>(i) /
+                                             static_cast<float>(rotary_dim));
+      const float angle = static_cast<float>(pos) * freq;
+      const float c = std::cos(angle);
+      const float s = std::sin(angle);
+      const float a = v[i];
+      const float b = v[i + half];
+      v[i] = a * c - b * s;
+      v[i + half] = a * s + b * c;
+    }
+  }
+}
+
+}  // namespace gufo::models::qwen36_35b_a3b::cpu

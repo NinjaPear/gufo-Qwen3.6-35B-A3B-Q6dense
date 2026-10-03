@@ -1,0 +1,95 @@
+{
+  "positions": 445,
+  "top1_agreement": 443,
+  "tokenization_match": true,
+  "mean_tv": 0.006402439446604581,
+  "p99_tv": 0.08738703326917045,
+  "max_tv": 0.17980789772756944,
+  "mean_kl": 0.0020234774304136566,
+  "p99_kl": 0.05463052836485933,
+  "max_kl": 0.08514907892771616,
+  "top_k": 20,
+  "tokens_per_prompt": 64,
+  "prompts": [
+    {
+      "prompt": "prose",
+      "tokenization_match": true,
+      "positions": 64,
+      "top1_agreement": 64,
+      "mean_tv": 0.009883501481375104,
+      "max_tv": 0.17980789772756944,
+      "mean_kl": 0.00228718444001367,
+      "max_kl": 0.07620059311981296
+    },
+    {
+      "prompt": "code",
+      "tokenization_match": true,
+      "positions": 64,
+      "top1_agreement": 63,
+      "mean_tv": 0.0037536417601814246,
+      "max_tv": 0.17805454281993527,
+      "mean_kl": 0.0011284905457250509,
+      "max_kl": 0.06654160177261036
+    },
+    {
+      "prompt": "json",
+      "tokenization_match": true,
+      "positions": 60,
+      "top1_agreement": 60,
+      "mean_tv": 0.0012829316806743562,
+      "max_tv": 0.07356616304165357,
+      "mean_kl": 0.000904332702336585,
+      "max_kl": 0.054036804622269445
+    },
+    {
+      "prompt": "math",
+      "tokenization_match": true,
+      "positions": 64,
+      "top1_agreement": 64,
+      "mean_tv": 0.003283217390783843,
+      "max_tv": 0.030559055098905212,
+      "mean_kl": 0.00022164297000525817,
+      "max_kl": 0.0028343657485172154
+    },
+    {
+      "prompt": "multilingual",
+      "tokenization_match": true,
+      "positions": 23,
+      "top1_agreement": 23,
+      "mean_tv": 0.0036632020305044917,
+      "max_tv": 0.02774226403479159,
+      "mean_kl": 0.0005649670662191992,
+      "max_kl": 0.005200182177586667
+    },
+    {
+      "prompt": "raw",
+      "tokenization_match": true,
+      "positions": 64,
+      "top1_agreement": 63,
+      "mean_tv": 0.012333552895534654,
+      "max_tv": 0.10311525737502585,
+      "mean_kl": 0.005791566910362693,
+      "max_kl": 0.08514907892771616
+    },
+    {
+      "prompt": "list",
+      "tokenization_match": true,
+      "positions": 42,
+      "top1_agreement": 42,
+      "mean_tv": 0.01435462027223092,
+      "max_tv": 0.10138976537278233,
+      "mean_kl": 0.004762581834754963,
+      "max_kl": 0.05463052836485933
+    },
+    {
+      "prompt": "thinking",
+      "tokenization_match": true,
+      "positions": 64,
+      "top1_agreement": 64,
+      "mean_tv": 0.003323617015301147,
+      "max_tv": 0.08738703326917045,
+      "mean_kl": 0.0004643153653172664,
+      "max_kl": 0.015529563331510945
+    }
+  ]
+}

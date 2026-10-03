@@ -1,0 +1,35 @@
+{
+  "sha256": {
+    "Qwen3.6-35B-A3B-Q6dense.gguf": "842ed2bf58034c2f4856239d04de57acec27183ef4012e469d1a423a8de23108",
+    "q6dense.types": "e1f872fc75efdf1379a9da71565a0107a6e44f41fa1eac64bff5afc7ba61de13",
+    "imatrix_unsloth.gguf_file": "a96ef6a7ef174fc43cca013f4452756877e5993f6a17eec1907900e9a0608586"
+  },
+  "sources": {
+    "target": "ligamentexceed/Qwen3.6-35B-A3B-Q6dense-GGUF, revision cd429bbcdc0a2843bdc509c804088013ed7212a4, Qwen3.6-35B-A3B-Q6dense.gguf",
+    "quantizedFrom": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF, revision 5bc3e238d916f48a861bac2f8a1990a0e9b7e98d, BF16 shards and imatrix_unsloth.gguf_file",
+    "quantizer": "llama.cpp b11069 (commit 68d9053a) llama-quantize, base type Q4_K_M, every tensor set by q6dense.types",
+    "chatTemplate": "Qwen/Qwen3.6-35B-A3B, revision 995ad96eacd98c81ed38be0c5b274b04031597b0"
+  },
+  "benchmarks-2026-10-03": {
+    "gufo": {
+      "revision": "594a623913b4109e4499885e9f73ed4d4ad3698e plus this change (uncommitted tree)",
+      "build": "nix build, production gfx1151 binary",
+      "binarySha256": "5ba14f3bd4efe2db369f912e18ad6431542556af63107269d765cdbb2c329d67"
+    },
+    "reference": {
+      "revision": "68d9053afd4f4d0752ced6187585f862355a40be",
+      "build": "llama.cpp b11069, pinned Nix ROCm gfx1151 recipe; AR and native MTP (--spec-type draft-mtp)",
+      "binarySha256": "81dee29e5fbc234bbb4ae90c022de9c9d8513d1cefa960550b0bb59d9fc5346f"
+    },
+    "host": "AMD Strix Halo gfx1151, 128 GB unified memory; an unrelated GPU service ran concurrently",
+    "measurement": "One measured sample per point. Per-artifact source revisions and commands are authoritative."
+  },
+  "qualification": "llama-parity.json",
+  "functional-2026-10-03": {
+    "gufo": {
+      "build": "nix build, production gfx1151 binary after moving the quantized kernels into the model package (renamed q36_, arithmetic unchanged)",
+      "binarySha256": "ca2218f576e3c9506f2524de15c3fdcd0a8265764929c8589c1bf3fe71477990"
+    },
+    "note": "Operator, session and snapshot tests re-run exact on this tree; benchmark tables keep the benchmarks-2026-10-03 binary."
+  }
+}

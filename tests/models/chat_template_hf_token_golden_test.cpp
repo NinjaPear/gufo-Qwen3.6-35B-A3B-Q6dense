@@ -27,7 +27,8 @@ void CheckQwenCase(const json::Value& fixture, std::string_view case_name,
                    const qwen::QwenTokenizer& tokenizer,
                    std::span<const qwen::ChatMessage> messages,
                    std::span<const qwen::ChatTool> tools,
-                   const qwen::ChatTemplateOptions& options) {
+                   const qwen::ChatTemplateOptions& options,
+                   std::string_view model = "qwen") {
   std::string error;
   const auto rendered =
       qwen::QwenChatTemplate::Render(messages, tools, options, &error);
@@ -36,7 +37,7 @@ void CheckQwenCase(const json::Value& fixture, std::string_view case_name,
       tokenizer, messages, tools, options, &error);
   Expect(tokens.has_value(), "Qwen golden prompt tokenizes: " + error);
 
-  const json::Value& expected = GoldenCase(fixture, "qwen", case_name);
+  const json::Value& expected = GoldenCase(fixture, model, case_name);
   Expect(Sha256(*rendered) == expected.member_str("rendered_sha256"),
          "Qwen rendered bytes match Hugging Face");
   if (tokens->size() != expected.member_size("token_count")) {
@@ -127,12 +128,67 @@ void TestQwenGoldens(const json::Value& fixture,
                 {});
 }
 
+// Qwen3.6 renders through the same compiled formatter with its own defaults:
+// no reasoning-effort instruction, earlier reasoning dropped by default.
+void TestQwen36Goldens(const json::Value& fixture,
+                       const std::string& model_path) {
+  std::string error;
+  const auto reader = gufo::core::GgufReader::OpenFile(model_path, &error);
+  Expect(reader != nullptr, "Qwen3.6 GGUF opens: " + error);
+  Expect(qwen::QwenChatTemplate::ValidateGgufTemplate(*reader, &error),
+         "Qwen3.6 GGUF template is recognized: " + error);
+  const auto tokenizer = qwen::QwenTokenizer::CreateFromGguf(*reader, &error);
+  Expect(tokenizer != nullptr, "Qwen3.6 tokenizer loads: " + error);
+
+  const std::vector<qwen::ChatMessage> base = {
+      {qwen::ChatRole::kUser, "Name one color.", "", ""},
+  };
+  const std::vector<qwen::ChatMessage> history = {
+      {qwen::ChatRole::kUser, "Name one color.", "", ""},
+      {qwen::ChatRole::kAssistant, "Red", "",
+       "I should answer with one color."},
+      {qwen::ChatRole::kUser, "Name another.", "", ""},
+  };
+  const std::vector<qwen::ChatTool> tools = {{
+      .name = "get_weather",
+      .description = "Get weather",
+      .parameters_json = "{\"type\":\"object\",\"properties\":{\"city\":{"
+                         "\"type\":\"string\"}},"
+                         "\"required\":[\"city\"]}",
+  }};
+  const auto options = [](std::optional<bool> thinking,
+                          std::optional<bool> preserve) {
+    gufo::ReasoningOptions reasoning;
+    reasoning.enabled = thinking;
+    reasoning.preserve_thinking = preserve;
+    return qwen::ResolveQwenChatOptions(reasoning, false,
+                                        qwen::QwenTemplateFamily::kQwen36);
+  };
+  const auto check = [&](std::string_view name, const auto& messages,
+                         std::span<const qwen::ChatTool> case_tools,
+                         const qwen::ChatTemplateOptions& case_options) {
+    CheckQwenCase(fixture, name, *tokenizer, messages, case_tools, case_options,
+                  "qwen36");
+  };
+  check("thinking", base, {}, options({}, {}));
+  check("chat", base, {}, options(false, {}));
+  check("history_drop", history, {}, options({}, {}));
+  check("history_preserve", history, {}, options(false, true));
+  check("tools", base, tools, options(false, {}));
+  const std::vector<qwen::ChatMessage> system_tools{
+      {qwen::ChatRole::kSystem, "Be concise."}, base[0]};
+  check("system_tools", system_tools, tools, options({}, {}));
+}
+
 }  // namespace
 
 int main() {
   const char* qwen_model = std::getenv("GUFO_QWEN_GGUF");
-  if (qwen_model == nullptr || qwen_model[0] == '\0') {
-    std::cout << "SKIP: set GUFO_QWEN_GGUF\n";
+  const char* qwen36_model = std::getenv("GUFO_QWEN36_GGUF");
+  const bool has_qwen = qwen_model != nullptr && qwen_model[0] != '\0';
+  const bool has_qwen36 = qwen36_model != nullptr && qwen36_model[0] != '\0';
+  if (!has_qwen && !has_qwen36) {
+    std::cout << "SKIP: set GUFO_QWEN_GGUF and/or GUFO_QWEN36_GGUF\n";
     return 77;
   }
 
@@ -142,7 +198,10 @@ int main() {
                                  std::istreambuf_iterator<char>()};
   const json::Value fixture = json::parse(fixture_text);
 
-  TestQwenGoldens(fixture, qwen_model);
+  if (has_qwen)
+    TestQwenGoldens(fixture, qwen_model);
+  if (has_qwen36)
+    TestQwen36Goldens(fixture, qwen36_model);
   std::cout << "Hugging Face chat-template token goldens passed\n";
   return 0;
 }

@@ -96,7 +96,8 @@ seed. Speed depends on acceptance and verification cost.
 
 - `speculative` — `dflash2` for Qwen3.8-27B, `dspark` for DeepSeek V4 Flash,
   `mtp` for models with a supported MTP head, or `off`. HTTP serving
-  supports `dflash2`, `dspark`, and Flash-Next `mtp`.
+  supports `dflash2`, `dspark`, and Flash-Next/Qwen3.6 `mtp`. Qwen3.6
+  reads its MTP block from the target GGUF and rejects `mtpModel`.
 - `dflashModel` — path to the DFlash2 companion draft.
 - `dsparkModel` — path to the DSpark support GGUF.
 - `mtpModel` — path to the MTP draft model.
@@ -105,7 +106,7 @@ seed. Speed depends on acceptance and verification cost.
 - `draftPolicy` (`"fixed"` / `"adaptive"`) — DFlash2 block-length policy;
   defaults to adaptive.
 - `minDraftTokens` — minimum draft length where supported. DFlash2, DSpark,
-  and Flash-Next MTP require the default of one.
+  and Flash-Next/Qwen3.6 MTP require the default of one.
 
 **Server limits (protecting the machine from clients)**
 

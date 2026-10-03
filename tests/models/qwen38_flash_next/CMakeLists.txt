@@ -35,7 +35,8 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
   target_link_libraries(qwen38_flash_next_session_test PRIVATE gufo_logging
-    gufo_qwen38_flash_next gufo_deepseek_v4_flash hip::host)
+    gufo_qwen38_flash_next gufo_deepseek_v4_flash gufo_qwen36_35b_a3b
+    hip::host)
   add_executable(qwen38_flash_next_snapshot_test EXCLUDE_FROM_ALL snapshot_test.cpp)
   target_link_libraries(qwen38_flash_next_snapshot_test PRIVATE
     gufo_qwen38_flash_next)

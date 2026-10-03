@@ -27,10 +27,17 @@ std::size_t RenderedPromptBoundBytes(std::uint32_t context_tokens) noexcept {
 }
 
 ChatTemplateOptions ResolveQwenChatOptions(const ReasoningOptions& reasoning,
-                                           bool add_vision_id) {
+                                           bool add_vision_id,
+                                           QwenTemplateFamily family) {
   ChatTemplateOptions options;
   options.add_vision_id = add_vision_id;
   options.enable_thinking = reasoning.enabled.value_or(options.enable_thinking);
+  if (family == QwenTemplateFamily::kQwen36) {
+    // The medium effort adds no instruction, as the Qwen3.6 template.
+    options.reasoning_effort = QwenReasoningEffort::kMedium;
+    options.preserve_thinking = reasoning.preserve_thinking.value_or(false);
+    return options;
+  }
   options.preserve_thinking =
       reasoning.preserve_thinking.value_or(options.preserve_thinking);
   switch (reasoning.effort.value_or(ReasoningEffort::kXHigh)) {
@@ -75,6 +82,17 @@ bool IsQwen38ReasoningTemplate(std::string_view value) {
   const std::string hash = TemplateSha256(value);
   return hash == QwenChatTemplate::OfficialTemplateSha256() ||
          hash == QwenChatTemplate::UnslothArtifactTemplateSha256();
+}
+
+bool IsQwen36Template(std::string_view value) {
+  const std::string hash = TemplateSha256(value);
+  return hash == QwenChatTemplate::Qwen36OfficialTemplateSha256() ||
+         hash == QwenChatTemplate::Qwen36UnslothTemplateSha256();
+}
+
+bool IsQwen36Artifact(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") ==
+         std::optional<std::string_view>{"qwen35moe"};
 }
 
 bool IsQwen38Artifact(const core::GgufReader& reader) {
@@ -266,9 +284,9 @@ std::unique_ptr<QwenChatTemplate> QwenChatTemplate::CreateFromGguf(
     const core::GgufReader& reader, std::string* error_msg) {
   auto template_str = reader.GetMetadataString("tokenizer.chat_template");
   if (!template_str.has_value() || template_str->empty()) {
-    if (IsQwen38Artifact(reader)) {
+    if (IsQwen38Artifact(reader) || IsQwen36Artifact(reader)) {
       if (error_msg != nullptr) {
-        *error_msg = "Qwen3.8 GGUF is missing tokenizer.chat_template metadata";
+        *error_msg = "Qwen GGUF is missing tokenizer.chat_template metadata";
       }
       return nullptr;
     }
@@ -279,9 +297,19 @@ std::unique_ptr<QwenChatTemplate> QwenChatTemplate::CreateFromGguf(
     }
     return CreateDefault();
   }
-  const Profile profile = IsQwen38ReasoningTemplate(*template_str)
-                              ? Profile::kQwen38Reasoning
-                              : Profile::kLegacyChatMl;
+  const Profile profile =
+      IsQwen38ReasoningTemplate(*template_str) ? Profile::kQwen38Reasoning
+      : IsQwen36Template(*template_str)        ? Profile::kQwen36
+                                               : Profile::kLegacyChatMl;
+  if (IsQwen36Artifact(reader) && profile != Profile::kQwen36) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          "Qwen3.6 GGUF chat template SHA-256 is not a recognized pinned "
+          "version: " +
+          TemplateSha256(*template_str);
+    }
+    return nullptr;
+  }
   if (IsQwen38Artifact(reader) && profile != Profile::kQwen38Reasoning) {
     if (error_msg != nullptr) {
       *error_msg =
@@ -297,7 +325,7 @@ std::unique_ptr<QwenChatTemplate> QwenChatTemplate::CreateFromGguf(
 
 bool QwenChatTemplate::ValidateGgufTemplate(const core::GgufReader& reader,
                                             std::string* error_msg) {
-  if (!IsQwen38Artifact(reader)) {
+  if (!IsQwen38Artifact(reader) && !IsQwen36Artifact(reader)) {
     return true;
   }
   return CreateFromGguf(reader, error_msg) != nullptr;
@@ -313,6 +341,7 @@ std::unique_ptr<QwenChatTemplate> QwenChatTemplate::CreateDefault(
   return std::unique_ptr<QwenChatTemplate>(new QwenChatTemplate(
       std::string(raw_template), TemplateSha256(raw_template),
       IsQwen38ReasoningTemplate(raw_template) ? Profile::kQwen38Reasoning
+      : IsQwen36Template(raw_template)        ? Profile::kQwen36
                                               : Profile::kLegacyChatMl));
 }
 
@@ -322,6 +351,8 @@ std::string_view QwenChatTemplate::GetTemplateId() const noexcept {
       return "qwen-chatml-compiled-v1";
     case Profile::kQwen38Reasoning:
       return "qwen38-reasoning-compiled-v3";
+    case Profile::kQwen36:
+      return "qwen36-compiled-v1";
   }
   return "qwen-chatml-compiled-v1";
 }

@@ -1,0 +1,261 @@
+{
+  "artifactType": "model-bench-table",
+  "fingerprint": {
+    "canonical": {
+      "cppStandard": "C++20",
+      "cpuArchitecture": "x86_64",
+      "cpuLogicalCores": 32,
+      "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "cpuPhysicalCores": 16,
+      "cxxCompiler": "GCC 15.3.0",
+      "gpuArchitecture": "gfx1151",
+      "gpuComputeUnits": 20,
+      "gpuDriver": "amdgpu",
+      "gpuName": "AMD Radeon 8060S Graphics",
+      "gpuPciId": "1002:1586",
+      "kernelRelease": "7.0.0-31-generic",
+      "memoryTotalBytes": 131891183616,
+      "memoryType": "LPDDR5X (Unified)",
+      "rocmVersion": "7.2.3",
+      "schemaVersion": "1.0.0"
+    },
+    "fingerprintId": "51021a2b54e6f0becf3be72f5060c34f61d9ac67c0808fd0858ca9723f6cd75d",
+    "schemaVersion": "1.0.0"
+  },
+  "measuredOn": "2026-10-03",
+  "mode": "mtp",
+  "model": {
+    "id": "Qwen3.6-35B-A3B",
+    "variant": null
+  },
+  "notes": [
+    "llama.cpp: llama-server version: 0.4.1-dev (build 11069, commit 68d9053a)",
+    "pp2048/tg128; depth is a cached conversation prefix of synthetic text (8-token reply); measured turn task is recorded per row; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
+    "synthetic text: 1.161 tokens/word, template overhead 12 tokens"
+  ],
+  "referenceName": "llama.cpp",
+  "rows": {
+    "0": {
+      "acceptance": 45.91,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.33,
+      "accepted_per_step_sd": null,
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 58869 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0 --spec-type draft-mtp",
+      "counts": [
+        {
+          "cache_n": 0,
+          "completion_sha256": "39c1d08836abfeae6b1d2be2387cf3f026c6e70ce7aeda28deaba5c8c2cac4fd",
+          "draft_n": 159,
+          "draft_n_accepted": 73,
+          "predicted_n": 128,
+          "prompt_n": 2040
+        }
+      ],
+      "pp": 1277.9,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 69.44,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "12288": {
+      "acceptance": 43.29,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.25,
+      "accepted_per_step_sd": null,
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 58869 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0 --spec-type draft-mtp",
+      "counts": [
+        {
+          "cache_n": 12249,
+          "completion_sha256": "2c283f6959557ff5b728167d6779005175dba02486b4ed980b898c735c53d100",
+          "draft_n": 164,
+          "draft_n_accepted": 71,
+          "predicted_n": 128,
+          "prompt_n": 2047
+        }
+      ],
+      "pp": 992.61,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 59.31,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "131072": {
+      "acceptance": 54.86,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.61,
+      "accepted_per_step_sd": null,
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 58869 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0 --spec-type draft-mtp",
+      "counts": [
+        {
+          "cache_n": 130932,
+          "completion_sha256": "c70cb70d775bfbc18f9f7932128546ad0aa971532400705d3d2fbacb37bce72a",
+          "draft_n": 144,
+          "draft_n_accepted": 79,
+          "predicted_n": 128,
+          "prompt_n": 2047
+        }
+      ],
+      "pp": 355.24,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 45.52,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "16384": {
+      "acceptance": 51.33,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.51,
+      "accepted_per_step_sd": null,
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 58869 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0 --spec-type draft-mtp",
+      "counts": [
+        {
+          "cache_n": 16324,
+          "completion_sha256": "5cebce7d6643591ad12176dac8528243ac130fddddaccf6bb68235ac200d589f",
+          "draft_n": 150,
+          "draft_n_accepted": 77,
+          "predicted_n": 128,
+          "prompt_n": 2047
+        }
+      ],
+      "pp": 925.3,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 64.63,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "32768": {
+      "acceptance": 56.74,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.67,
+      "accepted_per_step_sd": null,
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 58869 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0 --spec-type draft-mtp",
+      "counts": [
+        {
+          "cache_n": 32718,
+          "completion_sha256": "b3c22dbc0ee48dab232f78921e3683228426cb1948a42d58f7632b09bdd87d8e",
+          "draft_n": 141,
+          "draft_n_accepted": 80,
+          "predicted_n": 128,
+          "prompt_n": 2029
+        }
+      ],
+      "pp": 747.0,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 63.44,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "4096": {
+      "acceptance": 55.63,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.61,
+      "accepted_per_step_sd": null,
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 58869 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0 --spec-type draft-mtp",
+      "counts": [
+        {
+          "cache_n": 4095,
+          "completion_sha256": "9b53391d2ff0e8beba4f32d8cdb1154cc45004e38313277fe2627091251b3586",
+          "draft_n": 142,
+          "draft_n_accepted": 79,
+          "predicted_n": 128,
+          "prompt_n": 2043
+        }
+      ],
+      "pp": 1160.65,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 76.55,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "65536": {
+      "acceptance": 54.93,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.56,
+      "accepted_per_step_sd": null,
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 58869 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0 --spec-type draft-mtp",
+      "counts": [
+        {
+          "cache_n": 65447,
+          "completion_sha256": "bf76f77ff83295486f80b525eaef96d1b2022bc3f10752551c574a5d37e65187",
+          "draft_n": 142,
+          "draft_n_accepted": 78,
+          "predicted_n": 128,
+          "prompt_n": 2058
+        }
+      ],
+      "pp": 541.97,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 55.79,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "8192": {
+      "acceptance": 51.35,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.46,
+      "accepted_per_step_sd": null,
+      "command": "llama-server -m Qwen3.6-35B-A3B-Q6dense.gguf -c 133760 -np 1 --port 58869 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0 --spec-type draft-mtp",
+      "counts": [
+        {
+          "cache_n": 8184,
+          "completion_sha256": "0a85b9a6c626d2af9fc27aa53d0f9a5d617f4edab738a43dd040a4dc2d3ec1f2",
+          "draft_n": 148,
+          "draft_n_accepted": 76,
+          "predicted_n": 128,
+          "prompt_n": 2048
+        }
+      ],
+      "pp": 1078.48,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 70.71,
+      "tg_sd": null,
+      "workload": "prose"
+    }
+  },
+  "schemaVersion": 1,
+  "server": {
+    "command": [
+      "llama-server",
+      "-m",
+      "Qwen3.6-35B-A3B-Q6dense.gguf",
+      "-c",
+      "133760",
+      "-np",
+      "1",
+      "--port",
+      "58869",
+      "--host",
+      "127.0.0.1",
+      "--alias",
+      "bench",
+      "-ngl",
+      "999",
+      "-fa",
+      "on",
+      "--cache-reuse",
+      "0",
+      "--jinja",
+      "--reasoning",
+      "off",
+      "--cache-ram",
+      "0",
+      "--spec-type",
+      "draft-mtp"
+    ]
+  },
+  "source": {
+    "buildMode": "nix-release",
+    "dirty": true,
+    "revision": "594a623913b4109e4499885e9f73ed4d4ad3698e"
+  },
+  "table": "single-mtp",
+  "target": "reference"
+}

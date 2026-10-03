@@ -1,0 +1,253 @@
+{
+  "artifactType": "model-bench-table",
+  "fingerprint": {
+    "canonical": {
+      "cppStandard": "C++20",
+      "cpuArchitecture": "x86_64",
+      "cpuLogicalCores": 32,
+      "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "cpuPhysicalCores": 16,
+      "cxxCompiler": "GCC 15.3.0",
+      "gpuArchitecture": "gfx1151",
+      "gpuComputeUnits": 20,
+      "gpuDriver": "amdgpu",
+      "gpuName": "AMD Radeon 8060S Graphics",
+      "gpuPciId": "1002:1586",
+      "kernelRelease": "7.0.0-31-generic",
+      "memoryTotalBytes": 131891183616,
+      "memoryType": "LPDDR5X (Unified)",
+      "rocmVersion": "7.2.3",
+      "schemaVersion": "1.0.0"
+    },
+    "fingerprintId": "51021a2b54e6f0becf3be72f5060c34f61d9ac67c0808fd0858ca9723f6cd75d",
+    "schemaVersion": "1.0.0"
+  },
+  "measuredOn": "2026-10-03",
+  "mode": "mtp",
+  "model": {
+    "id": "Qwen3.6-35B-A3B",
+    "variant": null
+  },
+  "notes": [
+    "pp2048/tg128; depth is a cached conversation prefix of synthetic text (8-token reply); measured turn task is recorded per row; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
+    "synthetic text: 1.159 tokens/word, template overhead 12 tokens"
+  ],
+  "referenceName": "llama.cpp",
+  "rows": {
+    "0": {
+      "acceptance": 97.35,
+      "acceptance_sd": null,
+      "accepted_per_step": 6.11,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 36917 --sessions 1 llm --model Qwen3.6-35B-A3B-Q6dense.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --speculative mtp",
+      "counts": [
+        {
+          "cache_n": 0,
+          "completion_sha256": "82fd84fded8d257a194ac1eca43b70a866a79bac1e97e45d19f0292d6a7118bd",
+          "draft_n": 113,
+          "draft_n_accepted": 110,
+          "predicted_n": 128,
+          "prompt_n": 2034
+        }
+      ],
+      "pp": 3577.89,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 200.88,
+      "tg_sd": null,
+      "workload": "repetition"
+    },
+    "12288": {
+      "acceptance": 100.0,
+      "acceptance_sd": null,
+      "accepted_per_step": 5.4,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 60807 --sessions 1 llm --model Qwen3.6-35B-A3B-Q6dense.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --speculative mtp",
+      "counts": [
+        {
+          "cache_n": 12259,
+          "completion_sha256": "263d43c3f735a43c8cbd131cd8eaa883c038e554710cb736ae05c4b7a4476927",
+          "draft_n": 108,
+          "draft_n_accepted": 108,
+          "predicted_n": 128,
+          "prompt_n": 2067
+        }
+      ],
+      "pp": 2498.99,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 171.62,
+      "tg_sd": null,
+      "workload": "repetition"
+    },
+    "131072": {
+      "acceptance": 100.0,
+      "acceptance_sd": null,
+      "accepted_per_step": 5.1,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 36917 --sessions 1 llm --model Qwen3.6-35B-A3B-Q6dense.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --speculative mtp",
+      "counts": [
+        {
+          "cache_n": 131036,
+          "completion_sha256": "863825807579c48004a4978cdc2c7427fb6f2b4962ed1d230b2914f4d7df4c39",
+          "draft_n": 107,
+          "draft_n_accepted": 107,
+          "predicted_n": 128,
+          "prompt_n": 2052
+        }
+      ],
+      "pp": 541.92,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 116.77,
+      "tg_sd": null,
+      "workload": "repetition"
+    },
+    "16384": {
+      "acceptance": 86.99,
+      "acceptance_sd": null,
+      "accepted_per_step": 5.1,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 36917 --sessions 1 llm --model Qwen3.6-35B-A3B-Q6dense.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --speculative mtp",
+      "counts": [
+        {
+          "cache_n": 16324,
+          "completion_sha256": "feabbf7a97b0f534ff3ea683bfe7f0eaf7bca76e05d20289c9381767883b6c0b",
+          "draft_n": 123,
+          "draft_n_accepted": 107,
+          "predicted_n": 128,
+          "prompt_n": 2053
+        }
+      ],
+      "pp": 2247.17,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 162.58,
+      "tg_sd": null,
+      "workload": "repetition"
+    },
+    "32768": {
+      "acceptance": 93.75,
+      "acceptance_sd": null,
+      "accepted_per_step": 4.57,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 36917 --sessions 1 llm --model Qwen3.6-35B-A3B-Q6dense.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --speculative mtp",
+      "counts": [
+        {
+          "cache_n": 32733,
+          "completion_sha256": "c6100761990cae0e50e5871ed0f97077d858aaa224b4cca19cf5bcfb45dad358",
+          "draft_n": 112,
+          "draft_n_accepted": 105,
+          "predicted_n": 128,
+          "prompt_n": 2034
+        }
+      ],
+      "pp": 1676.17,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 145.5,
+      "tg_sd": null,
+      "workload": "repetition"
+    },
+    "4096": {
+      "acceptance": 88.24,
+      "acceptance_sd": null,
+      "accepted_per_step": 4.57,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 36917 --sessions 1 llm --model Qwen3.6-35B-A3B-Q6dense.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --speculative mtp",
+      "counts": [
+        {
+          "cache_n": 4081,
+          "completion_sha256": "8ddd067c8205a20751b56c3ac48d2daad70e29da600a6ec2ce3cf4ee007c77f3",
+          "draft_n": 119,
+          "draft_n_accepted": 105,
+          "predicted_n": 128,
+          "prompt_n": 2049
+        }
+      ],
+      "pp": 3204.41,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 165.9,
+      "tg_sd": null,
+      "workload": "repetition"
+    },
+    "65536": {
+      "acceptance": 83.08,
+      "acceptance_sd": null,
+      "accepted_per_step": 5.4,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 36917 --sessions 1 llm --model Qwen3.6-35B-A3B-Q6dense.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --speculative mtp",
+      "counts": [
+        {
+          "cache_n": 65491,
+          "completion_sha256": "262ee2e28900a107ea493604f21b4c2ce682b1054b98c27593a2f6aa694a96f5",
+          "draft_n": 130,
+          "draft_n_accepted": 108,
+          "predicted_n": 128,
+          "prompt_n": 2064
+        }
+      ],
+      "pp": 978.71,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 134.97,
+      "tg_sd": null,
+      "workload": "repetition"
+    },
+    "8192": {
+      "acceptance": 100.0,
+      "acceptance_sd": null,
+      "accepted_per_step": 5.74,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 36917 --sessions 1 llm --model Qwen3.6-35B-A3B-Q6dense.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --speculative mtp",
+      "counts": [
+        {
+          "cache_n": 8179,
+          "completion_sha256": "d41deb81970acd64ba9ad9f5e72a070a0c979e8f4a94cca94acae44c9f5e61f9",
+          "draft_n": 109,
+          "draft_n_accepted": 109,
+          "predicted_n": 128,
+          "prompt_n": 2054
+        }
+      ],
+      "pp": 2821.1,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 190.67,
+      "tg_sd": null,
+      "workload": "repetition"
+    }
+  },
+  "schemaVersion": 1,
+  "server": {
+    "command": [
+      "gufo",
+      "serve",
+      "--port",
+      "60807",
+      "--sessions",
+      "1",
+      "llm",
+      "--model",
+      "Qwen3.6-35B-A3B-Q6dense.gguf",
+      "--context",
+      "133760",
+      "--served-model-name",
+      "bench",
+      "--think",
+      "off",
+      "--max-pending-per-client",
+      "8",
+      "--speculative",
+      "mtp"
+    ]
+  },
+  "source": {
+    "buildMode": "nix-release",
+    "dirty": true,
+    "revision": "594a623913b4109e4499885e9f73ed4d4ad3698e"
+  },
+  "table": "single-mtp-repetition",
+  "target": "gufo"
+}

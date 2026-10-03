@@ -294,15 +294,17 @@ def check_sampling_defaults(client, model, checks, preset, overrides, vision=Fal
             record("deepseek_xhigh_maps_high", xhigh)
 
     for thinking in (False, True):
-        qwen_off = preset == "qwen38" and not thinking
+        qwen = preset in ("qwen38", "qwen36")
+        qwen_off = qwen and not thinking
         expected = {
             "temperature": .7 if qwen_off else 1.,
             "top_p": .8 if qwen_off else .95,
-            "presence_penalty": 1.5 if qwen_off else 0.,
+            # Qwen3.6 recommends presence 1.5 with thinking on as well.
+            "presence_penalty": 1.5 if qwen_off or preset == "qwen36" else 0.,
             "frequency_penalty": 0.,
             "seed": 73,
         }
-        native = {"top_k": 20 if preset == "qwen38" else 0,
+        native = {"top_k": 20 if qwen else 0,
                   "min_p": 0., "min_keep": 0, "repeat_penalty": 1.,
                   "repeat_last_n": 64}
         assert overrides.keys() <= (expected.keys() | native.keys()), overrides
@@ -2345,7 +2347,7 @@ def main():
     parser.add_argument("--suite", choices=("all", *SDK_SUITES), default="all")
     parser.add_argument("--vision", action="store_true",
                         help="Add image checks; the server needs its matching --mmproj")
-    parser.add_argument("--sampling-preset", choices=("qwen38", "deepseek4"),
+    parser.add_argument("--sampling-preset", choices=("qwen38", "qwen36", "deepseek4"),
                         help="Expected text defaults; required for all/sampling-defaults")
     parser.add_argument("--sampling-overrides", type=json.loads, default={},
                         help="JSON object of explicit server sampling CLI values")
