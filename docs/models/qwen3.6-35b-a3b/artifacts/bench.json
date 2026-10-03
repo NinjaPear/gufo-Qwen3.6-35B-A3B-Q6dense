@@ -42,7 +42,6 @@
       "prompt_tokens": 2048,
       "output_tokens": 128,
       "depths": [
-        0,
         4096,
         8192,
         12288,
@@ -68,7 +67,6 @@
       "prompt_tokens": 2048,
       "output_tokens": 128,
       "depths": [
-        0,
         4096,
         8192,
         12288,

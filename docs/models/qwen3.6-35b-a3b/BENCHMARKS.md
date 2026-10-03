@@ -17,7 +17,6 @@ pp2048 / tg128; depth is the cached prefix in tokens.
 <!-- bench:single-ar -->
 | Qwen3.6 Q6dense AR<br>Depth (tokens) | Gufo pp (tok/s) | llama.cpp pp (tok/s) | Gain | Gufo tg (tok/s) | llama.cpp tg (tok/s) | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 3646.29 | 1319.49 | +176.3% | 70.06 | 58.16 | +20.5% |
 | 4,096 | 3095.44 | 1203.09 | +157.3% | 68.43 | 55.69 | +22.9% |
 | 8,192 | 2830.00 | 1133.07 | +149.8% | 67.45 | 55.40 | +21.8% |
 | 12,288 | 2539.36 | 1046.51 | +142.7% | 66.45 | 54.20 | +22.6% |
@@ -37,7 +36,6 @@ text.
 <!-- bench:single-mtp -->
 | Qwen3.6 Q6dense MTP<br>Depth (tokens) | Gufo pp (tok/s) | llama.cpp pp (tok/s) | Gain pp | Gufo tg mixed (tok/s) | llama.cpp tg mixed (tok/s) | Gain mixed | Gufo tg repetitive (tok/s) | llama.cpp tg repetitive (tok/s) | Gain repetitive |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 3607.57 | 1277.90 | +182.3% | 99.75 | 69.44 | +43.6% | 200.88 | 115.79 | +73.5% |
 | 4,096 | 3204.41 | 1164.47 | +175.2% | 98.36 | 76.55 | +28.5% | 165.90 | 112.70 | +47.2% |
 | 8,192 | 2821.10 | 1078.48 | +161.6% | 101.29 | 70.71 | +43.2% | 190.67 | 103.08 | +85.0% |
 | 12,288 | 2498.99 | 992.82 | +151.7% | 89.36 | 59.31 | +50.7% | 171.62 | 98.04 | +75.1% |
@@ -51,7 +49,7 @@ text.
 
 ## Multiple users, autoregressive
 
-Same pp2048 prose prompt as single-user d0, tg128, context 4096 per user.
+pp2048 prose prompt with no cached prefix, tg128, context 4096 per user.
 Prefill every session before timed decoding; sum individual request decode rates.
 
 <!-- bench:multi-ar -->
@@ -68,8 +66,8 @@ Prefill every session before timed decoding; sum individual request decode rates
 
 ## Multiple users, MTP
 
-Same pp2048 mixed/repetitive prompts as single-user d0, tg128. C1 directly
-cross-checks that row. Prefill every session before timed decoding.
+pp2048 mixed/repetitive prompts with no cached prefix, tg128. Prefill every
+session before timed decoding.
 On mixed text at C6/C8 the batch controller verifies few drafts, and Gufo
 MTP falls below its own AR rate (227.56 versus 265.18 tok/s at C8).
 
