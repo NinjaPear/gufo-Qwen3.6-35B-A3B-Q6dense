@@ -1,11 +1,14 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <bit>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -20,6 +23,12 @@ void Require(bool condition, const std::string& message) {
 
 void Check(hipError_t status) {
   Require(status == hipSuccess, hipGetErrorString(status));
+}
+
+float AsFloat(std::uint16_t value, hipDataType type) {
+  return type == HIP_R_16BF
+             ? std::bit_cast<float>(static_cast<std::uint32_t>(value) << 16)
+             : __half2float(std::bit_cast<__half>(value));
 }
 
 struct Buffer {
@@ -39,18 +48,31 @@ int main() {
     auto warmed = BlasLt::Create(nullptr, &error);
     Require(warmed != nullptr, error);
     constexpr int max_n = 4096;
-    for (const auto [m, k] :
-         {std::pair{96, 2560}, std::pair{513, 2560}, std::pair{33, 96}}) {
-      std::vector<__half> weights(static_cast<std::size_t>(m) * k);
-      std::vector<__half> input(static_cast<std::size_t>(max_n) * k);
+    for (const auto [type, m, k] :
+         {std::tuple{HIP_R_16F, 96, 2560}, std::tuple{HIP_R_16F, 513, 2560},
+          std::tuple{HIP_R_16F, 17, 2560}, std::tuple{HIP_R_16F, 33, 96},
+          std::tuple{HIP_R_16BF, 64, 2560}, std::tuple{HIP_R_16BF, 128, 2560},
+          std::tuple{HIP_R_16BF, 256, 2560},
+          std::tuple{HIP_R_16BF, 512, 2560}}) {
+      // Prepare before inputs exist, then compare against lazy plan creation
+      // in a fresh instance, including ragged shapes after the prepared one.
+      Require(warmed->Prepare(type, m, max_n, k, &error), error);
+      std::vector<std::uint16_t> weights(static_cast<std::size_t>(m) * k);
+      std::vector<std::uint16_t> input(static_cast<std::size_t>(max_n) * k);
       unsigned rng = 123;
       for (auto* values : {&weights, &input}) {
         for (auto& v : *values) {
           rng ^= rng << 13;
           rng ^= rng >> 17;
           rng ^= rng << 5;
-          v = __float2half_rn(static_cast<float>(int(rng % 8193) - 4096) /
-                              4096.0F);
+          const float value =
+              static_cast<float>(int(rng % 8193) - 4096) / 4096.0F;
+          // Independent round-to-nearest-even for these finite BF16 inputs.
+          const auto bits = std::bit_cast<std::uint32_t>(value);
+          v = type == HIP_R_16BF
+                  ? static_cast<std::uint16_t>(
+                        (bits + 0x7fffU + ((bits >> 16) & 1U)) >> 16)
+                  : std::bit_cast<std::uint16_t>(__float2half_rn(value));
         }
       }
       Buffer a(weights.size() * sizeof(__half));
@@ -61,12 +83,19 @@ int main() {
       Check(hipMemcpy(b.data, input.data(), input.size() * sizeof(__half),
                       hipMemcpyHostToDevice));
       if (k == 2560) {
-        // Exercise both an unaligned cache boundary and a wide prefill split.
+        // Exercise an unaligned cache boundary, a wide prefill split and the
+        // short tails a checkpoint restore finishes a prompt with. A row's
+        // sums must not depend on its position in the batch: the indexer's
+        // BF16 scores feed a top-k whose near-ties would otherwise flip with
+        // the prefill chunking, and F16 router and recurrent-gate errors
+        // amplify across layers.
         for (const auto [total, boundary] :
-             {std::pair{136, 94}, std::pair{2048, 1025}}) {
+             {std::pair{136, 94}, std::pair{2048, 1025}, std::pair{3487, 777},
+              std::pair{1619, 1612}, std::pair{1619, 1618},
+              std::pair{1619, 1523}, std::pair{300, 293}}) {
           std::vector<float> bulk(std::size_t(m) * total), split(bulk.size());
           Require(warmed->Gemm(a.data, b.data, static_cast<float*>(c.data),
-                               HIP_R_16F, m, total, k, &error),
+                               type, m, total, k, &error),
                   error);
           Check(hipMemcpy(bulk.data(), c.data, bulk.size() * sizeof(float),
                           hipMemcpyDeviceToHost));
@@ -75,13 +104,19 @@ int main() {
             Require(
                 warmed->Gemm(
                     a.data, static_cast<__half*>(b.data) + std::size_t(off) * k,
-                    static_cast<float*>(c.data) + std::size_t(off) * m,
-                    HIP_R_16F, m, n, k, &error),
+                    static_cast<float*>(c.data) + std::size_t(off) * m, type, m,
+                    n, k, &error),
                 error);
           }
           Check(hipMemcpy(split.data(), c.data, split.size() * sizeof(float),
                           hipMemcpyDeviceToHost));
-          Require(bulk == split, "projection changed across prefill chunks");
+          Require(bulk == split,
+                  std::string(type == HIP_R_16BF ? "BF16" : "F16") +
+                      " m=" + std::to_string(m) +
+                      " projection changed across "
+                      "prefill chunks at " +
+                      std::to_string(boundary) + " of " +
+                      std::to_string(total));
         }
       }
       // Vary shape order and use ragged sizes between the calibrated widths.
@@ -92,8 +127,8 @@ int main() {
         std::vector<float> actual(reference.size());
         for (int pass = 0; pass < 3; ++pass) {
           auto& blas = pass == 1 ? fresh : warmed;
-          Require(blas->Gemm(a.data, b.data, static_cast<float*>(c.data),
-                             HIP_R_16F, m, n, k, &error),
+          Require(blas->Gemm(a.data, b.data, static_cast<float*>(c.data), type,
+                             m, n, k, &error),
                   error);
           Check(hipDeviceSynchronize());
           Check(hipMemcpy(actual.data(), c.data, actual.size() * sizeof(float),
@@ -112,8 +147,8 @@ int main() {
           double expected = 0.0;
           for (int j = 0; j < k; ++j) {
             expected += static_cast<double>(
-                            __half2float(weights[std::size_t(col) * k + j])) *
-                        __half2float(input[std::size_t(row) * k + j]);
+                            AsFloat(weights[std::size_t(col) * k + j], type)) *
+                        AsFloat(input[std::size_t(row) * k + j], type);
           }
           const float result = actual[std::size_t(row) * m + col];
           Require(std::isfinite(result) && std::abs(result - expected) < 0.002,
@@ -121,8 +156,8 @@ int main() {
         }
       }
     }
-    std::cout << "PASS: F16 projection replay, chunk boundaries, ragged shapes "
-                 "and F64\n";
+    std::cout << "PASS: F16/BF16 prepared/lazy projection replay, F16/BF16 "
+                 "chunk boundaries, ragged shapes and F64\n";
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';
     return 1;

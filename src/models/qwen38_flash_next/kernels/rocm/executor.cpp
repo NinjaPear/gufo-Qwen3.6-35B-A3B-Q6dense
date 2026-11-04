@@ -2,19 +2,25 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <gufo/ext/experimental/managed_alloc.hpp>
+#include <gufo/ext/experimental/snapshot_transfer.hpp>
+#include <gufo/ext/platform/pages.hpp>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
 #include "qfn_mmq.h"
-#include "src/core/hip/snapshot_transfer.hpp"
+#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -42,9 +48,9 @@ T* Alloc(std::vector<void*>& allocations, std::size_t count,
          std::string* error_msg, std::size_t* allocated_bytes = nullptr) {
   void* p = nullptr;
   const std::size_t bytes = std::max<std::size_t>(1, count) * sizeof(T);
-  if (hipMalloc(&p, bytes) != hipSuccess) {
+  if (hip::AllocateDevice(&p, bytes) != hipSuccess) {
     AssignError(error_msg,
-                "hipMalloc of " + std::to_string(bytes) + " bytes failed");
+                "allocation of " + std::to_string(bytes) + " bytes failed");
     allocations.push_back(nullptr);
     return nullptr;
   }
@@ -89,6 +95,19 @@ bool MatrixRows(std::uint32_t rows) {
 bool ExpertMatrixRows(std::uint32_t rows) {
   return prefill_phase || rows > 4 * kVecBatch;
 }
+/// Prefill passes wider than a vector batch take the fused projections and
+/// the paired routed expert tiles: they win from 9 rows up to the full chunk.
+/// Decode and verification batches keep their single-token arithmetic.
+bool WidePrefill(std::uint32_t rows) {
+  return prefill_phase && rows > kVecBatch;
+}
+
+/// Whether mmq's Q8_1 rows of width k carry no padding, so a producer's
+/// contiguous element order is the layout.
+bool UnpaddedQ8(std::uint32_t k) {
+  return k % 32 == 0 &&
+         qfn_mmq_q8_1_bytes(1, static_cast<int>(k)) == k / 32 * 36;
+}
 
 /// Key-tile splits per row of a narrow attention batch (decode at depth).
 constexpr std::uint32_t kAttnSplits = 8;
@@ -129,9 +148,527 @@ std::uint32_t IndexerCapacity(const Config& c, std::uint32_t batch,
       context, std::uint64_t{c.indexer_top_k} + batch)));
 }
 
+void PopulateSnapshotPrefix(std::uint8_t* data, std::uint64_t bytes,
+                            std::uint64_t worker_limit = 4) {
+  platform::PopulateWritablePages(data, static_cast<std::size_t>(bytes),
+                                  static_cast<std::size_t>(worker_limit));
+}
+
 }  // namespace
 
+namespace {
+constexpr std::uint64_t kSnapshotReuseBytes = 8ULL << 20;
+// Device memory kept free beyond the executor's own lazy scratch, for the
+// runtime and driver. Snapshot storage never grows into it.
+constexpr std::uint64_t kSnapshotDeviceSlackBytes = 512ULL << 20;
+
+/// Snapshot storage would leave too little device memory. Callers keep the
+/// checkpoint in its host payload instead; the request continues.
+class SnapshotDeviceExhausted : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+}  // namespace
+// Legacy hipFree synchronizes unrelated inference streams. Pool allocations
+// have stream-ordered release, so evicting a checkpoint cannot stall a peer.
+// Every transfer finishes before dropping its last storage reference.
+class SnapshotAllocator
+    : public std::enable_shared_from_this<SnapshotAllocator> {
+public:
+  // Every capture freezes the same mutable state size. Keep this many released
+  // blocks of it committed for the next captures: ROCm commits pool pages on
+  // each allocation (about 25 GB/s here), and an allocation also stalls other
+  // HIP calls, so a background refill would land in a peer's decode instead.
+  static constexpr std::size_t kSpareBlocks = 2;
+
+  /// `reserve` is the device memory every commit leaves free.
+  explicit SnapshotAllocator(std::uint64_t reserve) : reserve_(reserve) {
+    hipMemPoolProps properties{};
+    properties.allocType = hipMemAllocationTypePinned;
+    properties.handleTypes = hipMemHandleTypeNone;
+    properties.location.type = hipMemLocationTypeDevice;
+    CheckStatus(hipGetDevice(&properties.location.id), "snapshot pool device");
+    CheckStatus(hipMemPoolCreate(&pool_, &properties), "snapshot pool");
+    const auto created =
+        hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking);
+    if (created != hipSuccess) {
+      (void)hipMemPoolDestroy(pool_);
+      CheckStatus(created, "snapshot allocator stream");
+    }
+  }
+  ~SnapshotAllocator() {
+    for (void* spare : spares_)
+      (void)hipFree(spare);
+    (void)hipStreamSynchronize(stream_);
+    (void)hipStreamDestroy(stream_);
+    for (hipStream_t stream : free_streams_)
+      (void)hipStreamDestroy(stream);
+    (void)hipMemPoolDestroy(pool_);
+  }
+  std::shared_ptr<void> Allocate(std::uint64_t bytes) {
+    std::lock_guard lock(mutex_);
+    return Own(Commit(bytes), bytes);
+  }
+  /// Allocates storage the reserve already counts (the checkpoint arena): it
+  /// needs the reserve free only beyond its own bytes.
+  std::shared_ptr<void> AllocateReserved(std::uint64_t bytes) {
+    std::lock_guard lock(mutex_);
+    return Own(Commit(bytes, bytes), bytes);
+  }
+  /// Allocates the recurring mutable-state size, from a released block when
+  /// one is kept.
+  std::shared_ptr<void> AllocateSpare(std::uint64_t bytes) {
+    std::lock_guard lock(mutex_);
+    if (spare_bytes_ != bytes) {
+      for (void* spare : spares_)
+        (void)hipFree(spare);
+      spares_.clear();
+      spare_bytes_ = bytes;
+    }
+    if (spares_.empty())
+      return Own(Commit(bytes), bytes);
+    void* data = spares_.back();
+    spares_.pop_back();
+    return Own(data, bytes);
+  }
+  /// Bytes the spare blocks may hold, for scratch accounting.
+  [[nodiscard]] static std::uint64_t SpareBytes(std::uint64_t block) {
+    return kSpareBlocks * block;
+  }
+  /// Whether committing `bytes` keeps the reserve free. The snapshot budget
+  /// counts host payloads, but on an APU the device limit can be lower than
+  /// host RAM. ROCm 7.2's VM pool corrupts its heap when a page commit
+  /// fails, so storage is never requested beyond the device headroom.
+  [[nodiscard]] bool Fits(std::uint64_t bytes,
+                          std::uint64_t reserved = 0) const {
+    std::size_t free = 0;
+    std::size_t total = 0;
+    if (hipMemGetInfo(&free, &total) != hipSuccess)
+      return false;
+    return free >= bytes && free - bytes + reserved >= reserve_;
+  }
+  /// A transfer on a stream of its own, reused across transfers: creating a
+  /// stream can stall for milliseconds, and a shared stream would make a
+  /// capture wait for a peer's bulk materialization.
+  [[nodiscard]] std::unique_ptr<gufo::hip::SnapshotTransfer> Transfer() {
+    hipStream_t stream = nullptr;
+    {
+      std::lock_guard lock(streams_mutex_);
+      if (!free_streams_.empty()) {
+        stream = free_streams_.back();
+        free_streams_.pop_back();
+      }
+    }
+    if (stream == nullptr)
+      CheckStatus(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+                  "snapshot transfer stream");
+    return std::make_unique<gufo::hip::SnapshotTransfer>(
+        stream, [owner = shared_from_this()](hipStream_t done) {
+          std::lock_guard lock(owner->streams_mutex_);
+          owner->free_streams_.push_back(done);
+        });
+  }
+
+private:
+  static void CheckStatus(hipError_t error, const char* operation) {
+    if (error != hipSuccess)
+      throw std::runtime_error(std::string(operation) + ": " +
+                               hipGetErrorString(error));
+  }
+  void* Commit(std::uint64_t bytes, std::uint64_t reserved = 0) {
+    if (!Fits(bytes, reserved))
+      throw SnapshotDeviceExhausted("snapshot storage exceeds device headroom");
+    void* data = nullptr;
+    CheckStatus(hipMallocFromPoolAsync(&data, bytes, pool_, stream_),
+                "snapshot allocate");
+    const auto ready = hipStreamSynchronize(stream_);
+    if (ready != hipSuccess) {
+      (void)hipFree(data);
+      (void)hipStreamSynchronize(stream_);
+      CheckStatus(ready, "snapshot allocation ready");
+    }
+    return data;
+  }
+  std::shared_ptr<void> Own(void* data, std::uint64_t bytes) {
+    return {data, [owner = shared_from_this(), bytes](void* pointer) {
+              owner->Release(pointer, bytes);
+            }};
+  }
+  void Release(void* pointer, std::uint64_t bytes) {
+    std::lock_guard lock(mutex_);
+    if (bytes == spare_bytes_ && spares_.size() < kSpareBlocks) {
+      spares_.push_back(pointer);
+      return;
+    }
+    // In ROCm, hipFree recognizes pool allocations and bypasses SyncAllStreams.
+    // Unlike hipFreeAsync, it also permits a peer blocking-stream capture.
+    (void)hipFree(pointer);
+    // Keep physical memory bounded by retained checkpoints and the spares,
+    // including when their source session has already been destroyed.
+    (void)hipStreamSynchronize(stream_);
+  }
+  std::uint64_t reserve_;
+  std::mutex mutex_;
+  std::vector<void*> spares_;
+  std::uint64_t spare_bytes_{0};
+  hipStream_t stream_{nullptr};
+  std::mutex streams_mutex_;
+  std::vector<hipStream_t> free_streams_;
+  hipMemPool_t pool_{nullptr};
+};
+
+std::shared_ptr<SnapshotAllocator> Executor::GetSnapshotAllocator() const {
+  std::call_once(snapshot_allocator_once_, [&] {
+    // Admission reserved the lazy scratch; snapshots must not consume it.
+    snapshot_allocator_ = std::make_shared<SnapshotAllocator>(
+        DeferredScratchBytes() + kSnapshotDeviceSlackBytes);
+  });
+  return snapshot_allocator_;
+}
+
+// Provenance describes rows actually copied by a restore, rather than token
+// equality: different prefill shapes can produce different KV for the same
+// tokens. A branch shares its parent's rows only below its restored frontier.
+// These nodes retain metadata alone, never snapshot payloads or device storage.
+struct SnapshotLineage {
+  using Rows = std::array<std::uint32_t, 4>;
+  std::shared_ptr<const SnapshotLineage> parent;
+  Rows prefix{};
+  std::size_t depth = 0;
+  explicit SnapshotLineage(
+      std::shared_ptr<const SnapshotLineage> source = nullptr, Rows rows = {})
+      : parent(std::move(source)),
+        prefix(rows),
+        depth(parent ? parent->depth + 1 : 0) {}
+
+  static Rows Common(std::shared_ptr<const SnapshotLineage> left,
+                     std::shared_ptr<const SnapshotLineage> right,
+                     Rows bounds) {
+    const auto ascend = [&](auto& node) {
+      for (std::size_t i = 0; i < bounds.size(); ++i)
+        bounds[i] = std::min(bounds[i], node->prefix[i]);
+      node = node->parent;
+    };
+    if (!left || !right)
+      return {};
+    while (left->depth > right->depth)
+      ascend(left);
+    while (right->depth > left->depth)
+      ascend(right);
+    while (left != right) {
+      if (!left->parent || !right->parent)
+        return {};
+      ascend(left);
+      ascend(right);
+    }
+    return bounds;
+  }
+};
+
+struct SnapshotBlock {
+  SnapshotBlock(const std::shared_ptr<SnapshotAllocator>& allocator,
+                std::uint64_t bytes)
+      : storage(allocator->Allocate(bytes)), capacity(bytes) {}
+  std::shared_ptr<void> storage;
+  std::uint64_t capacity;
+  std::atomic<std::uint32_t> chunks{0};
+  std::uint64_t used = 0;
+};
+struct SnapshotChunk {
+  std::shared_ptr<SnapshotBlock> block;
+  std::uint8_t* device;
+  ~SnapshotChunk() { --block->chunks; }
+};
+struct SnapshotRegistry {
+  explicit SnapshotRegistry(std::shared_ptr<SnapshotAllocator> allocator)
+      : allocator(std::move(allocator)) {}
+  std::shared_ptr<SnapshotAllocator> allocator;
+  std::mutex mutex;
+  std::vector<std::weak_ptr<SnapshotState>> pending;
+  std::vector<std::weak_ptr<SnapshotBlock>> reserve;
+  std::exception_ptr failure;
+  void Preserve(std::uint32_t position, std::uint32_t mtp_position,
+                std::uint32_t blocks, std::uint32_t mtp_blocks);
+};
+
+void SnapshotState::Preserve(std::uint32_t position, std::uint32_t mtp_position,
+                             std::uint32_t blocks, std::uint32_t mtp_blocks,
+                             bool detach) const {
+  std::unique_ptr<gufo::hip::SnapshotTransfer> transfer;
+  for (auto& region : regions_) {
+    auto rows = region.draft ? mtp_position : position;
+    if (region.pooled)
+      rows = region.draft ? mtp_blocks : blocks;
+    const auto keep = std::uint64_t{rows} * region.row_bytes;
+    if (keep < region.pending_bytes) {
+      if (!transfer)
+        transfer = registry_->allocator->Transfer();
+      transfer->Copy(region.host + keep,
+                     static_cast<const std::uint8_t*>(region.device) + keep,
+                     region.pending_bytes - keep);
+      region.pending_bytes = keep;
+    }
+    if (detach)
+      region.live_bytes = std::min(region.live_bytes, keep);
+  }
+}
+
+void SnapshotState::Materialize() const {
+  std::lock_guard lock(registry_->mutex);
+  if (registry_->failure)
+    std::rethrow_exception(registry_->failure);
+  MaterializeLocked();
+}
+
+void SnapshotState::MaterializeLocked() const {
+  const auto transfer = registry_->allocator->Transfer();
+  for (const auto& region : regions_) {
+    PopulateSnapshotPrefix(region.host, region.bytes);
+    for (const auto& saved : region.saved)
+      transfer->Enqueue(region.host + saved.offset, saved.chunk->device,
+                        saved.bytes);
+  }
+  transfer->Finish();
+  Preserve(0, 0, 0, 0, false);
+  if (mutable_storage_) {
+    PopulateSnapshotPrefix(payload_ + mutable_offset_, mutable_bytes_);
+    transfer->Copy(payload_ + mutable_offset_, mutable_device_, mutable_bytes_);
+    mutable_storage_.reset();
+  }
+  if (extra_storage_) {
+    for (const auto& extra : extras_)
+      transfer->Enqueue(payload_ + extra.offset, extra.device, extra.bytes);
+    transfer->Finish();
+    extras_.clear();
+    extra_storage_.reset();
+  }
+  for (auto& region : regions_)
+    region.saved.clear();
+}
+
+std::uint64_t SnapshotState::DeviceBytes() const {
+  std::lock_guard lock(registry_->mutex);
+  std::uint64_t bytes = (mutable_storage_ ? mutable_bytes_ : 0) +
+                        (extra_storage_ ? extra_bytes_ : 0);
+  std::vector<const SnapshotBlock*> blocks;
+  for (const auto& region : regions_)
+    for (const auto& saved : region.saved) {
+      const auto* block = saved.chunk->block.get();
+      if (std::find(blocks.begin(), blocks.end(), block) == blocks.end()) {
+        blocks.push_back(block);
+        bytes += block->capacity;
+      }
+    }
+  return bytes;
+}
+
+void SnapshotRegistry::Preserve(std::uint32_t position,
+                                std::uint32_t mtp_position,
+                                std::uint32_t blocks,
+                                std::uint32_t mtp_blocks) {
+  struct Group {
+    void* device;
+    std::uint64_t keep;
+    std::uint64_t end;
+    std::vector<std::pair<SnapshotState::Region*, std::size_t>> regions;
+  };
+  std::vector<std::shared_ptr<SnapshotState>> snapshots;
+  std::vector<Group> groups;
+  std::vector<std::shared_ptr<SnapshotBlock>> available;
+  // Only overwritten rows need backing storage. Appending borrows K/V in
+  // place and does not allocate another context's worth of device pages.
+  for (auto it = reserve.begin(); it != reserve.end();) {
+    if (auto block = it->lock()) {
+      if (block->chunks == 0)
+        block->used = 0;
+      if (block->used < block->capacity &&
+          block->capacity - block->used <= kSnapshotReuseBytes)
+        available.push_back(std::move(block));
+      ++it;
+    } else {
+      it = reserve.erase(it);
+    }
+  }
+  for (auto it = pending.begin(); it != pending.end();) {
+    if (auto snapshot = it->lock()) {
+      for (auto& region : snapshot->regions_) {
+        auto rows = region.draft ? mtp_position : position;
+        if (region.pooled)
+          rows = region.draft ? mtp_blocks : blocks;
+        const auto keep = std::uint64_t{rows} * region.row_bytes;
+        if (keep < region.pending_bytes) {
+          auto group = std::find_if(
+              groups.begin(), groups.end(),
+              [&](const auto& entry) { return entry.device == region.device; });
+          if (group == groups.end()) {
+            groups.push_back({region.device,
+                              keep,
+                              region.pending_bytes,
+                              {{&region, snapshots.size()}}});
+          } else {
+            group->end = std::max(group->end, region.pending_bytes);
+            group->regions.emplace_back(&region, snapshots.size());
+          }
+        }
+      }
+      snapshots.push_back(std::move(snapshot));
+      ++it;
+    } else {
+      it = pending.erase(it);
+    }
+  }
+  struct Copy {
+    void* device;
+    std::uint64_t begin;
+    std::uint64_t end;
+    std::vector<SnapshotState::Region*> regions;
+    std::vector<std::size_t> owners;
+  };
+  std::vector<Copy> copies;
+  for (const auto& group : groups) {
+    std::vector<std::uint64_t> ends{group.keep};
+    for (const auto& [region, owner] : group.regions) {
+      (void)owner;
+      ends.push_back(region->pending_bytes);
+    }
+    std::sort(ends.begin(), ends.end());
+    ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
+    for (std::size_t index = 1; index < ends.size(); ++index) {
+      Copy copy{group.device, ends[index - 1], ends[index], {}, {}};
+      for (const auto& [region, owner] : group.regions)
+        if (region->pending_bytes >= copy.end) {
+          copy.regions.push_back(region);
+          copy.owners.push_back(owner);
+        }
+      copies.push_back(std::move(copy));
+    }
+  }
+  // Pack rows with the same consumers together across layers. Each consumer
+  // set gets one allocation, so protecting a deep prefix avoids dozens of
+  // small allocations. A short checkpoint retains only its own rows and at
+  // most bounded slack from a reused block belonging to other consumers.
+  std::stable_sort(copies.begin(), copies.end(),
+                   [](const auto& left, const auto& right) {
+                     return left.owners < right.owners;
+                   });
+  std::uint64_t capacity = 0;
+  for (const auto& block : available)
+    capacity += block->capacity - block->used;
+  // Allocate before enqueuing any copy or changing a checkpoint. Allocation
+  // failure then leaves the source and every retained checkpoint intact.
+  std::vector<std::uint64_t> commits;
+  std::uint64_t needed = 0;
+  for (std::size_t first = 0; first < copies.size();) {
+    auto last = first;
+    std::uint64_t bytes = 0;
+    while (last < copies.size() &&
+           copies[last].owners == copies[first].owners) {
+      bytes += copies[last].end - copies[last].begin;
+      ++last;
+    }
+    const auto reused = std::min(capacity, bytes);
+    capacity -= reused;
+    bytes -= reused;
+    if (bytes != 0) {
+      commits.push_back(bytes);
+      needed += bytes;
+    }
+    first = last;
+  }
+  bool device = needed == 0 || allocator->Fits(needed);
+  if (device) {
+    try {
+      for (const auto bytes : commits) {
+        auto block = std::make_shared<SnapshotBlock>(allocator, bytes);
+        reserve.push_back(block);
+        available.push_back(std::move(block));
+      }
+    } catch (const SnapshotDeviceExhausted&) {
+      device = false;
+    }
+  }
+  if (!device) {
+    // No device room for the overwritten rows: move each affected checkpoint
+    // into its host payload, which the snapshot budget already charges. This
+    // also releases the device copies it held from earlier rewinds.
+    std::vector<bool> affected(snapshots.size());
+    for (const auto& copy : copies)
+      for (const auto owner : copy.owners)
+        affected[owner] = true;
+    for (std::size_t index = 0; index < snapshots.size(); ++index)
+      if (affected[index])
+        snapshots[index]->MaterializeLocked();
+    copies.clear();
+    available.clear();
+  }
+  std::size_t block_index = 0;
+  std::unique_ptr<gufo::hip::SnapshotTransfer> transfer;
+  for (auto& copy : copies) {
+    for (auto begin = copy.begin; begin < copy.end;) {
+      if (block_index < available.size() &&
+          available[block_index]->used == available[block_index]->capacity)
+        ++block_index;
+      if (block_index >= available.size())
+        throw std::logic_error(
+            "snapshot protection exceeded allocated storage");
+      auto& used = available[block_index]->used;
+      const auto bytes =
+          std::min(available[block_index]->capacity - used, copy.end - begin);
+      auto chunk = std::make_shared<SnapshotChunk>();
+      chunk->block = available[block_index];
+      ++chunk->block->chunks;
+      chunk->device =
+          static_cast<std::uint8_t*>(chunk->block->storage.get()) + used;
+      if (!transfer)
+        transfer = allocator->Transfer();
+      transfer->Enqueue(chunk->device,
+                        static_cast<const std::uint8_t*>(copy.device) + begin,
+                        bytes, hipMemcpyDeviceToDevice);
+      for (auto* region : copy.regions)
+        region->saved.push_back({begin, bytes, chunk});
+      used += bytes;
+      begin += bytes;
+    }
+  }
+  if (transfer)
+    transfer->Finish();
+  for (const auto& snapshot : snapshots) {
+    for (auto& region : snapshot->regions_) {
+      auto rows = region.draft ? mtp_position : position;
+      if (region.pooled)
+        rows = region.draft ? mtp_blocks : blocks;
+      const auto keep = std::uint64_t{rows} * region.row_bytes;
+      region.pending_bytes = std::min(region.pending_bytes, keep);
+      region.live_bytes = std::min(region.live_bytes, keep);
+    }
+  }
+}
+
+void Session::PreserveSnapshots(std::uint32_t position,
+                                std::uint32_t mtp_position) const {
+  if (!snapshots_ || (position >= snapshot_position_ &&
+                      mtp_position >= snapshot_mtp_position_))
+    return;
+  std::lock_guard lock(snapshots_->mutex);
+  if (snapshots_->failure)
+    std::rethrow_exception(snapshots_->failure);
+  const auto ratio = owner_->config().compress_ratio;
+  snapshots_->Preserve(position, mtp_position,
+                       ratio ? std::min(blocks_, position / ratio) : 0,
+                       ratio ? std::min(mtp_.blocks, mtp_position / ratio) : 0);
+  snapshot_position_ = std::min(snapshot_position_, position);
+  snapshot_mtp_position_ = std::min(snapshot_mtp_position_, mtp_position);
+}
+
 Session::~Session() {
+  try {
+    PreserveSnapshots(0, 0);
+  } catch (...) {
+    // The backing device may be lost. Leave retained checkpoints readable as
+    // failures instead of allowing a later reader to touch freed allocations.
+    std::lock_guard lock(snapshots_->mutex);
+    snapshots_->failure = std::current_exception();
+  }
   TrimRollback(0);
   for (auto& [key, exec] : graphs_) {
     (void)hipGraphExecDestroy(exec);
@@ -154,6 +691,12 @@ void Session::RestoreVisionLayout(const qwen::vision::RopeLayout& layout,
     graphs_.clear();
     warmed_.clear();
   }
+}
+
+void Session::PrepareVision(hipStream_t stream) {
+  vision_input_.PrepareRope(stream);
+  for (auto& attention : attention_)
+    attention.rope = vision_input_.rope();
 }
 
 void Session::ConfigureVision(
@@ -196,6 +739,115 @@ std::size_t Session::AllocatedBytes() const noexcept {
   return allocated_bytes_ + rollback_bytes_ + vision_input_.Bytes();
 }
 
+PrefillCheckpoint::~PrefillCheckpoint() {
+  if (!state)
+    return;
+  source->snapshot_position_ =
+      std::max(source->snapshot_position_, state->snapshot_position_);
+  source->snapshot_mtp_position_ =
+      std::max(source->snapshot_mtp_position_, state->snapshot_mtp_position_);
+  // The view owns no cache allocations. Its borrowed rows belong to source.
+  state->snapshots_.reset();
+}
+
+bool Executor::ReservePrefillCheckpoint(const Session& session) const {
+  if (checkpoint_storage_)
+    return true;
+  const auto& c = config();
+  std::size_t floats =
+      has_mtp() ? std::size_t{options_.max_speculative} * c.HcDim() : 0;
+  for (const auto& linear : session.linear_)
+    if (linear.state)
+      floats +=
+          std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels() +
+          std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
+  if (c.ple_layer >= 0)
+    floats += std::size_t{c.PleConvHistory()} * c.HcDim();
+  try {
+    // Forward scratch is shared by the executor. The checkpoint is frozen
+    // into private snapshot storage before another session can reuse it.
+    // DeferredScratchBytes reserved it, so it may take its own reservation.
+    checkpoint_storage_ =
+        GetSnapshotAllocator()->AllocateReserved(floats * sizeof(float));
+  } catch (const SnapshotDeviceExhausted&) {
+    return false;
+  }
+  return true;
+}
+
+std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
+    Session& source, std::span<const std::int32_t> tokens, std::uint32_t prefix,
+    std::string* error_msg) const {
+  if (source.owner_ != this || prefix == 0 || prefix > tokens.size() ||
+      tokens.size() - prefix > kVecBatch ||
+      !source.VisionLayout().images.empty()) {
+    AssignError(error_msg, "prefill checkpoint must be in the text tail");
+    return nullptr;
+  }
+  const auto& c = config();
+  auto checkpoint = std::make_unique<PrefillCheckpoint>();
+  checkpoint->source = &source;
+  checkpoint->tokens = prefix;
+  checkpoint->hidden_rows =
+      source.mtp_enabled_ ? std::min(prefix, options_.max_speculative) : 0;
+  checkpoint->logits.resize(c.vocab_size);
+  checkpoint->state.reset(new Session);
+  auto& view = *checkpoint->state;
+  view.owner_ = this;
+  view.max_context_ = source.max_context_;
+  view.index_capacity_ = source.index_capacity_;
+  view.position_ = source.position_ + prefix;
+  view.mtp_enabled_ = source.mtp_enabled_;
+  view.attention_ = source.attention_;
+  view.linear_.resize(source.linear_.size());
+  view.blocks_ = c.compress_ratio > 0 && view.position_ > c.indexer_top_k
+                     ? view.position_ / c.compress_ratio
+                     : source.blocks_;
+  view.mtp_ = source.mtp_;
+  if (source.mtp_enabled_) {
+    view.mtp_.position = view.position_ - 1;
+    view.mtp_.blocks = view.mtp_.position > c.indexer_top_k
+                           ? view.mtp_.position / c.compress_ratio
+                           : source.mtp_.blocks;
+    if (prefix > 1)
+      view.mtp_.residual_valid = false;
+  }
+  view.ngram_ = source.ngram_;
+  std::vector<std::uint32_t> rows(std::size_t{prefix} * c.ple_heads);
+  if (c.ple_layer >= 0)
+    HashNgramRows(c, view.ngram_, tokens.first(prefix), rows);
+  if (!source.snapshots_)
+    source.snapshots_ =
+        std::make_shared<SnapshotRegistry>(GetSnapshotAllocator());
+  if (!source.snapshot_lineage_)
+    source.snapshot_lineage_ = std::make_shared<SnapshotLineage>();
+  view.snapshots_ = source.snapshots_;
+  view.snapshot_lineage_ = source.snapshot_lineage_;
+  const auto conv = std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
+  const auto recurrent =
+      std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
+  if (!checkpoint_storage_) {
+    AssignError(error_msg, "prefill checkpoint arena is not reserved");
+    return nullptr;
+  }
+  auto* storage = static_cast<float*>(checkpoint_storage_.get());
+  for (std::size_t il = 0; il < source.linear_.size(); ++il) {
+    if (!source.linear_[il].state)
+      continue;
+    view.linear_[il].conv_state = storage;
+    storage += conv;
+    view.linear_[il].state = storage;
+    storage += recurrent;
+  }
+  if (c.ple_layer >= 0) {
+    view.ple_history_ = storage;
+    storage += std::size_t{c.PleConvHistory()} * c.HcDim();
+  }
+  if (source.mtp_enabled_)
+    view.mtp_.target_hidden = storage;
+  return checkpoint;
+}
+
 void Session::TrimRollback(std::uint32_t depth) noexcept {
   if (depth >= rollback_depth_)
     return;
@@ -228,8 +880,16 @@ void Session::TrimRollback(std::uint32_t depth) noexcept {
   ngram_snapshots_.resize(depth);
 }
 
-void Session::Reset() {
-  TrimRollback(0);
+void Session::Reset(bool reuse_mtp) {
+  // Reset leaves append-only rows intact. Preserve them at the first write
+  // that would overwrite them, allowing cancellation to resume by rewind.
+  // Scratch is overwritten by the next verification. Retaining its stable
+  // addresses also retains the graphs; freeing it at every cache reassignment
+  // makes later MTP requests allocate and record those shapes again. Its full
+  // bound is already included in speculative SessionBytes and AllocatedBytes.
+  if (!reuse_mtp || !mtp_enabled_)
+    TrimRollback(0);
+  snapshot_lineage_.reset();
   position_ = 0;
   spec_tokens_ = 0;
   ngram_.Reset();
@@ -237,55 +897,57 @@ void Session::Reset() {
   mtp_.residual_valid = false;
   mtp_.blocks = 0;
   const Config& c = owner_->config();
+  const auto zero = [&](void* pointer, std::size_t bytes) {
+    const auto result = hipMemsetAsync(pointer, 0, bytes, owner_->stream());
+    // Adapter invalidation may report success only after every zero fill was
+    // submitted and completed. Keep legacy cleanup's error policy unchanged.
+    if (result != hipSuccess && continuation_hooks_)
+      throw std::runtime_error(hipGetErrorString(result));
+  };
   for (auto& l : linear_) {
     if (l.state != nullptr) {
-      (void)hipMemset(l.conv_state, 0,
-                      static_cast<std::size_t>(c.ssm_conv_kernel - 1) *
-                          c.SsmConvChannels() * sizeof(float));
-      (void)hipMemset(l.state, 0,
-                      static_cast<std::size_t>(c.ssm_num_v_heads) *
-                          c.ssm_head_dim * c.ssm_head_dim * sizeof(float));
+      zero(l.conv_state, static_cast<std::size_t>(c.ssm_conv_kernel - 1) *
+                             c.SsmConvChannels() * sizeof(float));
+      zero(l.state, static_cast<std::size_t>(c.ssm_num_v_heads) *
+                        c.ssm_head_dim * c.ssm_head_dim * sizeof(float));
     }
   }
   blocks_ = 0;
   if (ple_history_ != nullptr) {
-    (void)hipMemset(ple_history_, 0,
-                    static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim() *
-                        sizeof(float));
+    zero(ple_history_, static_cast<std::size_t>(c.PleConvHistory()) *
+                           c.HcDim() * sizeof(float));
   }
 }
 
 Executor::~Executor() {
   // Readers write pinned staging memory; drain them before freeing it,
   // including when a forward failed before reaching PLE.
-  if (ple_pending_) {
+  if (ple_pending_ || prefetch_.pending) {
     (void)ngram_->WaitRead();
   }
   (void)hipFree(batch_logits_);
+  (void)hipFree(wide_controls_);
+  for (float* p : wide_allocations_)
+    (void)hipFree(p);
   (void)hipFree(verification_penalties_);
-  (void)hipHostFree(batch_gdn_host_);
-  (void)hipHostFree(batch_controls_);
-  (void)hipHostFree(batch_candidates_host_);
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
-  for (void* p :
-       {static_cast<void*>(host_emb_), static_cast<void*>(control_host_),
-        static_cast<void*>(tokens_host_), static_cast<void*>(logits_host_),
-        static_cast<void*>(mtp_token_host_), static_cast<void*>(counts_host_),
-        static_cast<void*>(mtp_candidates_host_),
-        static_cast<void*>(tiles_host_)}) {
-    if (p != nullptr) {
-      (void)hipHostFree(p);
-    }
-  }
+  host_allocations_.Reset();
   if (blas_ != nullptr) {
     (void)hipblasDestroy(blas_);
   }
   if (counts_ready_ != nullptr) {
     (void)hipEventDestroy(counts_ready_);
   }
+  for (hipEvent_t event : {side_start_, side_done_}) {
+    if (event != nullptr)
+      (void)hipEventDestroy(event);
+  }
+  if (side_stream_ != nullptr)
+    (void)hipStreamDestroy(side_stream_);
   if (stream_ != nullptr) {
+    qfn_mmq_release_stream(stream_);
     (void)hipStreamDestroy(stream_);
   }
 }
@@ -306,11 +968,23 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     AssignError(error_msg, "quantized GEMM tier initialization failed");
     return nullptr;
   }
+  if (!Check(PrepareW8A8GemmWave64(), "wide Q8 GEMM preparation", error_msg))
+    return nullptr;
+  // The first greedy verification otherwise resolves the shared argmax
+  // module on the decode path. Preparation launches no trial kernels.
+  if (e->has_mtp() && !Check(gufo::hip::PrepareBatchedGPUArgmax(),
+                             "MTP argmax preparation", error_msg))
+    return nullptr;
   if (!Check(hipStreamCreate(&e->stream_), "hipStreamCreate", error_msg)) {
     return nullptr;
   }
   if (!Check(hipEventCreateWithFlags(&e->counts_ready_, hipEventDisableTiming),
-             "expert counts event", error_msg)) {
+             "expert counts event", error_msg) ||
+      !Check(hipStreamCreate(&e->side_stream_), "side stream", error_msg) ||
+      !Check(hipEventCreateWithFlags(&e->side_start_, hipEventDisableTiming),
+             "side stream fork event", error_msg) ||
+      !Check(hipEventCreateWithFlags(&e->side_done_, hipEventDisableTiming),
+             "side stream join event", error_msg)) {
     return nullptr;
   }
   if (hipblasCreate(&e->blas_) != HIPBLAS_STATUS_SUCCESS ||
@@ -319,10 +993,34 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     return nullptr;
   }
   const Config& c = model.config();
+  if (options.max_context > c.MaxContextLength()) {
+    AssignError(error_msg, "executor context exceeds the model context");
+    return nullptr;
+  }
+  e->context_capacity_ = std::max(c.context_length, options.max_context);
+  e->yarn_ = MakeYarnRope(c.rope_scaling, c.rotary_dim, c.rope_theta);
   const std::size_t T = e->options_.max_batch;
   e->blaslt_ = BlasLt::Create(e->stream_, error_msg);
   if (e->blaslt_ == nullptr) {
     return nullptr;
+  }
+  if (MatrixRows(T)) {
+    // The first indexer heuristic query also loads the library's code object.
+    // Do that before readiness instead of leaving a ~100 ms GPU idle gap in
+    // the first prefill. Exact geometry still determines every plan; no trial
+    // GEMM runs and no model activations or session state are touched.
+    for (const auto& layer : model.layers()) {
+      for (const auto* tensor : {&layer.indexer_k, &layer.indexer_q}) {
+        if (!tensor->empty() &&
+            (tensor->type == GgmlType::kBF16 ||
+             tensor->type == GgmlType::kF16) &&
+            !e->blaslt_->Prepare(
+                tensor->type == GgmlType::kBF16 ? HIP_R_16BF : HIP_R_16F,
+                tensor->rows, T, tensor->cols, error_msg)) {
+          return nullptr;
+        }
+      }
+    }
   }
   const std::size_t hc_dim = c.HcDim();
   const std::size_t hidden = c.hidden_size;
@@ -339,6 +1037,16 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                            static_cast<int>(model.max_q8_cols())),
         error_msg);
   }
+  const auto q8_1 = [&](std::size_t k) {
+    return Alloc<std::uint8_t>(
+        a, qfn_mmq_q8_1_bytes(static_cast<int>(kVecBatch), static_cast<int>(k)),
+        error_msg);
+  };
+  s.xn_q8_1 = q8_1(hc_dim);
+  s.lo_q8_1 = q8_1(c.hc_low_rank);
+  s.mixed_q8_1 = q8_1(hidden);
+  s.gdn_q8_1 = q8_1(c.SsmValueDim());
+  s.ctx_q8_1 = q8_1(c.AttentionQDim());
   s.x_q8t =
       Alloc<std::uint8_t>(a, Q8TiledBytes(T, model.max_q8_cols()), error_msg);
   s.res = f32(T * hc_dim);
@@ -346,40 +1054,78 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.xn_half = Alloc<__half>(a, T * hc_dim, error_msg);
   s.xn_q8t = Alloc<std::uint8_t>(a, Q8TiledBytes(T, hc_dim), error_msg);
   s.lo = f32(T * c.hc_low_rank);
-  s.hc_gate = f32(T * hc_dim);
   s.mixed = f32(T * hidden);
   s.inject = f32(T * c.hc_count * HcInjectParts(hidden));
   s.block_out = f32(T * hidden);
+  s.hc_defer_w = f32(T * c.hc_count);
+  e->hc_fused_state_ =
+      Alloc<std::uint8_t>(a, HcMixQ8FusedStateBytes(), error_msg);
+  e->mask_words_ = c.SparseMaskWords(e->context_capacity_);
+  const std::size_t linear_projection = std::max<std::size_t>(
+      c.SsmConvChannels() + c.SsmValueDim(), c.ple_layer >= 0 ? hc_dim : 0);
+  const std::size_t linear_floats =
+      T * (linear_projection + 2 * c.ssm_num_v_heads + 2 * c.SsmKeyDim() +
+           2 * c.SsmValueDim()) +
+      (T + c.ssm_conv_kernel) * c.SsmConvChannels();
+  const std::size_t attention_floats =
+      T * (5 * c.AttentionQDim() + 4 * c.AttentionKvDim() +
+           c.indexer_heads * c.indexer_head_dim + c.indexer_head_dim +
+           e->mask_words_);
+  const std::size_t expert_floats = slots * (2 * c.expert_ff + hidden);
+  // Linear/full attention and routed experts run sequentially on stream_.
+  // Their intermediates die before the next stage, including batched rows,
+  // MTP catch-up and the deferred MoE epilogue consumed by Combine. Keep
+  // stable addresses for graph replay without reserving all three stages.
+  float* const stage =
+      f32(std::max({linear_floats, attention_floats, expert_floats,
+                    T * (linear_projection + hc_dim)}));
+  if (stage == nullptr) {
+    return nullptr;
+  }
+  // Mixer gates die before attention/experts start. PLE also uses this
+  // buffer as its key, so keep it beyond PLE's gated output at stage.
+  s.hc_gate = stage + T * linear_projection;
+  float* cursor = stage;
+  const auto take = [&](std::size_t count) {
+    float* result = cursor;
+    cursor += count;
+    return result;
+  };
   // Stacked and separate SSM projections are mutually exclusive. MTP's
   // projected embedding is consumed before attention and reuses this space.
-  s.qkvz = f32(T * std::max<std::size_t>({c.SsmConvChannels() + c.SsmValueDim(),
-                                          c.ple_layer >= 0 ? hc_dim : 0}));
+  s.qkvz = take(T * linear_projection);
   s.qkv = s.qkvz;
   s.z = s.qkvz != nullptr ? s.qkvz + T * c.SsmConvChannels() : nullptr;
-  s.alpha_beta = f32(T * 2 * c.ssm_num_v_heads);
-  s.conv_scratch = f32((T + c.ssm_conv_kernel) * c.SsmConvChannels());
-  s.qn = f32(T * c.SsmKeyDim());
-  s.kn = f32(T * c.SsmKeyDim());
-  s.gdn_raw = f32(T * c.SsmValueDim());
-  s.gdn_out = f32(T * c.SsmValueDim());
-  s.qg = f32(T * (2 * c.AttentionQDim() + 2 * c.AttentionKvDim()));
-  s.q = f32(T * c.AttentionQDim());
-  s.attn_gate = f32(T * c.AttentionQDim());
-  s.k = f32(T * c.AttentionKvDim());
-  s.v = f32(T * c.AttentionKvDim());
-  s.iq = f32(T * c.indexer_heads * c.indexer_head_dim);
-  s.ik = f32(T * c.indexer_head_dim);
-  const std::uint32_t max_blocks =
-      (c.context_length + c.compress_ratio - 1) / c.compress_ratio;
-  e->mask_words_ = (max_blocks + 31) / 32;
-  s.mask = Alloc<std::uint32_t>(a, T * e->mask_words_, error_msg);
-  s.scores =
-      f32(static_cast<std::size_t>(e->select_chunk_) * e->mask_words_ * 32);
-  s.ctx = f32(T * c.AttentionQDim());
+  s.alpha_beta = take(T * 2 * c.ssm_num_v_heads);
+  s.conv_scratch = take((T + c.ssm_conv_kernel) * c.SsmConvChannels());
+  s.qn = take(T * c.SsmKeyDim());
+  s.kn = take(T * c.SsmKeyDim());
+  s.gdn_raw = take(T * c.SsmValueDim());
+  s.gdn_out = take(T * c.SsmValueDim());
+  cursor = stage;
+  s.qg = take(T * (2 * c.AttentionQDim() + 2 * c.AttentionKvDim()));
+  s.q = take(T * c.AttentionQDim());
+  s.attn_gate = take(T * c.AttentionQDim());
+  s.k = take(T * c.AttentionKvDim());
+  s.v = take(T * c.AttentionKvDim());
+  s.iq = take(T * c.indexer_heads * c.indexer_head_dim);
+  s.ik = take(T * c.indexer_head_dim);
+  s.mask = reinterpret_cast<std::uint32_t*>(take(T * e->mask_words_));
+  s.ctx = take(T * c.AttentionQDim());
+  // Keep score/selection traffic near the device cache size. Captured
+  // verification still needs all its rows at the maximum context.
+  const std::size_t score_stride = std::size_t{e->mask_words_} * 32;
+  e->select_score_floats_ =
+      std::max(kVecBatch * score_stride,
+               std::min(std::size_t{5 * 1024 * 1024}, 512 * score_stride));
+  s.scores = f32(e->select_score_floats_);
   s.attn_partials = f32(static_cast<std::size_t>(kVecBatch) * c.num_heads *
                         kAttnSplits * (c.head_dim + 2));
+  s.attn_lists = Alloc<std::uint32_t>(
+      a, std::size_t{kVecBatch} * (c.indexer_top_k / c.compress_ratio),
+      error_msg);
+  s.attn_counts = Alloc<std::uint32_t>(a, kVecBatch, error_msg);
   if (c.ple_layer >= 0) {
-    s.ple_emb = f32(T * c.PleEmbeddingDim());
     // PLE finishes before this layer's mixer/SSM. Its gate consumes key
     // and query before normalization/convolution reuse those two buffers.
     // The gated input stays separate until PleInject consumes both outputs.
@@ -391,13 +1137,26 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.ple_conv = s.xn;
     s.ple_history_scratch =
         f32(static_cast<std::size_t>(c.PleConvHistory()) * hc_dim);
+    // The quantizer reads each n-gram row once. On this UMA target it can
+    // consume the coherent reader buffer directly, without another device
+    // allocation or upload. Its address stays fixed for graph replay; the
+    // next-chunk prefetch uses separate storage until this forward finishes.
     void* pinned = nullptr;
-    if (!Check(hipHostMalloc(&pinned, T * c.PleEmbeddingDim() * sizeof(float)),
+    if (!Check(e->host_allocations_.Allocate(
+                   &pinned, T * c.PleEmbeddingDim() * sizeof(float),
+                   hipHostMallocMapped | hipHostMallocCoherent),
                "pinned n-gram buffer", error_msg)) {
       return nullptr;
     }
     e->host_emb_ = static_cast<float*>(pinned);
+    if (!Check(hipHostGetDevicePointer(reinterpret_cast<void**>(&s.ple_emb),
+                                       pinned, 0),
+               "mapped n-gram buffer", error_msg)) {
+      return nullptr;
+    }
     e->host_rows_.resize(T * c.ple_heads);
+    if (ngram)
+      ngram->ReserveGather(T * c.ple_heads);
   }
   s.router = f32(T * (c.num_experts + 1));
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
@@ -412,9 +1171,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
         Alloc<std::int32_t>(a, 3 * RoutedTileCapacity(slots, c), error_msg);
   }
   s.weights = f32(slots);
-  s.gate_e = f32(slots * c.expert_ff);
-  s.up_e = f32(slots * c.expert_ff);
-  s.down_e = f32(slots * hidden);
+  cursor = stage;
+  s.gate_e = take(slots * c.expert_ff);
+  s.up_e = take(slots * c.expert_ff);
+  s.down_e = take(slots * hidden);
   s.shexp_gate = f32(T * c.shared_expert_ff);
   s.shexp_up = f32(T * c.shared_expert_ff);
   s.shexp_out = f32(T * hidden);
@@ -425,25 +1185,29 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     void* control = nullptr;
     void* tokens = nullptr;
     void* logits = nullptr;
-    if (!Check(hipHostMalloc(&control, sizeof(Session::Control)),
-               "pinned control buffer", error_msg) ||
-        !Check(hipHostMalloc(&tokens, T * sizeof(std::int32_t)),
+    if (!Check(
+            e->host_allocations_.Allocate(&control, sizeof(Session::Control)),
+            "pinned control buffer", error_msg) ||
+        !Check(e->host_allocations_.Allocate(&tokens, T * sizeof(std::int32_t)),
                "pinned token buffer", error_msg) ||
-        !Check(hipHostMalloc(&logits, static_cast<std::size_t>(
-                                          e->options_.max_logit_rows) *
-                                          c.vocab_size * sizeof(float)),
-               "pinned logits buffer", error_msg)) {
+        !Check(
+            e->host_allocations_.Allocate(
+                &logits, static_cast<std::size_t>(e->options_.max_logit_rows) *
+                             c.vocab_size * sizeof(float)),
+            "pinned logits buffer", error_msg)) {
       return nullptr;
     }
     void* counts = nullptr;
-    if (!Check(hipHostMalloc(&counts, c.num_experts * sizeof(std::uint32_t)),
+    if (!Check(e->host_allocations_.Allocate(
+                   &counts, c.num_experts * sizeof(std::uint32_t)),
                "pinned expert counts", error_msg)) {
       return nullptr;
     }
     e->counts_host_ = static_cast<std::uint32_t*>(counts);
     void* tiles = nullptr;
-    if (!Check(hipHostMalloc(&tiles, 3 * RoutedTileCapacity(slots, c) *
-                                         sizeof(std::int32_t)),
+    if (!Check(e->host_allocations_.Allocate(
+                   &tiles,
+                   3 * RoutedTileCapacity(slots, c) * sizeof(std::int32_t)),
                "pinned routed tile map", error_msg)) {
       return nullptr;
     }
@@ -467,7 +1231,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.mtp_eproj = s.qkvz;
     s.mtp_res = s.res;
     s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
-    s.mtp_token = Alloc<std::int32_t>(a, 1, error_msg);
+    // The draft token and its confidence (float bits), one host transfer.
+    s.mtp_token = Alloc<std::int32_t>(a, 2, error_msg);
     const auto candidate_ids = std::max<std::size_t>(
         MtpCandidateWorkspaceSize(c.vocab_size),
         e->options_.max_speculative * kArgmaxParts *
@@ -477,16 +1242,38 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // Final selection consumes intermediate IDs before writing its scores.
     // Pack those scores behind the 64 returned IDs for one host transfer.
     s.mtp_scores = reinterpret_cast<float*>(s.mtp_ids + kMtpCandidates);
-    if (!Check(hipHostMalloc(&e->mtp_token_host_, sizeof(std::int32_t)),
+    if (!Check(e->host_allocations_.Allocate(&e->mtp_token_host_,
+                                             2 * sizeof(std::int32_t)),
                "pinned draft token", error_msg) ||
-        !Check(
-            hipHostMalloc(&e->mtp_candidates_host_, sizeof(MtpCandidateLogits)),
-            "pinned draft candidates", error_msg)) {
+        !Check(e->host_allocations_.Allocate(&e->mtp_candidates_host_,
+                                             sizeof(MtpCandidateLogits)),
+               "pinned draft candidates", error_msg)) {
       return nullptr;
     }
     std::construct_at(e->mtp_candidates_host_);
     e->mtp_candidates_host_->size =
         std::min<std::size_t>(c.vocab_size, kMtpCandidates);
+    const auto rows = std::min<std::size_t>(7, e->options_.max_speculative - 1);
+    if (rows != 0) {
+      e->verification_ids_ = Alloc<std::uint32_t>(
+          a, rows * MtpCandidateWorkspaceSize(c.vocab_size), error_msg);
+      e->verification_scratch_ids_ = Alloc<std::uint32_t>(
+          a, rows * MtpCandidateWorkspaceSize(c.vocab_size), error_msg);
+      const auto candidates = rows * (kMtpCandidates + kCompactPenaltyLimit);
+      e->verification_candidates_ =
+          Alloc<sampling::LogitCandidate>(a, candidates, error_msg);
+      if (!Check(e->host_allocations_.Allocate(
+                     &e->verification_candidates_host_,
+                     candidates * sizeof(sampling::LogitCandidate)),
+                 "pinned verification candidates", error_msg) ||
+          !Check(hip::AllocateDevice(&e->verification_penalties_,
+                                     rows * kCompactPenaltyLimit *
+                                         sizeof(sampling::TokenPenalty)),
+                 "verification penalties", error_msg))
+        return nullptr;
+      e->verification_penalty_capacity_ = rows * kCompactPenaltyLimit;
+      e->verification_penalty_host_.reserve(e->verification_penalty_capacity_);
+    }
   }
   for (void* p : a) {
     if (p == nullptr) {
@@ -507,7 +1294,7 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     return nullptr;
   }
   const Config& c = config();
-  if (max_context == 0 || max_context > c.context_length) {
+  if (max_context == 0 || max_context > context_capacity_) {
     AssignError(error_msg, "session context exceeds the model context");
     return nullptr;
   }
@@ -555,9 +1342,13 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   }
   s->control_ = Alloc<Session::Control>(a, 1, error_msg, &s->allocated_bytes_);
   if (s->mtp_enabled_) {
-    s->mtp_.target_hidden = Alloc<float>(
-        a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
-        error_msg, &s->allocated_bytes_);
+    // Wide copy verification keeps every row for the draft catch-up.
+    s->mtp_.target_hidden =
+        Alloc<float>(a,
+                     static_cast<std::size_t>(
+                         std::max(options_.max_speculative, max_copy_rows())) *
+                         c.HcDim(),
+                     error_msg, &s->allocated_bytes_);
     s->mtp_.k_cache =
         Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
                       error_msg, &s->allocated_bytes_);
@@ -571,6 +1362,14 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
         a, std::size_t{max_context / c.compress_ratio + 1} * c.indexer_head_dim,
         error_msg, &s->allocated_bytes_);
     s->mtp_.h = Alloc<float>(a, c.HcDim(), error_msg, &s->allocated_bytes_);
+    if (!model_->draft_output().empty()) {
+      s->mtp_.draft_rows = Alloc<std::uint8_t>(
+          a,
+          std::size_t{kMtpDraftExtraRows} * model_->output_row_bytes() + 4096,
+          error_msg, &s->allocated_bytes_);
+      s->mtp_.draft_ids = Alloc<std::int32_t>(a, kMtpDraftExtraRows, error_msg,
+                                              &s->allocated_bytes_);
+    }
   }
   for (void* p : a) {
     if (p == nullptr) {
@@ -582,7 +1381,80 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   if (!Check(hipDeviceSynchronize(), "session init", error_msg)) {
     return nullptr;
   }
+  // The table starts with the special tokens; every other slot is empty.
+  if (s->mtp_.draft_rows != nullptr &&
+      (!ClearDraftRows(*s, 0, error_msg) ||
+       !AppendDraftRows(*s, 0, model_->draft_specials(), error_msg) ||
+       !Check(hipStreamSynchronize(stream_), "draft table init", error_msg))) {
+    return nullptr;
+  }
   return s;
+}
+
+bool Executor::AppendDraftRows(Session& session, std::uint32_t first,
+                               std::span<const std::int32_t> ids,
+                               std::string* error_msg) const {
+  if (ids.empty())
+    return true;
+  if (session.owner_ != this || session.mtp_.draft_rows == nullptr ||
+      first > kMtpDraftExtraRows || ids.size() > kMtpDraftExtraRows - first) {
+    AssignError(error_msg, "invalid draft table append");
+    return false;
+  }
+  const auto& output = model_->output();
+  const std::size_t row_bytes = model_->output_row_bytes();
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    if (ids[i] < 0 || static_cast<std::uint32_t>(ids[i]) >= output.rows) {
+      AssignError(error_msg, "draft table token out of range");
+      return false;
+    }
+    // The ID goes by value, so no host buffer has to outlive the call.
+    if (!Check(hipMemcpyAsync(session.mtp_.draft_rows + (first + i) * row_bytes,
+                              static_cast<const std::uint8_t*>(output.data) +
+                                  static_cast<std::size_t>(ids[i]) * row_bytes,
+                              row_bytes, hipMemcpyDeviceToDevice, stream_),
+               "draft table row", error_msg) ||
+        !Check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(
+                                     session.mtp_.draft_ids + first + i),
+                                 ids[i], 1, stream_),
+               "draft table id", error_msg))
+      return false;
+  }
+  return true;
+}
+
+bool Executor::ClearDraftRows(Session& session, std::uint32_t first,
+                              std::string* error_msg) const {
+  if (session.owner_ != this || session.mtp_.draft_ids == nullptr ||
+      first > kMtpDraftExtraRows) {
+    AssignError(error_msg, "invalid draft table clear");
+    return false;
+  }
+  // Stale rows stay; an ID of -1 masks the slot.
+  return first == kMtpDraftExtraRows ||
+         Check(
+             hipMemsetAsync(session.mtp_.draft_ids + first, 0xFF,
+                            (kMtpDraftExtraRows - first) * sizeof(std::int32_t),
+                            stream_),
+             "draft table clear", error_msg);
+}
+
+DeviceTensor Executor::DraftTable(const Session& session) const noexcept {
+  DeviceTensor table = model_->output();
+  table.data = session.mtp_.draft_rows;
+  table.rows = kMtpDraftExtraRows;
+  return table;
+}
+
+bool Executor::DraftLogits(const Session& session, const float* x,
+                           float* logits, std::string* error_msg) const {
+  const auto& prefix = model_->draft_output();
+  if (!Dense(prefix, x, logits, 1, error_msg) ||
+      !Dense(DraftTable(session), x, logits + prefix.rows, 1, error_msg))
+    return false;
+  MaskDraftLogits(logits + prefix.rows, session.mtp_.draft_ids,
+                  kMtpDraftExtraRows, stream_);
+  return true;
 }
 
 bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
@@ -609,7 +1481,8 @@ bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
                                             c.ssm_num_v_heads, c.ssm_head_dim);
     const auto bytes = (linear * (conv + state) + ple) * sizeof(float);
     float* allocation = nullptr;
-    if (!Check(hipMalloc(&allocation, bytes), "rollback allocation", error_msg))
+    if (!Check(hip::AllocateDevice(&allocation, bytes), "rollback allocation",
+               error_msg))
       return false;
     session.rollback_allocations_.push_back(allocation);
     session.rollback_bytes_ += bytes;
@@ -626,6 +1499,85 @@ bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
       session.ple_snapshots_.rows[row] = next;
     }
     session.rollback_depth_ = row + 1;
+  }
+  return true;
+}
+
+std::size_t Executor::WideSegmentFloats() const {
+  const auto& c = config();
+  const std::size_t conv =
+      std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
+  const std::size_t full = GdnRollbackRowFloats(
+      0, c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim);
+  const std::size_t ple =
+      c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
+  constexpr std::uint32_t kRows =
+      static_cast<std::uint32_t>(sizeof(RollbackRows::rows) / sizeof(float*));
+  std::size_t floats = ple * (kRows + 1);
+  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    if (!c.IsLinearLayer(il))
+      continue;
+    floats += conv * (kRows + 1) + full;
+    for (std::uint32_t row = 0; row < kRows; ++row)
+      floats += GdnRollbackRowFloats(row, c.ssm_num_k_heads, c.ssm_num_v_heads,
+                                     c.ssm_head_dim);
+  }
+  return floats;
+}
+
+bool Executor::EnsureWideSegments(std::uint32_t segments,
+                                  std::string* error_msg) const {
+  if (wide_controls_ == nullptr &&
+      !Check(hip::AllocateDevice(&wide_controls_, std::size_t{kWideRows / 8} *
+                                                      sizeof(Session::Control)),
+             "wide verification controls", error_msg))
+    return false;
+  const auto& c = config();
+  const std::size_t conv =
+      std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
+  const std::size_t full = GdnRollbackRowFloats(
+      0, c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim);
+  const std::size_t ple =
+      c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
+  constexpr std::uint32_t kRows =
+      static_cast<std::uint32_t>(sizeof(RollbackRows::rows) / sizeof(float*));
+  while (wide_segments_.size() < segments) {
+    const std::size_t floats = WideSegmentFloats();
+    float* allocation = nullptr;
+    if (!Check(hip::AllocateDevice(&allocation, floats * sizeof(float)),
+               "wide rollback allocation", error_msg))
+      return false;
+    wide_allocations_.push_back(allocation);
+    WideSegment seg;
+    seg.conv.resize(c.num_layers);
+    seg.state.resize(c.num_layers);
+    seg.conv_start.resize(c.num_layers, nullptr);
+    seg.state_start.resize(c.num_layers, nullptr);
+    auto* next = allocation;
+    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+      if (!c.IsLinearLayer(il))
+        continue;
+      seg.conv_start[il] = next;
+      next += conv;
+      seg.state_start[il] = next;
+      next += full;
+      for (std::uint32_t row = 0; row < kRows; ++row) {
+        seg.conv[il].rows[row] = next;
+        next += conv;
+        seg.state[il].rows[row] = next;
+        next += GdnRollbackRowFloats(row, c.ssm_num_k_heads, c.ssm_num_v_heads,
+                                     c.ssm_head_dim);
+      }
+    }
+    if (ple != 0) {
+      seg.ple_start = next;
+      next += ple;
+      for (std::uint32_t row = 0; row < kRows; ++row) {
+        seg.ple.rows[row] = next;
+        next += ple;
+      }
+    }
+    wide_segments_.push_back(std::move(seg));
   }
   return true;
 }
@@ -661,8 +1613,15 @@ std::size_t Executor::SessionBytes(
          attention * (kv + index) + sizeof(Session::Control) +
          (mode == core::SessionMode::kSpeculative
               ? kv + index +
-                    std::size_t{options_.max_speculative + 1} * c.HcDim() *
-                        sizeof(float)
+                    std::size_t{std::max(options_.max_speculative + 1,
+                                         max_copy_rows())} *
+                        c.HcDim() * sizeof(float) +
+                    (model_->draft_output().empty()
+                         ? 0
+                         : std::size_t{kMtpDraftExtraRows} *
+                                   (model_->output_row_bytes() +
+                                    sizeof(std::int32_t)) +
+                               4096)
               : 0);
 }
 
@@ -673,7 +1632,26 @@ std::size_t Executor::DeferredScratchBytes() const {
                                 std::min(8U, options_.max_logit_rows) *
                                 c.vocab_size * sizeof(float)
                           : 0;
-  return bytes;
+  const auto linear = c.num_layers - c.num_layers / c.full_attention_interval;
+  const auto conv = std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
+  const auto state =
+      std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
+  const auto ple =
+      c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
+  const auto mutable_bytes = (linear * (conv + state) + ple) * sizeof(float);
+  if (!checkpoint_storage_) {
+    bytes +=
+        mutable_bytes + (has_mtp() ? std::size_t{options_.max_speculative} *
+                                         c.HcDim() * sizeof(float)
+                                   : 0);
+  }
+  // Rollback rows of a wide copy verification's later segments.
+  const std::size_t wide_segments = max_copy_rows() / 8;
+  if (wide_segments > 1 + wide_segments_.size())
+    bytes += (wide_segments - 1 - wide_segments_.size()) * WideSegmentFloats() *
+             sizeof(float);
+  // Committed spare blocks for captures, whether or not they exist yet.
+  return bytes + SnapshotAllocator::SpareBytes(mutable_bytes);
 }
 
 /// Column-tile width for the routed expert GEMMs: the tile at or above twice
@@ -690,6 +1668,22 @@ int RoutedTileCols(std::uint32_t n_tokens, std::uint32_t n_used,
   return 80;
 }
 
+const void* Executor::ReadyQ8(const float* x, std::uint32_t n_tokens,
+                              std::uint32_t k) const {
+  for (const ReadyRows* r : {&xn_q8_ready_, &mixed_q8_ready_}) {
+    if (r->src != nullptr && r->src == x && r->n == n_tokens && r->k == k) {
+      return r->data;
+    }
+  }
+  return nullptr;
+}
+
+void Executor::DropReadyQ8() const {
+  xn_q8_ready_ = {};
+  mixed_q8_ready_ = {};
+  pending_combine_ = {};  // a cancelled pass may have left one
+}
+
 bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
                         Q8Input* q, std::string* error_msg) const {
   q->x = x;
@@ -698,6 +1692,10 @@ bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
   q->k = k;
   if (MatrixRows(n_tokens)) {
     return true;  // the tiled path quantizes per call
+  }
+  if (const void* ready = ReadyQ8(x, n_tokens, k)) {
+    q->data = ready;
+    return true;
   }
   // Two slots alternate, so an input stays valid across one other
   // quantization; captured graphs replay the same alternation.
@@ -905,13 +1903,12 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   // Every column tile past an expert's bucket still costs a dispatch and a
   // full shared-memory reservation, so the grid is cut to the real largest
   // bucket. Counts are downloaded before the shared expert; wait only for
-  // that download while the shared expert continues on the same stream.
+  // that download while the shared expert continues (on the side stream in
+  // overlapped passes, joined by JoinSide).
   const Config& c = config();
   routed_max_rows_ = 0;
-  routed_64_tiles_ = 0;
-  routed_pair_tiles_ = 0;
-  routed_pair_offset_ = 0;
-  routed_pair_rows_ = 64;
+  routed_n_tiles_ = 0;
+  routed_wide_tiles_ = 0;
   if (!ExpertMatrixRows(n_tokens)) {
     return true;
   }
@@ -920,47 +1917,32 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   }
   // The F16 expert GEMM launches one block per (expert, row tile of its
   // 16-padded bucket): the map is built here and uploaded ahead of the
-  // launches on the same stream.
+  // launches on the same stream. Tile heights are multiples of 16, so a
+  // bucket's tile count follows from its unpadded rows.
   std::uint32_t max_rows = 0;
   std::uint32_t n_tiles = 0;
   routed_tile_rows_ = RoutedTileRows(
       static_cast<std::size_t>(n_tokens) * c.num_experts_used, c);
   for (std::uint32_t e = 0; e < c.num_experts; ++e) {
-    const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
     max_rows = std::max(max_rows, counts_host_[e]);
-    for (std::uint32_t j = 0;
-         j < (padded + routed_tile_rows_ - 1) / routed_tile_rows_; ++j) {
-      tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
-    }
   }
   routed_max_rows_ = std::max<std::uint32_t>(1, max_rows);
-  routed_n_tiles_ = n_tiles;
-  // Append the 64-token map for gate/up and eligible down projections.
-  // Wide expert buckets also get a 128-token gate/up map: it amortizes
-  // weight decoding, while short buckets retain the cheaper 64-token tile.
-  if (n_tokens >= 1024 && routed_tile_rows_ == kRoutedTileRowsWide) {
+  const auto append = [&](std::uint32_t tile_rows) {
     for (std::uint32_t e = 0; e < c.num_experts; ++e) {
-      const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
-      for (std::uint32_t j = 0; j < (padded + 63u) / 64u; ++j)
+      for (std::uint32_t j = 0;
+           j < (counts_host_[e] + tile_rows - 1) / tile_rows; ++j) {
         tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
-    }
-    routed_64_tiles_ = n_tiles - routed_n_tiles_;
-    routed_pair_offset_ = routed_n_tiles_;
-    routed_pair_tiles_ = routed_64_tiles_;
-    std::uint32_t tiles_128 = 0;
-    for (std::uint32_t e = 0; e < c.num_experts; ++e) {
-      tiles_128 += (counts_host_[e] + 127u) / 128u;
-    }
-    if (tiles_128 * 4 <= routed_64_tiles_ * 3) {
-      routed_pair_rows_ = 128;
-      routed_pair_offset_ = n_tiles;
-      routed_pair_tiles_ = tiles_128;
-      for (std::uint32_t e = 0; e < c.num_experts; ++e) {
-        for (std::uint32_t j = 0; j < (counts_host_[e] + 127u) / 128u; ++j) {
-          tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
-        }
       }
     }
+  };
+  if (WidePrefill(n_tokens)) {
+    // Prefill batches: one map of 128-token tiles serves the paired gate/up
+    // and the down projections.
+    append(128);
+    routed_wide_tiles_ = n_tiles;
+  } else {
+    append(routed_tile_rows_);
+    routed_n_tiles_ = n_tiles;
   }
   routed_tile_cols_ = qfn_mmq_routed_tile_cols_for_counts(
       counts_host_, static_cast<int>(c.num_experts));
@@ -1026,11 +2008,19 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
   if (!MatrixRows(n_tokens) && n_used <= 32 && same_shape &&
       (a.type == GgmlType::kQ4_K || a.type == GgmlType::kQ5_K ||
        a.type == GgmlType::kQ8_0)) {
-    if (qfn_mmq_moe_gated_vec(
-            static_cast<int>(a.type), a.data, b.data, x, ids, out,
-            static_cast<int>(a.rows), static_cast<int>(a.cols),
-            static_cast<int>(n_tokens), static_cast<int>(a.experts),
-            static_cast<int>(n_used), stream_) != 0) {
+    // The shared expert quantized the same rows (or their producer did).
+    const void* ready = ReadyQ8(x, n_tokens, a.cols);
+    if ((ready != nullptr
+             ? qfn_mmq_moe_gated_vec_preq(
+                   static_cast<int>(a.type), a.data, b.data, ready, ids, out,
+                   static_cast<int>(a.rows), static_cast<int>(a.cols),
+                   static_cast<int>(n_tokens), static_cast<int>(a.experts),
+                   static_cast<int>(n_used), stream_)
+             : qfn_mmq_moe_gated_vec(
+                   static_cast<int>(a.type), a.data, b.data, x, ids, out,
+                   static_cast<int>(a.rows), static_cast<int>(a.cols),
+                   static_cast<int>(n_tokens), static_cast<int>(a.experts),
+                   static_cast<int>(n_used), stream_)) != 0) {
       AssignError(error_msg, "gated expert vector projection failed");
       return false;
     }
@@ -1066,35 +2056,103 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
   return true;
 }
 
-void Executor::Combine(float* res, const float* gamma,
-                       std::uint32_t n_tokens) const {
+namespace {
+
+/// A mixer's F32 inject weights, which its combine can apply (see Combine).
+const float* InjectWeights(const DeviceMixer& m) {
+  return !m.inject.empty() && m.inject.type == GgmlType::kF32 ? m.inject.f32()
+                                                              : nullptr;
+}
+
+}  // namespace
+
+bool Executor::FusedMixer(const DeviceMixer& m, std::uint32_t n_tokens) const {
+  // Model geometry and Q8_0 projections only: a mixer in another format
+  // keeps the separate kernels.
   const Config& c = config();
+  return hc_fused_state_ != nullptr && !MatrixRows(n_tokens) &&
+         n_tokens <= kVecBatch && c.hc_count == 4 && c.hidden_size == 2560 &&
+         c.hc_low_rank == 320 && m.down.type == GgmlType::kQ8_0 &&
+         m.down.rows == c.hc_low_rank && m.down.cols == c.HcDim() &&
+         m.up.type == GgmlType::kQ8_0 && m.up.rows == c.HcDim() &&
+         m.up.cols == c.hc_low_rank;
+}
+
+void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
+                       const float* inject_w, const DeviceMixer* next) const {
+  const Config& c = config();
+  inject_fused_ = nullptr;
   // Wide batches hand the next mixer an F16 norm for its epilogue and the
   // same norm quantized into the tiled Q8 layout for its W8A8 down
   // projection: half the bytes for the combine and the epilogue, and no
   // separate activation pass for the projection.
   xn_half_ = wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr;
+  xn_q8_ready_ = {};  // s_.xn is rewritten (or left stale) below
+  // The next mixer's inject pass reads only the F16 norm written here.
+  const float* fused_inject = xn_half_ && n_tokens >= 96 ? inject_w : nullptr;
+  const bool defer = defer_residual_;
+  defer_residual_ = false;
+  const bool deferred = res_deferred_;
+  res_deferred_ = false;
   if (moe_pending_) {
-    // The MoE epilogue was deferred to this combine (see Moe).
+    // The MoE epilogue was deferred to this combine (see Moe), and with it
+    // the previous combine's residual update when that was deferred too.
     moe_pending_ = false;
     const auto* down = reinterpret_cast<const __half*>(s_.down_e);
-    if (xn_half_ &&
-        HcCombineMoeF16(res, down, s_.weights, s_.shexp_out,
-                        s_.router + c.num_experts, c.num_experts + 1,
-                        c.num_experts_used, s_.inject, inject_parts_, gamma,
-                        s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size,
-                        c.hc_count, c.rms_eps, stream_)) {
+    const float* fused_w = deferred ? fused_inject : nullptr;
+    if (wide_mixer_ && MatrixRows(n_tokens) &&
+        HcCombineMoeF16(
+            res, down, s_.weights, s_.shexp_out, s_.router + c.num_experts,
+            c.num_experts + 1, c.num_experts_used, s_.inject, inject_parts_,
+            gamma, s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size, c.hc_count,
+            c.rms_eps, stream_, deferred ? s_.block_out : nullptr,
+            deferred ? s_.hc_defer_w : nullptr, s_.inject, fused_w)) {
+      inject_fused_ = fused_w;
       return;
+    }
+    if (deferred) {
+      HcApplyDeferred(res, s_.block_out, s_.hc_defer_w, n_tokens, c.hidden_size,
+                      stream_);
     }
     MoeEpilogueVec4F16(down, s_.weights, s_.shexp_out,
                        s_.router + c.num_experts, c.num_experts + 1,
                        s_.block_out, n_tokens, c.num_experts_used,
                        c.hidden_size, stream_);
   }
+  if (deferred) {
+    // Only a fused MoE combine follows a deferring one; settle the update
+    // before anything else reads the residual.
+    HcApplyDeferred(res, s_.block_out, s_.hc_defer_w, n_tokens, c.hidden_size,
+                    stream_);
+  }
   if (xn_half_) {
-    HcCombineF16(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn_half,
-                 s_.xn_q8t, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
-                 stream_);
+    // The FFN combine that follows rereads this block output (42 MB at
+    // 4,096 tokens) instead of this combine writing the residual and the
+    // next reading it back (168 MB each).
+    const bool defer_now = defer && c.hc_count == 4;
+    res_deferred_ =
+        HcCombineF16(res, s_.block_out, s_.inject, inject_parts_, gamma,
+                     s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size, c.hc_count,
+                     c.rms_eps, stream_, defer_now ? s_.hc_defer_w : nullptr,
+                     s_.inject, defer_now ? fused_inject : nullptr);
+    if (res_deferred_)
+      inject_fused_ = fused_inject;
+    return;
+  }
+  // A decode batch's next mixer quantizes xn for its down projection: the
+  // combine writes those rows as well, or joins that mixer's single launch.
+  if (next != nullptr && gamma != nullptr && FusedMixer(*next, n_tokens)) {
+    pending_combine_ = {next,         res,        gamma,
+                        s_.block_out, s_.inject,  inject_parts_,
+                        s_.xn,        s_.xn_q8_1, n_tokens};
+    xn_q8_ready_ = {s_.xn, s_.xn_q8_1, n_tokens, c.HcDim()};
+    return;
+  }
+  if (!MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) &&
+      HcCombineQ8_1(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn,
+                    s_.xn_q8_1, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
+                    stream_)) {
+    xn_q8_ready_ = {s_.xn, s_.xn_q8_1, n_tokens, c.HcDim()};
     return;
   }
   HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, n_tokens,
@@ -1103,13 +2161,64 @@ void Executor::Combine(float* res, const float* gamma,
 
 bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
                      float* mixed, float* inject, std::uint32_t n_tokens,
-                     std::string* error_msg) const {
+                     std::string* error_msg, bool half_only,
+                     bool no_f32) const {
   const Config& c = config();
+  mixed_q8_ready_ = {};  // `mixed` is rewritten below
+  if (pending_combine_.mixer != nullptr) {
+    const PendingCombine p = pending_combine_;
+    pending_combine_ = {};
+    const bool fused_inject = inject != nullptr && !m.inject.empty() &&
+                              m.inject.type == GgmlType::kF32;
+    if (normed && p.mixer == &m && p.res == res && p.n == n_tokens &&
+        !half_only && !no_f32) {
+      // The combine, both projections, SiLU and the epilogue in one launch,
+      // with the outputs and producer-written Q8_1 rows of the kernels below.
+      const HcFusedMix mix{
+          m.down.data,
+          m.up.data,
+          p.res,
+          p.block_out,
+          p.inject,
+          p.inject_parts,
+          p.gamma,
+          p.xn,
+          p.xn_q8,
+          s_.lo,
+          s_.lo_q8_1,
+          static_cast<std::uint32_t>(
+              qfn_mmq_q8_1_bytes(1, static_cast<int>(c.hc_low_rank)) / 36 * 32),
+          fused_inject ? m.inject.f32() : nullptr,
+          mixed,
+          s_.mixed_q8_1,
+          fused_inject ? inject : nullptr,
+          c.hidden_size,
+          c.hc_count,
+          c.hc_low_rank,
+          c.rms_eps,
+          1.0F / static_cast<float>(c.hc_count)};
+      if (!HcMixQ8Fused(hc_fused_state_, mix, n_tokens, stream_)) {
+        AssignError(error_msg, "fused HC mixer failed");
+        return false;
+      }
+      inject_fused_ = nullptr;
+      q8t_src_ = nullptr;
+      half_src_ = nullptr;
+      mixed_q8_ready_ = {mixed, s_.mixed_q8_1, n_tokens, c.hidden_size};
+      inject_parts_ = fused_inject ? HcInjectParts(c.hidden_size) : 1;
+      return inject == nullptr || m.inject.empty() || fused_inject ||
+             Dense(m.inject, s_.xn, inject, n_tokens, error_msg);
+    }
+    // Another mixer follows after all: run the combine Combine left.
+    HcCombineQ8_1(p.res, p.block_out, p.inject, p.inject_parts, p.gamma, p.xn,
+                  p.xn_q8, p.n, c.hidden_size, c.hc_count, c.rms_eps, stream_);
+  }
   // Without `normed` this mixer's grouped norm of res is computed here (F32);
   // otherwise the previous combine produced it, as F16 plus tiled Q8 on the
-  // wide route or as F32 in s_.xn.
+  // wide route or as F32 in s_.xn (with its Q8_1 rows on a decode batch).
   if (!normed) {
     xn_half_ = false;
+    xn_q8_ready_ = {};
     RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
                 c.rms_eps, stream_);
   }
@@ -1138,14 +2247,39 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
     } else if (!Dense(m.down, s_.xn, s_.lo, n_tokens, error_msg)) {
       return false;
     }
-    SiluScale(s_.lo, 1.0F / static_cast<float>(c.hc_count),
-              static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
-    if (!Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg)) {
-      return false;
+    const float scale = 1.0F / static_cast<float>(c.hc_count);
+    const std::uint32_t lo_q8_cols = static_cast<std::uint32_t>(
+        qfn_mmq_q8_1_bytes(1, static_cast<int>(c.hc_low_rank)) / 36 * 32);
+    if (!MatrixRows(n_tokens) && m.up.type == GgmlType::kQ8_0 &&
+        m.up.cols == c.hc_low_rank &&
+        SiluScaleQ8_1(s_.lo, scale, n_tokens, c.hc_low_rank, lo_q8_cols,
+                      s_.lo_q8_1, stream_)) {
+      const Q8Input lo{s_.lo, s_.lo_q8_1, n_tokens, c.hc_low_rank};
+      if (!Dense(m.up, lo, s_.hc_gate, error_msg)) {
+        return false;
+      }
+    } else {
+      SiluScale(s_.lo, scale,
+                static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
+      if (!Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg)) {
+        return false;
+      }
     }
   }
   const bool fused_inject =
       inject != nullptr && !m.inject.empty() && m.inject.type == GgmlType::kF32;
+  // The previous combine already wrote these partials from the same norm.
+  const bool inject_done = fused_inject && inject == s_.inject &&
+                           inject_fused_ != nullptr &&
+                           inject_fused_ == m.inject.f32();
+  inject_fused_ = nullptr;
+  // A separate inject projection (BF16 or F16 rows) narrows its own input
+  // into the cached half buffer. Keep the full mixed row available for the
+  // projections that follow in that case: they narrow it again.
+  const bool separate_inject =
+      inject != nullptr && !m.inject.empty() && !fused_inject;
+  half_only = half_only && !separate_inject;
+  no_f32 = no_f32 && !separate_inject;
   const float* xn = s_.xn;
   const bool vectorized =
       xn_half_ ||
@@ -1158,10 +2292,12 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   if (xn_half_) {
     if (fused_projection) {
       if (!HcMixF16Gemm(m.up.data, reinterpret_cast<const __half*>(s_.hc_gate),
-                        s_.xn_half, fused_inject ? m.inject.f32() : nullptr,
-                        mixed, static_cast<__half*>(s_.x_half), s_.x_q8t,
-                        inject, n_tokens, c.hidden_size, c.hc_low_rank,
-                        stream_)) {
+                        s_.xn_half,
+                        fused_inject && !inject_done ? m.inject.f32() : nullptr,
+                        half_only || no_f32 ? nullptr : mixed,
+                        static_cast<__half*>(s_.x_half),
+                        half_only ? nullptr : s_.x_q8t, inject, n_tokens,
+                        c.hidden_size, c.hc_low_rank, stream_)) {
         AssignError(error_msg, "fused HC projection failed");
         return false;
       }
@@ -1177,25 +2313,35 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       half_rows_ = n_tokens;
       half_cols_ = c.hidden_size;
       half_bf16_ = false;
-      q8t_src_ = mixed;
-      q8t_rows_ = n_tokens;
-      q8t_cols_ = c.hidden_size;
+      if (!half_only || !fused_projection) {
+        q8t_src_ = mixed;
+        q8t_rows_ = n_tokens;
+        q8t_cols_ = c.hidden_size;
+      }
     }
   } else if (vectorized) {
     HcMixEpilogueVec4(xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
                       mixed, inject, n_tokens, c.hidden_size, c.hc_count,
                       stream_);
   } else {
+    // A decode batch's projections of `mixed` share its Q8_1 rows, which
+    // the epilogue writes as it stores them.
+    const bool q8 = !MatrixRows(n_tokens) && UnpaddedQ8(c.hidden_size);
     HcMixEpilogue(xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
-                  mixed, inject, n_tokens, c.hidden_size, c.hc_count, stream_);
+                  mixed, inject, n_tokens, c.hidden_size, c.hc_count, stream_,
+                  q8 ? s_.mixed_q8_1 : nullptr);
+    if (q8) {
+      mixed_q8_ready_ = {mixed, s_.mixed_q8_1, n_tokens, c.hidden_size};
+    }
   }
   inject_parts_ = fused_inject ? (vectorized ? HcInjectPartsVec4(c.hidden_size)
                                              : HcInjectParts(c.hidden_size))
                                : 1;
-  if (inject != nullptr && !m.inject.empty() && !fused_inject) {
+  if (separate_inject) {
     // A quantized inject projection (the draft block's) reads an F32 norm;
     // on the wide route the combine only produced F16, so norm again.
     if (xn_half_) {
+      xn_q8_ready_ = {};
       RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
                   c.rms_eps, stream_);
     }
@@ -1213,6 +2359,48 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
   }
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
+  if ((prefetch_.pending || prefetch_.ready) && !speculative &&
+      session.ngram_ == prefetch_.before) {
+    // A cache checkpoint or another step budget can end this chunk before
+    // or after the hinted one. Rows are per token, so a common prefix still
+    // serves every token both cover.
+    const auto shared = static_cast<std::size_t>(
+        std::ranges::mismatch(tokens, prefetch_.tokens).in1 - tokens.begin());
+    if (shared == tokens.size() || shared == prefetch_.tokens.size()) {
+      prefetch_.claimed = shared;
+      ple_pending_ = true;
+      if (shared == prefetch_.tokens.size()) {
+        session.ngram_ = prefetch_.after;
+      } else {
+        HashNgramRows(
+            c, session.ngram_, tokens,
+            std::span<std::uint32_t>(host_rows_.data(), n * c.ple_heads));
+      }
+      if (shared == tokens.size())
+        return true;
+      // Only one table read runs at a time: finish the prefetch, which had a
+      // whole chunk to complete, then read the rows past it.
+      FinishPrefetch();
+      const auto rest = tokens.subspan(shared);
+      const auto rows = rest.size() * c.ple_heads;
+      HashNgramRows(c, session.ngram_, rest,
+                    std::span<std::uint32_t>(host_rows_.data(), rows));
+      const NgramGatherOwner owner{rows, &session.ngram_counters_};
+      prefetch_.tail = ngram_->StartRead(
+          std::span<const std::uint32_t>(host_rows_.data(), rows),
+          std::span<float>(host_emb_ + shared * c.PleEmbeddingDim(),
+                           rest.size() * c.PleEmbeddingDim()),
+          std::span(&owner, 1));
+      if (!prefetch_.tail) {
+        prefetch_.claimed = 0;
+        prefetch_.ready = false;
+        ple_pending_ = false;
+        AssignError(error_msg, "n-gram table read could not start");
+      }
+      return prefetch_.tail;
+    }
+  }
+  FinishPrefetch();
   // Only proper prefixes need snapshots; the full batch keeps its live state.
   if (speculative) {
     for (std::uint32_t i = 0; i < n; ++i) {
@@ -1227,10 +2415,12 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
     HashNgramRows(c, session.ngram_, tokens,
                   std::span<std::uint32_t>(host_rows_.data(), n * c.ple_heads));
   }
+  const NgramGatherOwner owner{n * c.ple_heads, &session.ngram_counters_};
   ple_pending_ = ngram_->StartRead(
       std::span<const std::uint32_t>(host_rows_.data(), n * c.ple_heads),
       std::span<float>(host_emb_,
-                       static_cast<std::size_t>(n) * c.PleEmbeddingDim()));
+                       static_cast<std::size_t>(n) * c.PleEmbeddingDim()),
+      std::span(&owner, 1));
   if (!ple_pending_) {
     AssignError(error_msg, "n-gram table read could not start");
   }
@@ -1238,7 +2428,22 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
 }
 
 bool Executor::WaitPle(std::string* error_msg) const {
-  const bool ok = ple_pending_ && ngram_->WaitRead();
+  bool ok = ple_pending_;
+  if (ok && prefetch_.claimed != 0) {
+    FinishPrefetch();
+    ok = prefetch_.ready;
+    if (ok) {
+      std::copy_n(prefetch_.rows.data(),
+                  prefetch_.claimed * config().PleEmbeddingDim(), host_emb_);
+    }
+    if (prefetch_.tail)
+      ok = ngram_->WaitRead() && ok;
+    prefetch_.ready = false;
+    prefetch_.claimed = 0;
+    prefetch_.tail = false;
+  } else if (ok) {
+    ok = ngram_->WaitRead();
+  }
   ple_pending_ = false;
   if (!ok) {
     AssignError(error_msg, "n-gram table read failed");
@@ -1246,18 +2451,49 @@ bool Executor::WaitPle(std::string* error_msg) const {
   return ok;
 }
 
+void Executor::PrefetchPle(const Session& session,
+                           std::span<const std::int32_t> next) const {
+  const Config& c = config();
+  if (ple_pending_ || prefetch_.pending || next.empty() ||
+      next.size() > options_.max_batch) {
+    return;
+  }
+  // Hashed from the history after this batch, which PleFetch already
+  // advanced; the session keeps it until the next batch claims the rows.
+  prefetch_.ready = false;
+  prefetch_.before = session.ngram_;
+  prefetch_.after = session.ngram_;
+  const std::span<std::uint32_t> rows(host_rows_.data(),
+                                      next.size() * c.ple_heads);
+  HashNgramRows(c, prefetch_.after, next, rows);
+  prefetch_.tokens.assign(next.begin(), next.end());
+  const std::size_t count = next.size() * c.PleEmbeddingDim();
+  if (prefetch_.rows.size() < count) {
+    prefetch_.rows.resize(count);
+  }
+  const NgramGatherOwner owner{rows.size(), &session.ngram_counters_};
+  prefetch_.pending =
+      ngram_->StartRead(rows, std::span<float>(prefetch_.rows.data(), count),
+                        std::span(&owner, 1));
+}
+
+void Executor::FinishPrefetch() const {
+  if (prefetch_.pending) {
+    prefetch_.ready = ngram_->WaitRead();
+    prefetch_.pending = false;
+  }
+}
+
 bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
                    float* res, bool speculative, std::string* error_msg,
-                   bool embeddings_ready) const {
+                   bool embeddings_ready, PrefillCheckpoint* checkpoint) const {
   const Config& c = config();
-  const std::size_t emb_count =
-      static_cast<std::size_t>(n) * c.PleEmbeddingDim();
-  if (!embeddings_ready &&
-      (!WaitPle(error_msg) ||
-       !Check(hipMemcpyAsync(s_.ple_emb, host_emb_, emb_count * sizeof(float),
-                             hipMemcpyHostToDevice, stream_),
-              "n-gram upload", error_msg))) {
+  if (!embeddings_ready && !WaitPle(error_msg)) {
     return false;
+  }
+  if (!embeddings_ready && !prefetch_next_.empty()) {
+    PrefetchPle(session, prefetch_next_);
+    prefetch_next_ = {};
   }
   const std::uint32_t hc_dim = c.HcDim();
   Q8Input emb;
@@ -1274,6 +2510,10 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
           c.hidden_size, c.hc_count, stream_);
   RmsNormRows(s_.ple_gated, l.ple_norm_conv.f32(), s_.ple_norm, n, hc_dim,
               c.hc_count, c.rms_eps, stream_);
+  if (checkpoint)
+    HistoryPrefix(s_.ple_norm, hc_dim, session.ple_history_,
+                  checkpoint->state->ple_history_, checkpoint->tokens, hc_dim,
+                  c.PleConvHistory(), stream_);
   PleConv(s_.ple_norm, l.ple_conv1d.f32(), session.ple_history_,
           s_.ple_history_scratch, s_.ple_conv,
           speculative ? session.ple_snapshots_ : RollbackRows{}, n, hc_dim,
@@ -1287,7 +2527,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                                const float* x, float* out,
                                std::uint32_t n_tokens, bool speculative,
                                std::string* error_msg, bool projections_ready,
-                               bool project_output) const {
+                               bool project_output,
+                               GdnCheckpoint checkpoint) const {
   const Config& c = config();
   const std::uint32_t channels = c.SsmConvChannels();
   const float* qkv = s_.qkv;
@@ -1295,16 +2536,42 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   std::uint32_t qkv_stride = channels;
   std::uint32_t z_stride = c.SsmValueDim();
   bool convolved = false;
+  hipEvent_t z_ready = nullptr;
+  // Until GatedDeltaNet queues its wait for the Z rows, every exit orders
+  // the main stream after them: the side stream still writes s_.qkvz.
+  struct ZJoin {
+    hipStream_t stream;
+    hipEvent_t event = nullptr;
+    ~ZJoin() {
+      if (event != nullptr)
+        (void)hipStreamWaitEvent(stream, event, 0);
+    }
+  } z_join{stream_};
   if (!l.ssm_in.empty()) {
     // Wide prefill convolves QKV in the projection's LDS tile. The raw
     // boundary rows remain available for the rolling history update.
-    if (!projections_ready && !speculative && n_tokens >= 1024 &&
+    if (!projections_ready && !speculative && WidePrefill(n_tokens) &&
         n_tokens <= options_.max_batch && DenseF16Route(l.ssm_in, n_tokens)) {
       PrepareHalfInput(x, n_tokens, l.ssm_in.cols);
+      // The Z rows feed only the output norm: the side stream computes them
+      // beside the convolution boundary, the alpha/beta GEMM and the
+      // recurrence; the epilogue waits for them before it reads z. With the
+      // shared-expert overlap on ROCm 10.1: pp512 1,287 -> 1,330 tok/s,
+      // pp2048 and pp4096 within 1 %.
       convolved = DenseF16SsmGemm(
           l.ssm_in.data, static_cast<const __half*>(s_.x_half),
           l.ssm_conv1d.f32(), s.conv_state, s_.qkvz, s_.conv_scratch, n_tokens,
-          l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel, stream_);
+          l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel, stream_,
+          checkpoint.tokens, side_stream_, side_start_);
+      if (convolved) {
+        if (!Check(hipEventRecord(side_done_, side_stream_), "side stream join",
+                   error_msg)) {
+          (void)hipStreamSynchronize(side_stream_);
+          return false;
+        }
+        z_ready = side_done_;
+        z_join.event = side_done_;
+      }
     }
     if (!projections_ready && !convolved &&
         !Dense(l.ssm_in, x, s_.qkvz, n_tokens, error_msg)) {
@@ -1335,21 +2602,37 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
       tiled && l.ssm_out.rows == 2560 && l.ssm_out.cols == 6144;
   auto* out_half =
       half_output ? reinterpret_cast<__half*>(s_.gdn_out) : nullptr;
-  GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),
-                l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), s.conv_state,
-                s_.conv_scratch, s_.qn, s_.kn, s_.gdn_raw, s.state, s_.gdn_out,
-                tiled && !half_output ? s_.x_q8t : nullptr,
-                speculative ? s.state_snapshots : RollbackRows{},
-                speculative ? s.conv_snapshots : RollbackRows{}, n_tokens,
-                c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim,
-                c.ssm_conv_kernel, MatrixRows(n_tokens) && !speculative,
-                convolved, c.rms_eps, stream_, out_half);
+  // Shift successive rows off the 12 KiB pitch while retaining every half.
+  // The existing F32 scratch has room for these slightly padded F16 rows.
+  const std::uint32_t half_stride =
+      half_output && n_tokens >= 1024 ? l.ssm_out.cols + 32 : 0;
+  // A decode batch's output projection reads the epilogue's Q8_1 rows.
+  const std::uint32_t value_dim = c.SsmValueDim();
+  const bool out_q8_1 = project_output && !tiled && !MatrixRows(n_tokens) &&
+                        c.ssm_head_dim == 128 &&
+                        l.ssm_out.type == GgmlType::kQ8_0 &&
+                        l.ssm_out.cols == value_dim && UnpaddedQ8(value_dim);
+  if (!GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta,
+                     l.ssm_conv1d.f32(), l.ssm_a.f32(), l.ssm_dt.f32(),
+                     l.ssm_norm.f32(), s.conv_state, s_.conv_scratch, s_.qn,
+                     s_.kn, s_.gdn_raw, s.state, s_.gdn_out,
+                     tiled && !half_output ? s_.x_q8t : nullptr,
+                     speculative ? s.state_snapshots : RollbackRows{},
+                     speculative ? s.conv_snapshots : RollbackRows{}, n_tokens,
+                     c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim,
+                     c.ssm_conv_kernel, MatrixRows(n_tokens) && !speculative,
+                     convolved, c.rms_eps, stream_, out_half, checkpoint,
+                     half_stride, out_q8_1 ? s_.gdn_q8_1 : nullptr, z_ready)) {
+    AssignError(error_msg, "DeltaNet launch failed");
+    return false;
+  }
+  z_join.event = nullptr;  // GatedDeltaNet waited for the Z rows
   if (!project_output) {
     return true;
   }
   if (half_output) {
     if (!DenseF16Gemm(l.ssm_out.data, out_half, out, n_tokens, l.ssm_out.rows,
-                      l.ssm_out.cols, stream_)) {
+                      l.ssm_out.cols, stream_, half_stride)) {
       AssignError(error_msg, "SSM output F16 GEMM failed");
       return false;
     }
@@ -1364,6 +2647,11 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
     }
     return true;
   }
+  if (out_q8_1) {
+    return Dense(l.ssm_out,
+                 Q8Input{s_.gdn_out, s_.gdn_q8_1, n_tokens, value_dim}, out,
+                 error_msg);
+  }
   return Dense(l.ssm_out, s_.gdn_out, out, n_tokens, error_msg);
 }
 
@@ -1374,7 +2662,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          std::uint32_t start_pos, std::uint32_t pool_grid,
                          std::uint32_t max_context, bool sparse,
                          std::string* error_msg, bool last_only,
-                         bool projections_ready, bool project_output) const {
+                         bool projections_ready, bool project_output,
+                         std::uint32_t checkpoint_tokens) const {
   const Config& c = config();
   const std::uint32_t kv_row = c.AttentionKvDim();
   const std::uint32_t index_capacity =
@@ -1382,7 +2671,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   bool prepared = false;
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
-        !projections_ready && n_tokens >= 1024 &&
+        !projections_ready && WidePrefill(n_tokens) &&
         n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
         l.attn_qkv.rows == 13312 && l.attn_qkv.cols == 2560 &&
         c.num_heads == 24 && c.num_kv_heads == 2 && c.head_dim == 256 &&
@@ -1393,7 +2682,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
           l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
           l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
           s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps, stream_,
-          s.rope);
+          s.rope, yarn_);
       if (!prepared) {
         AssignError(error_msg, "fused attention projection failed");
         return false;
@@ -1407,7 +2696,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
           s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(), l.attn_k_norm.f32(),
           s_.q, s_.attn_gate, s.k_cache, s.v_cache, n_tokens, c.num_heads,
           c.num_kv_heads, c.head_dim, c.rotary_dim, pos, c.rope_theta,
-          c.rms_eps, stream_, s.rope, prefill_phase);
+          c.rms_eps, stream_, s.rope, prefill_phase, yarn_);
       if (!prepared) {
         UnpackQGate(s_.qg, l.attn_qkv.rows, s_.q, s_.attn_gate, s_.k, s_.v,
                     n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
@@ -1431,9 +2720,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     RmsNormRows(s_.k, l.attn_k_norm.f32(), s_.k, n_tokens * c.num_kv_heads,
                 c.head_dim, 1, c.rms_eps, stream_);
     Rope(s_.q, n_tokens, c.num_heads, c.head_dim, c.rotary_dim, pos,
-         c.rope_theta, stream_, s.rope);
+         c.rope_theta, stream_, s.rope, yarn_);
     Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
-         c.rope_theta, stream_, s.rope);
+         c.rope_theta, stream_, s.rope, yarn_);
     StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_);
     StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_);
   }
@@ -1458,47 +2747,94 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                 n_tokens * c.indexer_heads, c.indexer_head_dim, 1, c.rms_eps,
                 stream_);
     Rope(s_.iq, n_tokens, c.indexer_heads, c.indexer_head_dim, c.rotary_dim,
-         pos, c.rope_theta, stream_, s.rope);
+         pos, c.rope_theta, stream_, s.rope, yarn_);
     PoolIndexerBlocks(s.index_k, l.indexer_k_norm.f32(), s.block_k, first_block,
                       pos, n_tokens, pool_grid, c.compress_ratio,
                       c.indexer_head_dim, c.rotary_dim, c.rope_theta, c.rms_eps,
-                      index_capacity, stream_, s.rope);
+                      index_capacity, stream_, s.rope, yarn_);
     // Align score rows to full cache lines. The selector still considers
     // only complete causal blocks, so padding cannot change the ranking.
+    // Wide prefill is never captured: compact score rows to the populated
+    // context. Graphs retain the maximum stride for replay at later positions.
+    const auto score_context =
+        n_tokens > kVecBatch ? start_pos + n_tokens : max_context;
     const std::uint32_t blocks =
-        (max_context + c.compress_ratio - 1) / c.compress_ratio;
+        (score_context + c.compress_ratio - 1) / c.compress_ratio;
     const std::uint32_t max_blocks = (blocks + 31) / 32 * 32;
-    // Catch-up consumes only the final attention tile. Keep all its query
-    // masks (sparse attention packs four queries; dense tiles hold sixteen)
-    // but avoid scoring the unused prefix against the complete context.
-    const auto first_query = last_only ? (n_tokens - 1) / 16 * 16 : 0U;
-    for (std::uint32_t t0 = first_query; t0 < n_tokens; t0 += select_chunk_) {
-      const std::uint32_t n = std::min(select_chunk_, n_tokens - t0);
+    // Query rows are independent; rounding down to a power of two wasted
+    // up to half the bounded scratch and doubled launches above 160K.
+    const auto select_chunk = static_cast<std::uint32_t>(
+        std::min(std::size_t{512}, select_score_floats_ / max_blocks));
+    // Catch-up consumes only the final attention tile. Cover its masks even
+    // when the dense/sparse boundary shifts the four-query sparse groups.
+    const auto first_query = last_only && n_tokens > 16 ? n_tokens - 16 : 0U;
+    for (std::uint32_t t0 = first_query; t0 < n_tokens; t0 += select_chunk) {
+      const std::uint32_t n = std::min(select_chunk, n_tokens - t0);
+      // Batches wider than kVecBatch are never captured, so the host
+      // position bounds the scored range (a replayed graph must cover
+      // max_blocks).
+      const std::uint32_t live =
+          n_tokens > kVecBatch ? (start_pos + t0 + n) / c.compress_ratio : 0;
       SelectBlocks(s_.iq + static_cast<std::size_t>(t0) * c.indexer_heads *
                                c.indexer_head_dim,
                    s.block_k,
                    s_.mask + static_cast<std::size_t>(t0) * mask_words_,
                    s_.scores, n, pos, t0, c.indexer_heads, c.indexer_head_dim,
                    c.compress_ratio, c.indexer_top_k / c.compress_ratio,
-                   mask_words_, max_blocks, stream_);
+                   mask_words_, max_blocks, stream_, live);
     }
     mask = s_.mask;
   }
   // Wide batches run the fused WMMA kernel (never inside a graph: the kv
   // extent is a host value), output gate included, skipping the key tiles
   // no query of a block selected; the per-token kernel covers the rest.
-  if (last_only && !Check(hipMemsetAsync(s_.ctx, 0,
-                                         static_cast<std::size_t>(n_tokens) *
-                                             c.AttentionQDim() * sizeof(float),
-                                         stream_),
-                          "draft attention output initialization", error_msg)) {
+  if (last_only &&
+      !Check(hipMemsetAsync(s_.ctx, 0,
+                            static_cast<std::size_t>(n_tokens) *
+                                c.AttentionQDim() * sizeof(float),
+                            stream_),
+             "partial attention output initialization", error_msg)) {
     return false;
   }
-  if (MatrixRows(n_tokens) &&
-      WmmaCausalAttention(s_.q, s_.attn_gate, s.k_cache, s.v_cache, mask,
-                          mask_words_, s_.ctx, n_tokens, start_pos, c.num_heads,
-                          c.num_kv_heads, c.head_dim, c.compress_ratio, stream_,
-                          last_only)) {
+  // Queries before the token budget always take the dense tiles, also in a
+  // batch that crosses it, so each position's key sweep (and its rounding)
+  // does not depend on where the prefill chunks fall. The sparse part goes
+  // first: it is the launch that can be refused.
+  const auto attend = [&](std::uint32_t first, std::uint32_t rows, bool last) {
+    const std::uint32_t pos = start_pos + first;
+    const std::uint32_t dense_rows = mask != nullptr && pos < c.indexer_top_k
+                                         ? std::min(rows, c.indexer_top_k - pos)
+                                         : 0;
+    const auto at = [&](std::uint32_t row) {
+      return std::size_t{first + row} * c.AttentionQDim();
+    };
+    return (dense_rows == rows ||
+            WmmaCausalAttention(
+                s_.q + at(dense_rows), s_.attn_gate + at(dense_rows), s.k_cache,
+                s.v_cache,
+                mask ? mask + std::size_t{first + dense_rows} * mask_words_
+                     : nullptr,
+                mask_words_, s_.ctx + at(dense_rows), rows - dense_rows,
+                pos + dense_rows, c.num_heads, c.num_kv_heads, c.head_dim,
+                c.compress_ratio, stream_, last)) &&
+           (dense_rows == 0 || (last && dense_rows != rows) ||
+            WmmaCausalAttention(s_.q + at(0), s_.attn_gate + at(0), s.k_cache,
+                                s.v_cache, nullptr, mask_words_, s_.ctx + at(0),
+                                dense_rows, pos, c.num_heads, c.num_kv_heads,
+                                c.head_dim, c.compress_ratio, stream_, last));
+  };
+  if (checkpoint_tokens != 0 && checkpoint_tokens < n_tokens) {
+    // Sparse tiles compact the union of their queries' selected keys.
+    // Keep the checkpoint's query grouping identical to a pass ending there.
+    if (!attend(0, checkpoint_tokens, false) ||
+        !attend(checkpoint_tokens, n_tokens - checkpoint_tokens, false)) {
+      AssignError(error_msg, "checkpoint attention geometry is unsupported");
+      return false;
+    }
+    return !project_output ||
+           Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+  }
+  if (MatrixRows(n_tokens) && attend(0, n_tokens, last_only)) {
     return !project_output ||
            Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
   }
@@ -1508,9 +2844,20 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   rocm::Attention(s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
                   split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens,
                   pos, c.num_heads, c.num_kv_heads, c.head_dim,
-                  c.compress_ratio, stream_);
-  SigmoidMul(s_.ctx, s_.attn_gate,
-             static_cast<std::size_t>(n_tokens) * c.AttentionQDim(), stream_);
+                  c.compress_ratio, stream_, split ? s_.attn_lists : nullptr,
+                  split ? s_.attn_counts : nullptr,
+                  c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0,
+                  c.indexer_top_k);
+  const std::uint32_t q_dim = c.AttentionQDim();
+  const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
+  // A decode batch's output projection reads the gate's Q8_1 rows.
+  if (project_output && split && l.attn_out.type == GgmlType::kQ8_0 &&
+      l.attn_out.cols == q_dim && UnpaddedQ8(q_dim) &&
+      SigmoidMulQ8_1(s_.ctx, s_.attn_gate, ctx_count, s_.ctx_q8_1, stream_)) {
+    return Dense(l.attn_out, Q8Input{s_.ctx, s_.ctx_q8_1, n_tokens, q_dim}, out,
+                 error_msg);
+  }
+  SigmoidMul(s_.ctx, s_.attn_gate, ctx_count, stream_);
   return !project_output || Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
 }
 
@@ -1540,20 +2887,63 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // The shared expert (gated by the last router row) does not depend on
   // routing. Queue its GEMMs after the count download, then prepare the
   // routed dispatch on the CPU without waiting for these GEMMs to finish.
-  shexp_half_ready_ = false;
-  if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
-                  &l.shexp_down, error_msg)) {
-    return false;
-  }
-  if (shexp_half_ready_) {
-    shexp_half_ready_ = false;
-    if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out, n_tokens,
-                      l.shexp_down.rows, l.shexp_down.cols, stream_)) {
-      AssignError(error_msg, "shared expert F16 GEMM failed");
+  // A wide batch runs them on the side stream beside the routed experts,
+  // which leave compute idle while they stream expert weights. The shared
+  // expert writes its own scratch and may quantize x into s_.x_q8t, so no
+  // main-stream work may use s_.x_q8t before JoinSide.
+  // Only the Q8_0 shared expert overlaps: its kernels take stream_, while
+  // the BF16, F16 and F32 routes go through BLAS handles bound to the main
+  // stream.
+  const bool overlap = ExpertMatrixRows(n_tokens) && !last_only &&
+                       l.shexp_gate.type == GgmlType::kQ8_0 &&
+                       l.shexp_up.type == GgmlType::kQ8_0 &&
+                       l.shexp_down.type == GgmlType::kQ8_0;
+  const hipStream_t main = stream_;
+  if (overlap) {
+    if (!Check(hipEventRecord(side_start_, main), "side stream fork",
+               error_msg) ||
+        !Check(hipStreamWaitEvent(side_stream_, side_start_, 0),
+               "side stream wait", error_msg)) {
       return false;
     }
-  } else if (!Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens,
-                    error_msg)) {
+    stream_ = side_stream_;
+  }
+  const auto shared_expert = [&] {
+    shexp_half_ready_ = false;
+    if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
+                    &l.shexp_down, error_msg)) {
+      return false;
+    }
+    if (shexp_half_ready_) {
+      shexp_half_ready_ = false;
+      if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out,
+                        n_tokens, l.shexp_down.rows, l.shexp_down.cols,
+                        stream_)) {
+        AssignError(error_msg, "shared expert F16 GEMM failed");
+        return false;
+      }
+      return true;
+    }
+    return Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg);
+  };
+  const bool shared_ok = shared_expert();
+  stream_ = main;
+  if (overlap) {
+    if (!Check(hipEventRecord(side_done_, side_stream_), "side stream join",
+               error_msg)) {
+      // Nothing to join: wait for the whole side stream instead.
+      (void)hipStreamSynchronize(side_stream_);
+      return false;
+    }
+    side_pending_ = true;
+  }
+  // Every exit, including errors, orders the main stream after the shared
+  // expert: its side-stream writes must not race the next pass.
+  struct JoinGuard {
+    const Executor* executor;
+    ~JoinGuard() { (void)executor->JoinSide(nullptr); }
+  } join_guard{this};
+  if (!shared_ok) {
     return false;
   }
   if (last_only && l.ffn_gate_exps.type == GgmlType::kQ8_0 &&
@@ -1576,7 +2966,26 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       throw;
     }
   }
-  return MoeExperts(l, x, out, n_tokens, error_msg);
+  return MoeExperts(l, x, out, n_tokens, error_msg) && JoinSide(error_msg);
+}
+
+bool Executor::JoinSide(std::string* error_msg) const {
+  if (!side_pending_)
+    return true;
+  side_pending_ = false;
+  return Check(hipStreamWaitEvent(stream_, side_done_, 0),
+               "side stream join wait", error_msg);
+}
+
+bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
+  const Config& c = config();
+  return ExpertMatrixRows(n_tokens) &&
+         (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
+          l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
+         l.ffn_up_exps.type == l.ffn_gate_exps.type &&
+         (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
+          l.ffn_down_exps.type == GgmlType::kQ8_0) &&
+         c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
 }
 
 bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
@@ -1591,13 +3000,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   // Tiled batches take the WMMA route: assignments compacted by expert
   // into 16-row padded buckets, token rows narrowed to F16 once, then the
   // F16 matrix-core GEMM per (expert, row tile).
-  const bool wmma_experts = ExpertMatrixRows(n_tokens) &&
-                            (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
-                             l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
-                            l.ffn_up_exps.type == l.ffn_gate_exps.type &&
-                            (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
-                             l.ffn_down_exps.type == GgmlType::kQ8_0) &&
-                            c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
+  const bool wmma_experts = WmmaExperts(l, n_tokens);
   if (wmma_experts) {
     RoutedCompact(s_.ids, s_.expert_counts, s_.routed_bounds, s_.routed_cursors,
                   s_.rows_token, s_.rows_slot, n_tokens, used, c.num_experts,
@@ -1615,19 +3018,19 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       half_bf16_ = false;
     }
     const auto* x_half = static_cast<const __half*>(s_.x_half);
-    // Large batches pair the gate/up projections and apply SwiGLU without
-    // materializing the gate. Smaller buckets favor separate projections.
+    // Prefill pairs the gate/up projections and applies SwiGLU without
+    // materializing the gate; decode-time batches keep separate projections.
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
     const WeightType gate_type = l.ffn_gate_exps.type == GgmlType::kQ5_K
                                      ? WeightType::kQ5_K
                                      : WeightType::kQ4_K;
     const bool gated_ok =
-        n_tokens >= 1024 && routed_tile_rows_ == 48
-            ? RoutedGatedF16Gemm(
-                  l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
-                  s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
-                  routed_pair_rows_, s_.routed_bounds, s_.rows_token,
-                  s_.rows_slot, up_half, c.expert_ff, c.hidden_size, stream_)
+        routed_wide_tiles_ != 0
+            ? RoutedGatedF16Gemm(l.ffn_gate_exps.data, l.ffn_up_exps.data,
+                                 gate_type, x_half, s_.routed_tiles,
+                                 routed_wide_tiles_, s_.routed_bounds,
+                                 s_.rows_token, s_.rows_slot, up_half,
+                                 c.expert_ff, c.hidden_size, stream_)
             : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
                              s_.routed_tiles, routed_n_tiles_,
                              routed_tile_rows_, s_.routed_bounds, s_.rows_token,
@@ -1645,18 +3048,15 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
                                      ? WeightType::kQ8_0
                                      : WeightType::kQ5_1;
-    // Larger down tiles amortize weight decoding. Reuse the 64-token map
-    // when it has no more padded rows than the 48-token map.
-    const bool wide_down =
-        (down_type == WeightType::kQ5_1 || down_type == WeightType::kQ8_0) &&
-        routed_tile_rows_ == 48 && routed_64_tiles_ != 0 &&
-        routed_64_tiles_ * 4 <= routed_n_tiles_ * 3;
+    // Prefill takes the gate/up map's 128-token tiles: each wave decodes its
+    // rows' weights once for up to 128 tokens.
+    const bool wide_down = routed_wide_tiles_ != 0;
     // The down projection's rows are F16 too: the epilogue reads half the
     // bytes of the largest routed intermediate.
     if (!RoutedF16Gemm(l.ffn_down_exps.data, down_type, up_half,
-                       s_.routed_tiles + (wide_down ? routed_n_tiles_ : 0),
-                       wide_down ? routed_64_tiles_ : routed_n_tiles_,
-                       wide_down ? 64 : routed_tile_rows_, s_.routed_bounds,
+                       s_.routed_tiles,
+                       wide_down ? routed_wide_tiles_ : routed_n_tiles_,
+                       wide_down ? 128 : routed_tile_rows_, s_.routed_bounds,
                        s_.rows_slot, s_.rows_slot, nullptr, nullptr,
                        reinterpret_cast<__half*>(s_.down_e), c.hidden_size,
                        c.expert_ff, stream_)) {
@@ -1674,6 +3074,9 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
       return false;
     }
   }
+  // The epilogue reads the shared expert's output.
+  if (!JoinSide(error_msg))
+    return false;
   if (wmma_experts) {
     // The combine that follows folds this epilogue into its own pass when
     // it takes the F16 route (Combine); otherwise it runs here.
@@ -1695,6 +3098,23 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   return true;
 }
 
+bool Executor::KeepHiddenRow(Session& session, std::uint32_t row,
+                             std::string* error_msg) const {
+  if (!session.mtp_enabled_ || session.owner_ != this ||
+      row >= std::max(options_.max_speculative, max_copy_rows())) {
+    AssignError(error_msg, "invalid kept trunk hidden row");
+    return false;
+  }
+  if (row == 0)
+    return true;
+  const auto dim = std::size_t{config().HcDim()};
+  return Check(
+      hipMemcpyAsync(session.mtp_.target_hidden,
+                     session.mtp_.target_hidden + row * dim,
+                     dim * sizeof(float), hipMemcpyDeviceToDevice, stream_),
+      "kept hidden row", error_msg);
+}
+
 bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
                                std::string* error_msg) const {
   if (!session.mtp_enabled_ || session.owner_ != this ||
@@ -1713,26 +3133,39 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
 }
 
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
-                       bool candidates, std::string* error_msg) const {
-  const DeviceTensor& output = model_->output();
+                       bool candidates, const Session* draft,
+                       std::string* error_msg) const {
+  const std::uint32_t prefix = model_->draft_output().rows;
+  const std::uint32_t rows =
+      draft != nullptr ? prefix + kMtpDraftExtraRows : model_->output().rows;
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
-      !Dense(output, s_.mixed, s_.logits, 1, error_msg)) {
+      !(draft != nullptr
+            ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
+            : Dense(model_->output(), s_.mixed, s_.logits, 1, error_msg))) {
     return false;
   }
-  if (candidates)
+  const auto count = std::min<std::uint32_t>(rows, kMtpCandidates);
+  if (candidates) {
     MtpTopCandidates(s_.logits, s_.mtp_ids, s_.mtp_scratch_ids, s_.mtp_scores,
-                     output.rows, stream_);
+                     rows, stream_);
+    if (draft != nullptr)
+      RemapDraftIds(s_.mtp_ids, count, prefix, draft->mtp_.draft_ids,
+                    kMtpDraftExtraRows, stream_);
+  }
   if (token) {
-    Argmax(s_.logits, s_.mtp_argmax, s_.mtp_token, 1, output.rows, stream_);
-    if (!Check(
-            hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
-                           hipMemcpyDeviceToHost, stream_),
-            "draft token download", error_msg)) {
+    Argmax(s_.logits, s_.mtp_argmax, s_.mtp_token, 1, rows, stream_);
+    ArgmaxConfidence(s_.logits, s_.mtp_token, rows, stream_);
+    if (draft != nullptr)
+      RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1, prefix,
+                    draft->mtp_.draft_ids, kMtpDraftExtraRows, stream_);
+    if (!Check(hipMemcpyAsync(mtp_token_host_, s_.mtp_token,
+                              2 * sizeof(std::int32_t), hipMemcpyDeviceToHost,
+                              stream_),
+               "draft token download", error_msg)) {
       return false;
     }
   }
   if (candidates) {
-    const auto count = std::min<std::size_t>(output.rows, kMtpCandidates);
     static_assert(offsetof(MtpCandidateLogits, logits) ==
                   kMtpCandidates * sizeof(std::uint32_t));
     const auto bytes =
@@ -1753,10 +3186,31 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
   // grows the GEMM tier's arena, which capture forbids.
   if (graph && session.warmed_.contains(key)) {
     hipGraphExec_t exec = nullptr;
+    bool enqueued = false;
     if (const auto it = session.graphs_.find(key);
         it != session.graphs_.end()) {
       exec = it->second;
     } else {
+      // A warmed target shape may need its first graph or a replacement
+      // after rollback storage was released. Queue this pass first, then
+      // record identical commands while the GPU executes it. Short prefix
+      // and draft graphs keep their existing route. No second pass is launched.
+      if (synchronize && (key & (std::uint64_t{1} << 40)) == 0) {
+        auto dispatch = std::tie(
+            moe_pending_, defer_residual_, res_deferred_, shexp_half_ready_,
+            q8t_src_, q8t_rows_, q8t_cols_, half_src_, half_rows_, half_cols_,
+            half_bf16_, xn_half_, inject_parts_, inject_fused_, q8_slot_,
+            xn_q8_ready_, mixed_q8_ready_, pending_combine_);
+        const auto before = std::apply(
+            [](const auto&... fields) { return std::make_tuple(fields...); },
+            dispatch);
+        if (!body())
+          return false;
+        // Producer readiness and alternating scratch addresses must match
+        // the executed pass when the graph records its kernel arguments.
+        dispatch = before;
+        enqueued = true;
+      }
       hipGraph_t captured = nullptr;
       // Frozen peer sessions can copy snapshots on independent nonblocking
       // streams while the scheduler records this session's decode graph.
@@ -1783,7 +3237,8 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
       }
       session.graphs_.emplace(key, exec);
     }
-    if (!Check(hipGraphLaunch(exec, stream_), "graph launch", error_msg)) {
+    if (!enqueued &&
+        !Check(hipGraphLaunch(exec, stream_), "graph launch", error_msg)) {
       return false;
     }
   } else {
@@ -1798,12 +3253,30 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
 
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                        std::uint32_t n_logits, float* logits, ForwardMode mode,
-                       std::string* error_msg) const {
+                       std::string* error_msg, PrefillCheckpoint* checkpoint,
+                       std::span<const std::int32_t> next) const {
+  // Only this call's PLE layer may start the prefetch of `next`.
+  struct NextHint {
+    std::span<const std::int32_t>& hint;
+    ~NextHint() { hint = {}; }
+  } next_hint{prefetch_next_};
+  if (mode == ForwardMode::kPrefill) {
+    prefetch_next_ = next;
+  }
   const bool speculative = mode == ForwardMode::kVerify;
   PrefillPhase phase(mode == ForwardMode::kPrefill);
   selected_logits_ = nullptr;
+  wide_rows_ = 0;
+  DropReadyQ8();
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
+  if (checkpoint && (mode != ForwardMode::kPrefill ||
+                     checkpoint->source != &session || checkpoint->tokens > n ||
+                     checkpoint->state->position_ !=
+                         session.position_ + checkpoint->tokens)) {
+    AssignError(error_msg, "prefill checkpoint does not match this pass");
+    return false;
+  }
   if (n == 0 || n > options_.max_batch ||
       (speculative && n > options_.max_speculative)) {
     AssignError(error_msg, "token batch is empty or exceeds the batch limit");
@@ -1834,6 +3307,44 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   }
   if (speculative && !EnsureRollback(session, n - 1, error_msg))
     return false;
+  // Failed eager/captured work can still be reading pinned inputs. Drain it
+  // before another request reuses those buffers; successful forwards already
+  // synchronize below and need no additional wait.
+  struct PinnedInputGuard {
+    hipStream_t stream;
+    bool completed{false};
+    ~PinnedInputGuard() {
+      if (!completed)
+        (void)hipStreamSynchronize(stream);
+    }
+  } pinned_inputs{stream_};
+  // Start the disk rows before protecting checkpoint rows, which can commit
+  // device pages: layer 0 alone cannot hide the whole read.
+  if (session.continuation_hooks_) {
+    const auto end =
+        session.position_ + static_cast<std::uint32_t>(tokens.size());
+    session.continuation_hooks_->BeforeWrite(
+        false, session.position_, end, session.blocks_,
+        end > c.indexer_top_k ? end / c.compress_ratio : session.blocks_);
+  }
+  const auto ngram = session.ngram_;
+  if (c.ple_layer >= 0) {
+    if (ngram_ == nullptr) {
+      AssignError(error_msg, "n-gram table is not open");
+      return false;
+    }
+    if (!PleFetch(session, tokens, speculative, error_msg)) {
+      return false;
+    }
+  }
+  try {
+    session.PreserveSnapshots(session.position_, session.mtp_.position);
+  } catch (...) {
+    // The forward never ran; leave the n-gram window where it was.
+    (void)WaitPle(nullptr);
+    session.ngram_ = ngram;
+    throw;
+  }
   ++session.mutation_epoch_;
   session.spec_base_ = start_pos;
   session.spec_tokens_ = speculative ? n : 0;
@@ -1846,15 +3357,6 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   control_host_->mtp_position = session.mtp_.position;
   control_host_->mtp_blocks = session.mtp_.blocks;
   control_host_->hidden_row = -1;
-  if (c.ple_layer >= 0) {
-    if (ngram_ == nullptr) {
-      AssignError(error_msg, "n-gram table is not open");
-      return false;
-    }
-    if (!PleFetch(session, tokens, speculative, error_msg)) {
-      return false;
-    }
-  }
   // Sparse selection only changes the result once a query can see more
   // than the token budget; every layer of this model shares one ratio.
   const bool sparse = c.compress_ratio > 0 && start_pos + n > c.indexer_top_k;
@@ -1891,12 +3393,11 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const auto body = [&] {
     return ForwardBody(session, n, n_logits, logits != nullptr, speculative,
                        sparse, start_pos, graph ? graph_pool_grid : pool_grid,
-                       first_layer, c.num_layers, error_msg);
+                       first_layer, c.num_layers, error_msg, checkpoint, graph);
   };
-  // Only the suffix waits for its pinned n-gram rows. During eager
-  // execution and capture, Ple performs this wait at the same boundary.
-  if (graph && session.graphs_.contains(key) && ple_pending_ &&
-      !WaitPle(error_msg)) {
+  // The prefix is already queued. Wait once before the suffix so recording
+  // its graph can reuse these pinned rows while the eager pass executes.
+  if (graph && ple_pending_ && !WaitPle(error_msg)) {
     return false;
   }
   if (!Run(session, key, graph, body, error_msg)) {
@@ -1920,6 +3421,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                     s_.res))
       return false;
   }
+  pinned_inputs.completed = true;
   return true;
 }
 
@@ -1928,7 +3430,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            bool speculative, bool sparse,
                            std::uint32_t start_pos, std::uint32_t pool_grid,
                            std::uint32_t first_layer, std::uint32_t end_layer,
-                           std::string* error_msg) const {
+                           std::string* error_msg,
+                           PrefillCheckpoint* checkpoint,
+                           bool embeddings_ready) const {
   const Config& c = config();
   if (first_layer == 0) {
     if (!Check(hipMemcpyAsync(session.control_, control_host_,
@@ -1951,46 +3455,128 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     if (!session.CheckCancellation(error_msg))
       return false;
     const DeviceLayer& l = layers[il];
-    if (c.IsPleLayer(il) &&
-        !Ple(l, session, n, s_.res, speculative, error_msg)) {
+    if (c.IsPleLayer(il) && !Ple(l, session, n, s_.res, speculative, error_msg,
+                                 embeddings_ready, checkpoint)) {
       return false;
     }
-    if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg)) {
+    // Both stacked SSM projections consume the same F16 input. Avoid writing
+    // unused F32/Q8 copies when the wide mixer can supply that input directly.
+    const bool half_only = WidePrefill(n) && n <= options_.max_batch &&
+                           l.linear && DenseF16Route(l.ssm_in, n) &&
+                           l.ssm_alpha_beta.type == GgmlType::kF16 &&
+                           l.ssm_alpha_beta.cols == l.ssm_in.cols;
+    if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
+               half_only)) {
       return false;
     }
+    // The last target layer's query outputs have no later cache consumer.
+    // Preserve all K/V/indexer rows and the final query's original tile.
+    const bool last_attention = WidePrefill(n) && !session.mtp_enabled_ &&
+                                il + 1 == c.num_layers && n_logits == 1 &&
+                                checkpoint == nullptr;
     if (l.linear) {
+      const auto capture =
+          checkpoint ? GdnCheckpoint{checkpoint->state->linear_[il].state,
+                                     checkpoint->state->linear_[il].conv_state,
+                                     checkpoint->tokens}
+                     : GdnCheckpoint{};
       if (!LinearAttention(l, session.linear_[il], s_.mixed, s_.block_out, n,
-                           speculative, error_msg)) {
+                           speculative, error_msg, false, true, capture)) {
         return false;
       }
     } else if (!Attention(l, session.attention_[il], s_.mixed, s_.block_out, n,
                           &session.control_->position,
                           &session.control_->blocks, start_pos, pool_grid,
-                          session.max_context_, sparse, error_msg)) {
+                          session.max_context_, sparse, error_msg,
+                          last_attention, false, true,
+                          checkpoint ? checkpoint->tokens : 0)) {
       return false;
     }
 
-    // Each combine also norms the residual for the mixer that follows it,
-    // unless PLE rewrites the residual first.
-    Combine(s_.res, l.hc_ffn.norm.f32(), n);
-    if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, n, error_msg) ||
-        !Moe(l, s_.mixed, s_.block_out, n, error_msg)) {
-      return false;
-    }
     const float* next_norm =
         il + 1 < c.num_layers
             ? (c.IsPleLayer(il + 1) ? nullptr
                                     : layers[il + 1].hc_attn.norm.f32())
-            : model_->hc_head().norm.f32();
-    Combine(s_.res, next_norm, n);
+            : nullptr;
+    const float* next_inject =
+        next_norm != nullptr ? InjectWeights(layers[il + 1].hc_attn) : nullptr;
+    // Cache updates precede the FFN. Without MTP, only requested head rows
+    // and the checkpoint frontier consume the final layer's residual.
+    // Keep aligned tiles and at least 96 rows to retain the wide arithmetic.
+    const auto needed =
+        std::max({96U, n_logits, checkpoint ? n - checkpoint->tokens + 1 : 0U});
+    const auto skipped = prefill_phase && !session.mtp_enabled_ &&
+                                 il + 1 == c.num_layers && n > needed
+                             ? (n - needed) / 128 * 128
+                             : 0U;
+    const auto finish = [&](std::uint32_t rows) {
+      defer_residual_ = WmmaExperts(l, rows);
+      // The wide FFN reads the mix only through its F16 rows (router, routed
+      // experts) and tiled Q8 rows (shared expert).
+      const bool no_f32 = prefill_phase && defer_residual_ &&
+                          rows <= options_.max_batch &&
+                          l.router.type == GgmlType::kF16 &&
+                          l.shexp_gate.type == GgmlType::kQ8_0 &&
+                          l.shexp_up.type == GgmlType::kQ8_0;
+      Combine(s_.res, l.hc_ffn.norm.f32(), rows, InjectWeights(l.hc_ffn),
+              &l.hc_ffn);
+      if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows, error_msg,
+                 false, no_f32) ||
+          !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
+        return false;
+      // The next layer's mixer follows in this pass (without a PLE step:
+      // next_norm is null before a PLE layer).
+      Combine(s_.res, next_norm, rows, next_inject,
+              il + 1 < end_layer ? &layers[il + 1].hc_attn : nullptr);
+      return true;
+    };
+    if (skipped != 0) {
+      struct RestoreScratch {
+        const Executor* executor;
+        Scratch scratch;
+        ~RestoreScratch() { executor->UseScratch(scratch); }
+      } restore{this, s_};
+      auto tail = RowScratch(s_, skipped);
+      tail.inject =
+          s_.inject + std::size_t{skipped} * c.hc_count * inject_parts_;
+      UseScratch(tail);
+      if (!finish(n - skipped))
+        return false;
+    } else if (!finish(n)) {
+      return false;
+    }
     normed = next_norm != nullptr;
   }
   if (end_layer < c.num_layers) {
     return true;
   }
+  if (checkpoint) {
+    if (checkpoint->hidden_rows != 0 &&
+        !Check(hipMemcpyAsync(checkpoint->state->mtp_.target_hidden,
+                              s_.res + std::size_t{checkpoint->tokens -
+                                                   checkpoint->hidden_rows} *
+                                           c.HcDim(),
+                              std::size_t{checkpoint->hidden_rows} * c.HcDim() *
+                                  sizeof(float),
+                              hipMemcpyDeviceToDevice, stream_),
+               "checkpoint hidden rows", error_msg))
+      return false;
+    PrefillPhase head_phase(false);
+    if (!HcMix(model_->hc_head(),
+               s_.res + std::size_t{checkpoint->tokens - 1} * c.HcDim(), false,
+               s_.mixed, nullptr, 1, error_msg) ||
+        !Dense(model_->output(), s_.mixed, s_.logits, 1, error_msg) ||
+        !Check(hipMemcpyAsync(checkpoint->logits.data(), s_.logits,
+                              std::size_t{c.vocab_size} * sizeof(float),
+                              hipMemcpyDeviceToHost, stream_),
+               "checkpoint logits", error_msg))
+      return false;
+  }
   // Prefill catches up immediately from shared scratch. Only the short tail
   // needed across calls belongs to this session.
-  const auto kept = std::min(n, options_.max_speculative);
+  const auto kept = std::min(
+      checkpoint && checkpoint->tokens < n ? n - checkpoint->tokens : n,
+      options_.max_speculative);
   if (session.mtp_enabled_ &&
       !Check(hipMemcpyAsync(
                  session.mtp_.target_hidden,
@@ -2002,9 +3588,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
   }
   if (n_logits > 0) {
     PrefillPhase head_phase(false);
-    // The head mixer norms its tail rows itself: the last combine's norm is
-    // laid out for the whole batch (and tiled on the wide route), so a row
-    // offset into it is not addressable.
+    // Only the requested tail needs the head's normalization.
     const std::size_t skip = static_cast<std::size_t>(n - n_logits);
     const DeviceMixer& head = model_->hc_head();
     if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
@@ -2032,6 +3616,12 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
     AssignError(error_msg, "rollback outside the pending speculative batch");
     return false;
   }
+  if (session.continuation_hooks_ && keep < n) {
+    const auto end = session.spec_base_ + keep;
+    session.continuation_hooks_->BeforeWrite(
+        false, end, session.position_,
+        std::min(session.blocks_, end / c.compress_ratio), session.blocks_);
+  }
   session.spec_tokens_ = 0;
   if (logits != nullptr &&
       !Check(hipMemcpyAsync(
@@ -2048,15 +3638,51 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
   if (keep < n) {
     const std::size_t conv_elems =
         static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
-    const std::size_t slot = keep - 1;
-    for (auto& l : session.linear_) {
+    const std::size_t state_elems = GdnRollbackRowFloats(
+        0, c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim);
+    // A wide verification (ForwardWide) ran consecutive segments of at most
+    // eight rows. Cut back within the segment holding the last kept row;
+    // keeping a whole segment restores the next one's starting state.
+    constexpr std::uint32_t kSegment =
+        static_cast<std::uint32_t>(sizeof(RollbackRows::rows) /
+                                   sizeof(float*)) +
+        1;
+    const std::uint32_t segment = (keep - 1) / kSegment;
+    const std::uint32_t local = keep - segment * kSegment;
+    const bool whole = local == std::min(kSegment, n - segment * kSegment);
+    if (segment != 0 || whole) {
+      if (n <= kSegment || wide_segments_.size() < (n - 1) / kSegment) {
+        AssignError(error_msg, "rollback outside the wide verification");
+        return false;
+      }
+    }
+    const WideSegment* start = whole ? &wide_segments_[segment] : nullptr;
+    const WideSegment* rows =
+        !whole && segment != 0 ? &wide_segments_[segment - 1] : nullptr;
+    const std::size_t slot = local - 1;
+    for (std::size_t il = 0; il < session.linear_.size(); ++il) {
+      auto& l = session.linear_[il];
       if (l.state == nullptr) {
         continue;
       }
-      RestoreGdnState(l.state, l.state_snapshots, keep, c.ssm_num_k_heads,
+      if (start != nullptr) {
+        if (!Check(hipMemcpyAsync(l.state, start->state_start[il],
+                                  state_elems * sizeof(float),
+                                  hipMemcpyDeviceToDevice, stream_),
+                   "state rollback", error_msg) ||
+            !Check(hipMemcpyAsync(l.conv_state, start->conv_start[il],
+                                  conv_elems * sizeof(float),
+                                  hipMemcpyDeviceToDevice, stream_),
+                   "conv rollback", error_msg))
+          return false;
+        continue;
+      }
+      const auto& state_rows = rows ? rows->state[il] : l.state_snapshots;
+      const auto& conv_rows = rows ? rows->conv[il] : l.conv_snapshots;
+      RestoreGdnState(l.state, state_rows, local, c.ssm_num_k_heads,
                       c.ssm_num_v_heads, stream_);
       if (!Check(hipGetLastError(), "state rollback", error_msg) ||
-          !Check(hipMemcpyAsync(l.conv_state, l.conv_snapshots.rows[slot],
+          !Check(hipMemcpyAsync(l.conv_state, conv_rows.rows[slot],
                                 conv_elems * sizeof(float),
                                 hipMemcpyDeviceToDevice, stream_),
                  "conv rollback", error_msg)) {
@@ -2066,13 +3692,16 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
     if (session.ple_history_ != nullptr) {
       const std::size_t hist =
           static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim();
-      if (!Check(hipMemcpyAsync(
-                     session.ple_history_, session.ple_snapshots_.rows[slot],
-                     hist * sizeof(float), hipMemcpyDeviceToDevice, stream_),
-                 "PLE rollback", error_msg)) {
+      const float* source = start  ? start->ple_start
+                            : rows ? rows->ple.rows[slot]
+                                   : session.ple_snapshots_.rows[slot];
+      if (!Check(
+              hipMemcpyAsync(session.ple_history_, source, hist * sizeof(float),
+                             hipMemcpyDeviceToDevice, stream_),
+              "PLE rollback", error_msg)) {
         return false;
       }
-      session.ngram_ = session.ngram_snapshots_[slot];
+      session.ngram_ = session.ngram_snapshots_[keep - 1];
     }
     session.position_ = session.spec_base_ + keep;
     // Pooled block keys past the kept prefix are stale; they are rebuilt
@@ -2092,7 +3721,7 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
 }
 
 constexpr std::array<char, 8> kSnapshotMagic{'Q', 'F', 'N', 'S',
-                                             'N', 'A', 'P', '5'};
+                                             'N', 'A', 'P', '6'};
 
 /// Fixed header ahead of the section bytes. It carries every geometry
 /// value the section sizes derive from, so a payload of another artifact
@@ -2116,10 +3745,17 @@ struct SnapshotHeader {
   std::uint32_t mtp_residual_valid;
   std::uint32_t hidden_rows;
   std::uint32_t image_count;
+  // Rotated K depends on the rope scaling at every position.
+  float rope_factor;
+  std::uint32_t rope_original_context;
+  float rope_beta_fast;
+  float rope_beta_slow;
   std::array<std::int32_t, Config::kMaxPleNgram - 1> ngram_prev;
   std::uint64_t payload_bytes;
 };
 static_assert(std::is_trivially_copyable_v<SnapshotHeader>);
+// The four rope fields must not push payload_bytes off its 8-byte alignment.
+static_assert(offsetof(SnapshotHeader, payload_bytes) == 104);
 
 namespace {
 
@@ -2141,6 +3777,17 @@ SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
   h.image_count = std::ranges::count_if(
       session.VisionLayout().images,
       [&](const auto& image) { return image.offset < h.position; });
+  // Disabled scaling has one disk-cache identity ("absolute-v1" from
+  // RopePositionPolicy) regardless of whatever original_context/beta the
+  // config happens to carry, so the header must normalize to the same
+  // defaults rather than echo them raw (else two "off" configs that differ
+  // only in those unused fields would collide on identity but disagree on
+  // SameGeometry, and neither could restore the other's snapshot).
+  const RopeScaling rope = NormalizedRopeScaling(c.rope_scaling);
+  h.rope_factor = rope.factor;
+  h.rope_original_context = rope.original_context;
+  h.rope_beta_fast = rope.beta_fast;
+  h.rope_beta_slow = rope.beta_slow;
   return h;
 }
 
@@ -2152,7 +3799,11 @@ bool SameGeometry(const SnapshotHeader& h, const SnapshotHeader& mine) {
          h.kv_row == mine.kv_row &&
          h.indexer_head_dim == mine.indexer_head_dim &&
          h.compress_ratio == mine.compress_ratio && h.hc_dim == mine.hc_dim &&
-         h.ple_elems == mine.ple_elems && h.has_mtp == mine.has_mtp;
+         h.ple_elems == mine.ple_elems && h.has_mtp == mine.has_mtp &&
+         h.rope_factor == mine.rope_factor &&
+         h.rope_original_context == mine.rope_original_context &&
+         h.rope_beta_fast == mine.rope_beta_fast &&
+         h.rope_beta_slow == mine.rope_beta_slow;
 }
 
 }  // namespace
@@ -2161,8 +3812,11 @@ template<typename Visit>
 std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
                                      const Session* session, Visit&& visit) {
   std::uint64_t offset = sizeof(SnapshotHeader);
-  const auto region = [&](void* device, std::uint64_t bytes, const char* what) {
-    if (bytes != 0 && !visit(device, offset, bytes, what)) {
+  const auto region = [&](void* device, std::uint64_t bytes, const char* what,
+                          std::uint64_t row_bytes = 0, bool draft = false,
+                          bool pooled = false) {
+    if (bytes != 0 &&
+        !visit(device, offset, bytes, what, row_bytes, draft, pooled)) {
       return false;
     }
     offset += bytes;
@@ -2202,8 +3856,10 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
   for (std::uint32_t il = 0; il < h.num_layers; ++il) {
     if (((il + 1) % h.full_attention_interval) == 0) {
       const auto* at = attention(il);
-      if (!region(at != nullptr ? at->k_cache : nullptr, kv_bytes, "K cache") ||
-          !region(at != nullptr ? at->v_cache : nullptr, kv_bytes, "V cache")) {
+      if (!region(at != nullptr ? at->k_cache : nullptr, kv_bytes, "K cache",
+                  std::uint64_t{h.kv_row} * sizeof(__half)) ||
+          !region(at != nullptr ? at->v_cache : nullptr, kv_bytes, "V cache",
+                  std::uint64_t{h.kv_row} * sizeof(__half))) {
         return 0;
       }
       // Serialize only unpooled rows, in chronological order. The physical
@@ -2222,7 +3878,9 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
           return 0;
       }
       if (!region(at != nullptr ? at->block_k : nullptr, block_bytes,
-                  "pooled block keys"))
+                  "pooled block keys",
+                  std::uint64_t{h.indexer_head_dim} * sizeof(__half), false,
+                  true))
         return 0;
     }
   }
@@ -2245,14 +3903,17 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
     if (!region(
             mtp ? mtp->block_k : nullptr,
             std::uint64_t{h.mtp_blocks} * h.indexer_head_dim * sizeof(__half),
-            "draft pooled keys"))
+            "draft pooled keys",
+            std::uint64_t{h.indexer_head_dim} * sizeof(__half), true, true))
       return 0;
     const std::uint64_t mtp_kv_bytes =
         std::uint64_t{h.mtp_position} * h.kv_row * sizeof(__half);
     if (!region(mtp != nullptr ? mtp->k_cache : nullptr, mtp_kv_bytes,
-                "draft K cache") ||
+                "draft K cache", std::uint64_t{h.kv_row} * sizeof(__half),
+                true) ||
         !region(mtp != nullptr ? mtp->v_cache : nullptr, mtp_kv_bytes,
-                "draft V cache") ||
+                "draft V cache", std::uint64_t{h.kv_row} * sizeof(__half),
+                true) ||
         !region(
             mtp != nullptr ? mtp->h : nullptr,
             h.mtp_residual_valid ? std::uint64_t{h.hc_dim} * sizeof(float) : 0,
@@ -2276,14 +3937,16 @@ std::uint64_t Executor::SnapshotBytes(const Session& session,
   h.mtp_position = session.mtp_.position;
   h.mtp_residual_valid = session.mtp_.residual_valid;
   h.hidden_rows = hidden_rows;
-  return WalkSnapshot(
-      h, nullptr,
-      [](void*, std::uint64_t, std::uint64_t, const char*) { return true; });
+  return WalkSnapshot(h, nullptr,
+                      [](void*, std::uint64_t, std::uint64_t, const char*,
+                         std::uint64_t, bool, bool) { return true; });
 }
 
 bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
                             std::span<std::uint8_t> payload,
-                            std::string* error_msg) const {
+                            std::string* error_msg,
+                            std::shared_ptr<SnapshotState>* deferred,
+                            std::shared_ptr<void> storage) const {
   if (session.owner_ != this) {
     AssignError(error_msg, "session belongs to another executor");
     return false;
@@ -2311,7 +3974,59 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
     AssignError(error_msg, "snapshot buffer size does not match the payload");
     return false;
   }
-  gufo::hip::SnapshotTransfer transfer;
+  std::shared_ptr<SnapshotState> pending;
+  const auto transfer = GetSnapshotAllocator()->Transfer();
+  if (deferred) {
+    if (!storage) {
+      AssignError(error_msg, "borrowed snapshot needs owned payload storage");
+      return false;
+    }
+    if (!session.snapshots_)
+      session.snapshots_ =
+          std::make_shared<SnapshotRegistry>(GetSnapshotAllocator());
+    pending = std::make_shared<SnapshotState>();
+    pending->registry_ = session.snapshots_;
+    if (!session.snapshot_lineage_)
+      session.snapshot_lineage_ = std::make_shared<SnapshotLineage>();
+    pending->lineage_ = session.snapshot_lineage_;
+    pending->storage_ = std::move(storage);
+    pending->payload_ = payload.data();
+    std::uint64_t mutable_prefix = sizeof(SnapshotHeader);
+    (void)WalkSnapshot(h, nullptr,
+                       [&](void*, std::uint64_t offset, std::uint64_t bytes,
+                           const char*, std::uint64_t row_bytes, bool, bool) {
+                         if (row_bytes != 0)
+                           return false;
+                         mutable_prefix = offset + bytes;
+                         return true;
+                       });
+    std::uint64_t extra_bytes = 0;
+    (void)WalkSnapshot(h, nullptr,
+                       [&](void*, std::uint64_t offset, std::uint64_t bytes,
+                           const char*, std::uint64_t row_bytes, bool, bool) {
+                         if (row_bytes == 0 && offset >= mutable_prefix)
+                           extra_bytes += bytes;
+                         return true;
+                       });
+    pending->mutable_offset_ = sizeof(SnapshotHeader);
+    pending->mutable_bytes_ = mutable_prefix - sizeof(SnapshotHeader);
+    try {
+      pending->mutable_storage_ =
+          session.snapshots_->allocator->AllocateSpare(pending->mutable_bytes_);
+      pending->mutable_device_ =
+          static_cast<std::uint8_t*>(pending->mutable_storage_.get());
+      if (extra_bytes != 0) {
+        pending->extra_storage_ =
+            session.snapshots_->allocator->Allocate(extra_bytes);
+        pending->extra_bytes_ = extra_bytes;
+      }
+    } catch (const SnapshotDeviceExhausted&) {
+      // No device room to freeze this capture: copy it to its host payload.
+      pending.reset();
+    }
+  }
+  if (!pending)
+    PopulateSnapshotPrefix(payload.data(), payload.size());
   std::memcpy(payload.data(), &h, sizeof(h));
   const auto grid_bytes =
       std::size_t{h.image_count} * sizeof(qwen::vision::ImageGrid);
@@ -2319,20 +4034,91 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
     std::memcpy(payload.data() + payload.size() - grid_bytes,
                 session.VisionLayout().images.data(), grid_bytes);
   }
-  return WalkSnapshot(h, &session,
-                      [&](void* device, std::uint64_t offset,
-                          std::uint64_t bytes, const char*) {
-                        if (!session.CheckCancellation(error_msg))
-                          return false;
-                        transfer.Copy(payload.data() + offset, device, bytes);
-                        return true;
-                      }) != 0;
+  std::uint64_t extra_used = 0;
+  const bool saved =
+      WalkSnapshot(
+          h, &session,
+          [&](void* device, std::uint64_t offset, std::uint64_t bytes,
+              const char*, std::uint64_t row_bytes, bool draft, bool pooled) {
+            if (!session.CheckCancellation(error_msg))
+              return false;
+            if (pending && row_bytes != 0) {
+              pending->regions_.push_back({device,
+                                           payload.data() + offset,
+                                           bytes,
+                                           bytes,
+                                           bytes,
+                                           row_bytes,
+                                           draft,
+                                           pooled,
+                                           {}});
+            } else {
+              auto* destination = payload.data() + offset;
+              auto kind = hipMemcpyDeviceToHost;
+              if (pending && offset >= pending->mutable_offset_ &&
+                  offset + bytes <=
+                      pending->mutable_offset_ + pending->mutable_bytes_) {
+                destination = pending->mutable_device_ + offset -
+                              pending->mutable_offset_;
+                kind = hipMemcpyDeviceToDevice;
+              } else if (pending && pending->extra_storage_) {
+                if (extra_used + bytes > pending->extra_bytes_)
+                  throw std::logic_error("snapshot extra regions overflow");
+                destination =
+                    static_cast<std::uint8_t*>(pending->extra_storage_.get()) +
+                    extra_used;
+                kind = hipMemcpyDeviceToDevice;
+                pending->extras_.push_back({offset, bytes, destination});
+                extra_used += bytes;
+              }
+              if (pending)
+                transfer->Enqueue(destination, device, bytes, kind);
+              else
+                transfer->Copy(destination, device, bytes);
+            }
+            return true;
+          }) != 0;
+  transfer->Finish();
+  if (saved && pending) {
+    std::lock_guard lock(session.snapshots_->mutex);
+    std::erase_if(session.snapshots_->pending,
+                  [](const auto& entry) { return entry.expired(); });
+    session.snapshots_->pending.push_back(pending);
+    session.snapshot_position_ =
+        std::max(session.snapshot_position_, session.position_);
+    session.snapshot_mtp_position_ =
+        std::max(session.snapshot_mtp_position_, session.mtp_.position);
+    *deferred = std::move(pending);
+  }
+  return saved;
+}
+
+std::uint64_t Executor::PrefillCheckpointBytes(const Session& session,
+                                               std::uint32_t position) const {
+  const auto& c = config();
+  auto h = MakeSnapshotHeader(c, session.mtp_enabled_, session);
+  h.position = position;
+  h.blocks = c.compress_ratio > 0 && position > c.indexer_top_k
+                 ? position / c.compress_ratio
+                 : session.blocks_;
+  if (session.mtp_enabled_) {
+    h.mtp_position = position - 1;
+    h.mtp_blocks = h.mtp_position > c.indexer_top_k
+                       ? h.mtp_position / c.compress_ratio
+                       : session.mtp_.blocks;
+    h.hidden_rows =
+        std::min(position - session.position_, options_.max_speculative);
+  }
+  return WalkSnapshot(h, nullptr,
+                      [](void*, std::uint64_t, std::uint64_t, const char*,
+                         std::uint64_t, bool, bool) { return true; });
 }
 
 bool Executor::RestoreSnapshot(Session& session,
                                std::span<const std::uint8_t> payload,
                                SnapshotInfo* info, std::string* error_msg,
-                               std::uint32_t next_drafts) const {
+                               std::uint32_t next_drafts,
+                               const SnapshotState* deferred) const {
   if (session.owner_ != this) {
     AssignError(error_msg, "session belongs to another executor");
     return false;
@@ -2351,7 +4137,7 @@ bool Executor::RestoreSnapshot(Session& session,
   }
   const std::uint32_t max_blocks =
       h.compress_ratio == 0 ? 0 : h.position / h.compress_ratio;
-  if (h.image_count > 256 || h.position == 0 ||
+  if (h.image_count > h.position || h.position == 0 ||
       h.position > session.max_context_ || h.blocks > max_blocks ||
       h.mtp_position > h.position ||
       h.mtp_blocks > h.mtp_position / h.compress_ratio ||
@@ -2371,9 +4157,9 @@ bool Executor::RestoreSnapshot(Session& session,
   }
   if (h.payload_bytes != payload.size() ||
       WalkSnapshot(h, nullptr,
-                   [](void*, std::uint64_t, std::uint64_t, const char*) {
-                     return true;
-                   }) != payload.size()) {
+                   [](void*, std::uint64_t, std::uint64_t, const char*,
+                      std::uint64_t, bool, bool) { return true; }) !=
+          payload.size()) {
     AssignError(error_msg, "snapshot payload size does not match its header");
     return false;
   }
@@ -2403,29 +4189,227 @@ bool Executor::RestoreSnapshot(Session& session,
   if (!Check(hipStreamSynchronize(stream_), "restore drain", error_msg)) {
     return false;
   }
+  const bool borrowed = deferred && deferred->registry_ == session.snapshots_;
+  std::unique_lock<std::mutex> snapshot_lock;
+  std::unique_lock<std::mutex> source_lock;
+  if (session.snapshots_)
+    snapshot_lock =
+        std::unique_lock(session.snapshots_->mutex, std::defer_lock);
+  if (deferred && !borrowed)
+    source_lock = std::unique_lock(deferred->registry_->mutex, std::defer_lock);
+  if (snapshot_lock.mutex() && source_lock.mutex())
+    std::lock(snapshot_lock, source_lock);
+  else if (snapshot_lock.mutex())
+    snapshot_lock.lock();
+  else if (source_lock.mutex())
+    source_lock.lock();
+  if (session.snapshots_ && session.snapshots_->failure)
+    std::rethrow_exception(session.snapshots_->failure);
+  if (deferred && deferred->registry_->failure)
+    std::rethrow_exception(deferred->registry_->failure);
+  // A same-session restore retains the still-live prefix. Only detached rows
+  // are uploaded. Save other checkpoints' overwritten suffixes first.
+  std::uint32_t trunk_keep = 0;
+  std::uint32_t draft_keep = 0;
+  std::uint32_t trunk_blocks = 0;
+  std::uint32_t draft_blocks = 0;
+  if (borrowed) {
+    trunk_keep = h.position;
+    draft_keep = h.mtp_position;
+    trunk_blocks = h.blocks;
+    draft_blocks = h.mtp_blocks;
+    for (const auto& region : deferred->regions_) {
+      const auto rows =
+          static_cast<std::uint32_t>(region.live_bytes / region.row_bytes);
+      if (region.pooled) {
+        if (region.draft)
+          draft_blocks = std::min(draft_blocks, rows);
+        else
+          trunk_blocks = std::min(trunk_blocks, rows);
+      } else {
+        if (region.draft)
+          draft_keep = std::min(draft_keep, rows);
+        else
+          trunk_keep = std::min(trunk_keep, rows);
+      }
+    }
+  } else if (deferred) {
+    const auto common = SnapshotLineage::Common(
+        session.snapshot_lineage_, deferred->lineage_,
+        {std::min(session.position_, h.position),
+         std::min(session.mtp_.position, h.mtp_position),
+         std::min(session.blocks_, h.blocks),
+         std::min(session.mtp_.blocks, h.mtp_blocks)});
+    trunk_keep = common[0];
+    draft_keep = common[1];
+    trunk_blocks = common[2];
+    draft_blocks = common[3];
+  }
+  trunk_blocks = h.compress_ratio
+                     ? std::min(trunk_blocks, trunk_keep / h.compress_ratio)
+                     : 0;
+  draft_blocks = h.compress_ratio
+                     ? std::min(draft_blocks, draft_keep / h.compress_ratio)
+                     : 0;
+  auto restored_lineage =
+      deferred ? std::make_shared<SnapshotLineage>(
+                     deferred->lineage_,
+                     SnapshotLineage::Rows{h.position, h.mtp_position, h.blocks,
+                                           h.mtp_blocks})
+               : nullptr;
+  if (session.snapshots_) {
+    session.snapshots_->Preserve(trunk_keep, draft_keep, trunk_blocks,
+                                 draft_blocks);
+  }
+  // If restoration fails after a partial write, no provenance may survive.
+  session.snapshot_lineage_.reset();
   // Every live state region is overwritten below. Retain only scratch that
   // the restored operation can use; this never allocates new rollback rows.
   // Explicit reset and failed restoration still release all scratch.
   const auto remaining = session.max_context_ - h.position;
   session.TrimRollback(std::min({next_drafts, options_.max_speculative - 1,
                                  remaining ? remaining - 1 : 0}));
-  if (WalkSnapshot(h, &session,
-                   [&](void* device, std::uint64_t offset, std::uint64_t bytes,
-                       const char* what) {
-                     return session.CheckCancellation(error_msg) &&
-                            Check(hipMemcpy(device, payload.data() + offset,
-                                            bytes, hipMemcpyHostToDevice),
-                                  what, error_msg);
-                   }) == 0) {
+  // A borrowed restore may reuse its source slot. Keep recorded graphs, but
+  // let unrecorded shapes run eagerly once in the restored request before
+  // recording them, just as they would in a fresh execution slot.
+  std::erase_if(session.warmed_,
+                [&](const auto key) { return !session.graphs_.contains(key); });
+  std::unique_ptr<gufo::hip::SnapshotTransfer> fork_transfer;
+  const auto upload = [&](void* device, const std::uint8_t* source,
+                          std::uint64_t bytes, const char* what,
+                          hipMemcpyKind kind = hipMemcpyHostToDevice) {
+    if (!session.CheckCancellation(error_msg))
+      return false;
+    if (deferred) {
+      if (!fork_transfer)
+        fork_transfer = GetSnapshotAllocator()->Transfer();
+      fork_transfer->Enqueue(device, source, bytes, kind);
+      return true;
+    }
+    return Check(hipMemcpy(device, source, bytes, hipMemcpyHostToDevice), what,
+                 error_msg);
+  };
+
+  if (WalkSnapshot(
+          h, &session,
+          [&](void* device, std::uint64_t offset, std::uint64_t bytes,
+              const char* what, std::uint64_t row_bytes, bool draft,
+              bool pooled) {
+            const auto original_offset = offset;
+            const auto original_bytes = bytes;
+            if (deferred && row_bytes != 0) {
+              auto rows = draft ? draft_keep : trunk_keep;
+              if (pooled)
+                rows = draft ? draft_blocks : trunk_blocks;
+              const auto skip =
+                  std::min(bytes, std::uint64_t{rows} * row_bytes);
+              device = static_cast<std::uint8_t*>(device) + skip;
+              offset += skip;
+              bytes -= skip;
+            }
+            if (deferred && !borrowed && row_bytes != 0) {
+              // Fork directly from the source's still-live prefix.
+              // Its detached tail is already present in the payload.
+              // Hold both registries until the copy completes so a
+              // reset or destruction cannot invalidate either side.
+              for (const auto& region : deferred->regions_) {
+                if (region.host != payload.data() + original_offset)
+                  continue;
+                const auto skip = offset - original_offset;
+                const auto copied =
+                    region.live_bytes > skip
+                        ? std::min(bytes, region.live_bytes - skip)
+                        : 0;
+                if (copied != 0) {
+                  if (!session.CheckCancellation(error_msg))
+                    return false;
+                  if (!fork_transfer)
+                    fork_transfer = GetSnapshotAllocator()->Transfer();
+                  fork_transfer->Enqueue(
+                      device,
+                      static_cast<const std::uint8_t*>(region.device) + skip,
+                      copied, hipMemcpyDeviceToDevice);
+                }
+                device = static_cast<std::uint8_t*>(device) + copied;
+                offset += copied;
+                bytes -= copied;
+                break;
+              }
+            }
+            if (bytes == 0)
+              return true;
+            if (deferred && row_bytes != 0) {
+              for (const auto& region : deferred->regions_) {
+                if (region.host != payload.data() + original_offset ||
+                    region.saved.empty())
+                  continue;
+                const auto skip = offset - original_offset;
+                for (const auto& saved : region.saved) {
+                  const auto begin = std::max(skip, saved.offset);
+                  const auto end =
+                      std::min(original_bytes, saved.offset + saved.bytes);
+                  if (begin < end) {
+                    if (!session.CheckCancellation(error_msg))
+                      return false;
+                    if (!fork_transfer)
+                      fork_transfer = GetSnapshotAllocator()->Transfer();
+                    fork_transfer->Enqueue(
+                        static_cast<std::uint8_t*>(device) + begin - skip,
+                        saved.chunk->device + begin - saved.offset, end - begin,
+                        hipMemcpyDeviceToDevice);
+                  }
+                }
+                return true;
+              }
+            }
+            const auto* source = payload.data() + offset;
+            auto kind = hipMemcpyHostToDevice;
+            if (deferred && deferred->mutable_storage_ &&
+                offset >= deferred->mutable_offset_ &&
+                offset + bytes <=
+                    deferred->mutable_offset_ + deferred->mutable_bytes_) {
+              source = deferred->mutable_device_ + offset -
+                       deferred->mutable_offset_;
+              kind = hipMemcpyDeviceToDevice;
+            } else if (deferred && deferred->extra_storage_ && row_bytes == 0) {
+              // The destination may split a ring region differently from the
+              // source, so copy every overlapping frozen piece.
+              auto* target = static_cast<std::uint8_t*>(device);
+              for (const auto& extra : deferred->extras_) {
+                const auto begin = std::max(offset, extra.offset);
+                const auto end =
+                    std::min(offset + bytes, extra.offset + extra.bytes);
+                if (begin < end &&
+                    !upload(target + (begin - offset),
+                            extra.device + (begin - extra.offset), end - begin,
+                            what, hipMemcpyDeviceToDevice))
+                  return false;
+              }
+              return true;
+            }
+            return upload(device, source, bytes, what, kind);
+          }) == 0) {
+    if (fork_transfer)
+      fork_transfer->Finish();
+    if (snapshot_lock.owns_lock())
+      snapshot_lock.unlock();
     session.Reset();
     return false;
   }
+  if (fork_transfer)
+    fork_transfer->Finish();
   session.RestoreVisionLayout(layout, stream_);
   session.position_ = h.position;
   session.blocks_ = h.blocks;
   session.mtp_.position = h.mtp_position;
   session.mtp_.blocks = h.mtp_blocks;
   session.mtp_.residual_valid = h.mtp_residual_valid != 0;
+  session.snapshot_lineage_ = std::move(restored_lineage);
+  if (borrowed)
+    for (auto& region : deferred->regions_)
+      region.live_bytes = region.bytes;
+  session.snapshot_position_ = borrowed ? h.position : trunk_keep;
+  session.snapshot_mtp_position_ = borrowed ? h.mtp_position : draft_keep;
   session.spec_base_ = h.position;
   session.spec_tokens_ = 0;
   session.ngram_.prev = h.ngram_prev;
@@ -2439,9 +4423,9 @@ bool Executor::RestoreSnapshot(Session& session,
 bool Executor::ReadVerificationRows(std::uint32_t row, std::span<float> logits,
                                     std::string* error_msg) const {
   const auto vocab = config().vocab_size;
-  if (row >= options_.max_speculative || logits.empty() ||
-      logits.size() % vocab != 0 ||
-      logits.size() / vocab > options_.max_speculative - row) {
+  const auto rows = std::max(options_.max_speculative, wide_rows_);
+  if (row >= rows || logits.empty() || logits.size() % vocab != 0 ||
+      logits.size() / vocab > rows - row) {
     AssignError(error_msg, "invalid verification row");
     return false;
   }
@@ -2458,6 +4442,24 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
                                     std::span<const std::int32_t> drafts,
                                     std::string* error_msg) const {
   const auto rows = predictions.size();
+  if (rows > 7 && rows < wide_rows_ && drafts.size() == rows &&
+      selected_logits_ != nullptr) {
+    // A wide copy verification: rows of at most seven at a time, each with
+    // the penalty history of the drafts before it.
+    const float* logits = selected_logits_;
+    auto tentative = sampler.WithoutConstraint();
+    bool ok = true;
+    for (std::size_t first = 0; ok && first < rows; first += 7) {
+      const auto count = std::min<std::size_t>(7, rows - first);
+      selected_logits_ = logits + first * config().vocab_size;
+      ok = GreedyMtpPredictions(predictions.subspan(first, count), tentative,
+                                drafts.subspan(first, count), error_msg);
+      for (std::size_t i = first; ok && i < first + count; ++i)
+        tentative.Accept(static_cast<sampling::TokenId>(drafts[i]));
+    }
+    selected_logits_ = logits;
+    return ok;
+  }
   if (rows == 0 || rows > options_.max_logit_rows || rows > 7 ||
       drafts.size() != rows || s_.mtp_ids == nullptr) {
     AssignError(error_msg, "invalid greedy MTP verification request");
@@ -2486,7 +4488,7 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
       const auto capacity =
           std::max(penalties.size(), 2 * verification_penalty_capacity_);
       sampling::TokenPenalty* allocated = nullptr;
-      if (!Check(hipMalloc(&allocated, capacity * sizeof(*allocated)),
+      if (!Check(hip::AllocateDevice(&allocated, capacity * sizeof(*allocated)),
                  "verification penalty allocation", error_msg))
         return false;
       (void)hipFree(verification_penalties_);
@@ -2525,11 +4527,104 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
   return copied && completed;
 }
 
+bool Executor::CanCompactWideVerification(const sampling::SamplerState& sampler,
+                                          std::size_t rows) {
+  return CanCompactMtpVerification(sampler) &&
+         sampler.penalties().size() + rows + 8 <= kCompactPenaltyLimit;
+}
+
+bool Executor::CanCompactMtpVerification(
+    const sampling::SamplerState& sampler) {
+  const auto& config = sampler.config();
+  return config.uses_random_sampling() && config.top_k > 0 &&
+         std::size_t(config.top_k) <= kMtpCandidates &&
+         config.min_keep <= kMtpCandidates &&
+         sampler.penalties().size() + 8 <= kCompactPenaltyLimit &&
+         !sampler.NeedsConstraintMask();
+}
+
+bool Executor::SampledMtpCandidates(
+    std::span<std::span<const sampling::LogitCandidate>> output,
+    const sampling::SamplerState& sampler, std::span<const std::int32_t> drafts,
+    std::string* error_msg) const {
+  const auto rows = output.size();
+  if (rows > 7 && rows < wide_rows_ && drafts.size() == rows &&
+      selected_logits_ != nullptr &&
+      CanCompactWideVerification(sampler, rows)) {
+    // A wide copy verification: rows of at most seven at a time, each with
+    // the penalty history of the drafts before it, kept beyond the next
+    // piece's download.
+    const float* logits = selected_logits_;
+    auto tentative = sampler.WithoutConstraint();
+    wide_candidates_.resize(std::max(wide_candidates_.size(), rows));
+    bool ok = true;
+    for (std::size_t first = 0; ok && first < rows; first += 7) {
+      const auto count = std::min<std::size_t>(7, rows - first);
+      std::array<std::span<const sampling::LogitCandidate>, 7> piece{};
+      selected_logits_ = logits + first * config().vocab_size;
+      ok = SampledMtpCandidates(std::span(piece).first(count), tentative,
+                                drafts.subspan(first, count), error_msg);
+      for (std::size_t i = 0; ok && i < count; ++i) {
+        auto& kept = wide_candidates_[first + i];
+        kept.assign(piece[i].begin(), piece[i].end());
+        output[first + i] = kept;
+        tentative.Accept(static_cast<sampling::TokenId>(drafts[first + i]));
+      }
+    }
+    selected_logits_ = logits;
+    return ok;
+  }
+  if (rows == 0 || rows > 7 || rows >= options_.max_speculative ||
+      rows != drafts.size() || verification_ids_ == nullptr ||
+      !CanCompactMtpVerification(sampler)) {
+    AssignError(error_msg, "invalid compact MTP verification request");
+    return false;
+  }
+  auto& penalties = verification_penalty_host_;
+  penalties.clear();
+  GreedyPenaltyRows batch{};
+  auto tentative = sampler.WithoutConstraint();
+  for (std::size_t row = 0; row < rows; ++row) {
+    const auto counts = tentative.penalties();
+    penalties.insert(penalties.end(), counts.begin(), counts.end());
+    batch.offsets[row + 1] = penalties.size();
+    if (row + 1 < rows)
+      tentative.Accept(static_cast<sampling::TokenId>(drafts[row]));
+  }
+  batch.penalties = verification_penalties_;
+  if (!penalties.empty() &&
+      !Check(hipMemcpyAsync(verification_penalties_, penalties.data(),
+                            penalties.size() * sizeof(penalties[0]),
+                            hipMemcpyHostToDevice, stream_),
+             "compact verification penalties", error_msg))
+    return false;
+  VerificationCandidates(VerificationLogits(), batch, verification_ids_,
+                         verification_scratch_ids_, verification_candidates_,
+                         rows, config().vocab_size, stream_);
+  const auto count = rows * kMtpCandidates + penalties.size();
+  const bool copied = Check(
+      hipMemcpyAsync(verification_candidates_host_, verification_candidates_,
+                     count * sizeof(sampling::LogitCandidate),
+                     hipMemcpyDeviceToHost, stream_),
+      "compact verification candidates", error_msg);
+  const bool completed =
+      Check(hipStreamSynchronize(stream_), "compact verification", error_msg);
+  if (!copied || !completed)
+    return false;
+  for (std::size_t row = 0; row < rows; ++row)
+    output[row] = {
+        verification_candidates_host_ + row * kMtpCandidates +
+            batch.offsets[row],
+        kMtpCandidates + batch.offsets[row + 1] - batch.offsets[row]};
+  return true;
+}
+
 bool Executor::MtpForward(Session& session,
                           std::span<const std::int32_t> tokens,
                           std::int32_t hidden_row, MtpOutput output,
                           std::string* error_msg,
                           const float* hidden_source) const {
+  DropReadyQ8();
   const auto n = static_cast<std::uint32_t>(tokens.size());
   if (session.owner_ != this ||
       std::any_of(tokens.begin(), tokens.end(), [&](auto t) {
@@ -2548,7 +4643,9 @@ bool Executor::MtpForward(Session& session,
   if (n == 0 || n > options_.max_batch || (hidden_row < 0 && n != 1) ||
       (hidden_row >= 0 &&
        static_cast<std::uint32_t>(hidden_row) + n >
-           (hidden_source ? options_.max_batch : options_.max_speculative))) {
+           (hidden_source
+                ? options_.max_batch
+                : std::max(options_.max_speculative, max_copy_rows())))) {
     AssignError(error_msg, "MTP batch outside the kept hidden rows");
     return false;
   }
@@ -2569,6 +4666,12 @@ bool Executor::MtpForward(Session& session,
     AssignError(error_msg, "MTP context is full");
     return false;
   }
+  if (session.continuation_hooks_)
+    session.continuation_hooks_->BeforeWrite(
+        true, pos, pos + n, session.mtp_.blocks,
+        pos + n > config().indexer_top_k ? (pos + n) / config().compress_ratio
+                                         : session.mtp_.blocks);
+  session.PreserveSnapshots(session.position_, session.mtp_.position);
   ++session.mutation_epoch_;
   session.mtp_.residual_valid = false;
   std::copy(tokens.begin(), tokens.end(), tokens_host_);
@@ -2585,24 +4688,30 @@ bool Executor::MtpForward(Session& session,
   const bool graph = output.trace == nullptr && hidden_source == nullptr &&
                      n <= kVecBatch && pool <= graph_pool &&
                      pos + 1 >= session.VisionLayout().PrefixLength();
+  // Captured graphs bake in the head; key on the one this draft reads.
+  const bool subset = UseDraftSubset(session, output.draft_subset) &&
+                      (output.token != nullptr || output.candidates != nullptr);
   const std::uint64_t key =
       static_cast<std::uint64_t>(n) |
       (static_cast<std::uint64_t>(hidden_row < 0) << 32) |
       (std::uint64_t{1} << 40) |
       (std::uint64_t{output.token != nullptr} << 41) |
       (std::uint64_t{output.candidates != nullptr} << 43) |
-      (std::uint64_t{sparse} << 44) | (std::uint64_t{output.kv_only} << 45);
+      (std::uint64_t{sparse} << 44) | (std::uint64_t{output.kv_only} << 45) |
+      (std::uint64_t{subset} << 46);
   const auto body = [&] {
     return MtpBody(session, n, pos, output.token != nullptr,
                    output.candidates != nullptr, error_msg,
                    graph ? graph_pool : pool, hidden_source, output.trace,
-                   output.kv_only);
+                   output.kv_only, subset);
   };
   if (!Run(session, key, graph, body, error_msg)) {
     return false;
   }
   if (output.token != nullptr) {
-    *output.token = *mtp_token_host_;
+    *output.token = mtp_token_host_[0];
+    if (output.confidence != nullptr)
+      *output.confidence = std::bit_cast<float>(mtp_token_host_[1]);
   }
   if (output.candidates != nullptr) {
     *output.candidates = *mtp_candidates_host_;
@@ -2617,7 +4726,7 @@ bool Executor::MtpForward(Session& session,
 bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                        bool token, bool candidates, std::string* error_msg,
                        std::uint32_t pool_grid, const float* hidden_source,
-                       MtpTrace* trace, bool kv_only) const {
+                       MtpTrace* trace, bool kv_only, bool draft_subset) const {
   const Config& c = config();
   const DeviceLayer& l = model_->mtp();
   const std::uint32_t hc_dim = c.HcDim();
@@ -2647,11 +4756,20 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
               1, c.rms_eps, stream_);
   // The hidden input: kept trunk rows from `hidden_row`, or the block's
   // own carried residual.
-  MtpHidden(hidden_source ? hidden_source : session.mtp_.target_hidden,
-            session.mtp_.h, &session.control_->hidden_row, s_.mtp_h, n, hc_dim,
-            stream_);
+  const float* hidden = s_.mtp_h;
+  if (hidden_source && control_host_->hidden_row >= 0) {
+    // Eager catch-up can normalize the trunk rows directly. Graphs use the
+    // device-selected source below because their hidden-row index can change
+    // on replay. Neither path modifies the trunk residual.
+    hidden = hidden_source +
+             static_cast<std::size_t>(control_host_->hidden_row) * hc_dim;
+  } else {
+    MtpHidden(hidden_source ? hidden_source : session.mtp_.target_hidden,
+              session.mtp_.h, &session.control_->hidden_row, s_.mtp_h, n,
+              hc_dim, stream_);
+  }
   // Unlike the HC mixers, this normalization spans the complete HC * H row.
-  RmsNormRows(s_.mtp_h, l.nextn_hnorm.f32(), s_.mtp_h, n, hc_dim, 1, c.rms_eps,
+  RmsNormRows(hidden, l.nextn_hnorm.f32(), s_.mtp_h, n, hc_dim, 1, c.rms_eps,
               stream_);
   if (trace && !copy_trace(s_.mtp_h + final_row, trace->normalized_hidden))
     return false;
@@ -2709,7 +4827,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                           nullptr, attn.k_cache, attn.v_cache, n, 0,
                           c.num_kv_heads, c.head_dim, c.rotary_dim,
                           &session.control_->mtp_position, c.rope_theta,
-                          c.rms_eps, stream_, attn.rope)) {
+                          c.rms_eps, stream_, attn.rope, false, yarn_)) {
       AssignError(error_msg, "MTP cache projection failed");
       return false;
     }
@@ -2720,11 +4838,11 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     StoreRows(s_.ik, attn.index_k, n, c.indexer_head_dim,
               &session.control_->mtp_position, capacity, stream_);
     if (pos + n > c.indexer_top_k) {
-      PoolIndexerBlocks(attn.index_k, l.indexer_k_norm.f32(), attn.block_k,
-                        &session.control_->mtp_blocks,
-                        &session.control_->mtp_position, n, pool_grid,
-                        c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
-                        c.rope_theta, c.rms_eps, capacity, stream_, attn.rope);
+      PoolIndexerBlocks(
+          attn.index_k, l.indexer_k_norm.f32(), attn.block_k,
+          &session.control_->mtp_blocks, &session.control_->mtp_position, n,
+          pool_grid, c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
+          c.rope_theta, c.rms_eps, capacity, stream_, attn.rope, yarn_);
     }
     return true;
   }
@@ -2764,7 +4882,9 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     if (!Dense(l.attn_out, s_.ctx, s_.block_out, tail_rows, error_msg))
       return false;
   }
-  Combine(s_.mtp_res, l.hc_ffn.norm.f32(), tail_rows);
+  // A trace reads the residual before the mixer.
+  Combine(s_.mtp_res, l.hc_ffn.norm.f32(), tail_rows, nullptr,
+          trace == nullptr ? &l.hc_ffn : nullptr);
   if (trace && !copy_trace(s_.mtp_res + tail_last, trace->attention))
     return false;
   if (!session.CheckCancellation(error_msg))
@@ -2809,7 +4929,8 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     return false;
   }
   return (!token && !candidates) ||
-         MtpHead(l.nextn_head, last, token, candidates, error_msg);
+         MtpHead(l.nextn_head, last, token, candidates,
+                 draft_subset ? &session : nullptr, error_msg);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

@@ -1,10 +1,5 @@
 #include "src/core/gguf_reader.hpp"
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -25,6 +20,7 @@
 #include <variant>
 #include <vector>
 
+#include "src/core/platform/mapped_file.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 
 namespace gufo::core {
@@ -60,21 +56,13 @@ bool ReadString(const std::uint8_t* data, std::size_t size, std::size_t& offset,
 
 }  // namespace
 
-GgufReader::~GgufReader() {
-  if (owns_mmap_ && mmap_addr_ != nullptr && size_ > 0) {
-    munmap(mmap_addr_, size_);
-  }
-  if (fd_ >= 0) {
-    close(fd_);
-  }
-}
+GgufReader::~GgufReader() = default;
 
 GgufReader::GgufReader(GgufReader&& other) noexcept
     : data_(other.data_),
-      mmap_addr_(other.mmap_addr_),
       size_(other.size_),
-      fd_(other.fd_),
-      owns_mmap_(other.owns_mmap_),
+      source_path_(std::move(other.source_path_)),
+      mapping_(std::move(other.mapping_)),
       version_(other.version_),
       alignment_(other.alignment_),
       metadata_(std::move(other.metadata_)),
@@ -83,26 +71,19 @@ GgufReader::GgufReader(GgufReader&& other) noexcept
       mapped_regions_(std::move(other.mapped_regions_)),
       shards_(std::move(other.shards_)) {
   other.data_ = nullptr;
-  other.mmap_addr_ = nullptr;
   other.size_ = 0;
-  other.fd_ = -1;
-  other.owns_mmap_ = false;
 }
 
 GgufReader& GgufReader::operator=(GgufReader&& other) noexcept {
   if (this != &other) {
-    if (owns_mmap_ && mmap_addr_ != nullptr && size_ > 0) {
-      munmap(mmap_addr_, size_);
-    }
-    if (fd_ >= 0) {
-      close(fd_);
-    }
+    mapping_.Close();
+    shards_.clear();
+    mapped_regions_.clear();
 
     data_ = other.data_;
-    mmap_addr_ = other.mmap_addr_;
     size_ = other.size_;
-    fd_ = other.fd_;
-    owns_mmap_ = other.owns_mmap_;
+    source_path_ = std::move(other.source_path_);
+    mapping_ = std::move(other.mapping_);
     version_ = other.version_;
     alignment_ = other.alignment_;
     metadata_ = std::move(other.metadata_);
@@ -112,10 +93,7 @@ GgufReader& GgufReader::operator=(GgufReader&& other) noexcept {
     shards_ = std::move(other.shards_);
 
     other.data_ = nullptr;
-    other.mmap_addr_ = nullptr;
     other.size_ = 0;
-    other.fd_ = -1;
-    other.owns_mmap_ = false;
   }
   return *this;
 }
@@ -143,40 +121,21 @@ std::unique_ptr<GgufReader> GgufReader::OpenFile(
 
 std::unique_ptr<GgufReader> GgufReader::OpenSingleFile(
     const std::filesystem::path& path, std::string* error_msg) {
-  const int fd = open(path.c_str(), O_RDONLY);
-  if (fd < 0) {
+  std::string open_error;
+  auto mapping = platform::ReadOnlyMappedFile::Open(path, &open_error);
+  if (!mapping.valid()) {
     if (error_msg != nullptr) {
-      *error_msg = "Failed to open file: " + path.string();
+      *error_msg =
+          "Failed to open or map file: " + path.string() + ": " + open_error;
     }
     return nullptr;
   }
-
-  struct stat sb{};
-  if (fstat(fd, &sb) != 0 || sb.st_size <= 0) {
-    close(fd);
-    if (error_msg != nullptr) {
-      *error_msg = "Invalid or empty file: " + path.string();
-    }
-    return nullptr;
-  }
-
-  const auto size = static_cast<std::size_t>(sb.st_size);
-  void* const addr = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-  if (addr == MAP_FAILED) {
-    close(fd);
-    if (error_msg != nullptr) {
-      *error_msg = "Failed to mmap file: " + path.string();
-    }
-    return nullptr;
-  }
-  (void)madvise(addr, size, MADV_SEQUENTIAL);
 
   auto reader = std::unique_ptr<GgufReader>(new GgufReader());
-  reader->mmap_addr_ = addr;
-  reader->data_ = static_cast<const std::uint8_t*>(addr);
-  reader->size_ = size;
-  reader->fd_ = fd;
-  reader->owns_mmap_ = true;
+  reader->data_ = mapping.data();
+  reader->size_ = mapping.size();
+  reader->source_path_ = path;
+  reader->mapping_ = std::move(mapping);
 
   try {
     if (!reader->ParseHeaders(error_msg)) {
@@ -189,8 +148,9 @@ std::unique_ptr<GgufReader> GgufReader::OpenSingleFile(
       *error_msg = "Insufficient memory for GGUF descriptors";
     return nullptr;
   }
-  reader->mapped_regions_.push_back(
-      {reader->data_, reader->size_, reader->fd_});
+  reader->mapped_regions_.push_back({reader->data_, reader->size_,
+                                     reader->mapping_.PlatformHandle(),
+                                     reader->source_path_});
   return reader;
 }
 
@@ -294,8 +254,9 @@ std::unique_ptr<GgufReader> GgufReader::OpenSplitFileSet(
   combined->mapped_regions_.reserve(split_count);
 
   for (const auto& shard : shards) {
-    combined->mapped_regions_.push_back(
-        {shard->data_, shard->size_, shard->fd_});
+    combined->mapped_regions_.push_back({shard->data_, shard->size_,
+                                         shard->mapping_.PlatformHandle(),
+                                         shard->source_path_});
     for (const auto& tensor : shard->tensors_) {
       if (combined->tensor_index_.contains(tensor.name)) {
         if (error_msg != nullptr) {
@@ -333,11 +294,8 @@ std::unique_ptr<GgufReader> GgufReader::OpenMemory(const void* data,
   }
 
   auto reader = std::unique_ptr<GgufReader>(new GgufReader());
-  reader->mmap_addr_ = nullptr;
   reader->data_ = static_cast<const std::uint8_t*>(data);
   reader->size_ = size;
-  reader->fd_ = -1;
-  reader->owns_mmap_ = false;
 
   try {
     if (!reader->ParseHeaders(error_msg)) {
@@ -351,7 +309,7 @@ std::unique_ptr<GgufReader> GgufReader::OpenMemory(const void* data,
     return nullptr;
   }
   reader->mapped_regions_.push_back(
-      {reader->data_, reader->size_, reader->fd_});
+      {reader->data_, reader->size_, platform::kInvalidFile, {}});
   return reader;
 }
 
@@ -593,14 +551,27 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
             values.push_back(value);
           }
           meta_val.value = std::move(values);
-        } else if (item_type == GgufValueType::kUint32 ||
+        } else if (item_type == GgufValueType::kUint8 ||
+                   item_type == GgufValueType::kUint16 ||
+                   item_type == GgufValueType::kUint32 ||
                    item_type == GgufValueType::kBool ||
                    item_type == GgufValueType::kUint64) {
+          // Writers pick the narrowest integer type; widen every width.
           std::vector<std::uint64_t> u_arr;
           u_arr.reserve(array_len);
           for (std::uint64_t a = 0; a < array_len; ++a) {
             std::uint64_t val = 0;
-            if (item_type == GgufValueType::kUint32) {
+            if (item_type == GgufValueType::kUint8) {
+              std::uint8_t val8 = 0;
+              if (!ReadPod(data_, size_, offset, val8))
+                return false;
+              val = val8;
+            } else if (item_type == GgufValueType::kUint16) {
+              std::uint16_t val16 = 0;
+              if (!ReadPod(data_, size_, offset, val16))
+                return false;
+              val = val16;
+            } else if (item_type == GgufValueType::kUint32) {
               std::uint32_t val32 = 0;
               if (!ReadPod(data_, size_, offset, val32)) {
                 return false;
@@ -619,13 +590,25 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
             u_arr.push_back(val);
           }
           meta_val.value = std::move(u_arr);
-        } else if (item_type == GgufValueType::kInt32 ||
+        } else if (item_type == GgufValueType::kInt8 ||
+                   item_type == GgufValueType::kInt16 ||
+                   item_type == GgufValueType::kInt32 ||
                    item_type == GgufValueType::kInt64) {
           std::vector<std::int64_t> i_arr;
           i_arr.reserve(array_len);
           for (std::uint64_t a = 0; a < array_len; ++a) {
             std::int64_t val = 0;
-            if (item_type == GgufValueType::kInt32) {
+            if (item_type == GgufValueType::kInt8) {
+              std::int8_t val8 = 0;
+              if (!ReadPod(data_, size_, offset, val8))
+                return false;
+              val = val8;
+            } else if (item_type == GgufValueType::kInt16) {
+              std::int16_t val16 = 0;
+              if (!ReadPod(data_, size_, offset, val16))
+                return false;
+              val = val16;
+            } else if (item_type == GgufValueType::kInt32) {
               std::int32_t val32 = 0;
               if (!ReadPod(data_, size_, offset, val32)) {
                 return false;
@@ -638,24 +621,9 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
           }
           meta_val.value = std::move(i_arr);
         } else {
-          // Skip other array types cleanly
-          std::size_t item_size = 4;
-          if (item_type == GgufValueType::kUint8 ||
-              item_type == GgufValueType::kInt8 ||
-              item_type == GgufValueType::kBool) {
-            item_size = 1;
-          } else if (item_type == GgufValueType::kUint16 ||
-                     item_type == GgufValueType::kInt16) {
-            item_size = 2;
-          } else if (item_type == GgufValueType::kUint64 ||
-                     item_type == GgufValueType::kInt64 ||
-                     item_type == GgufValueType::kFloat64) {
-            item_size = 8;
-          }
-          if (offset > size_ || array_len > (size_ - offset) / item_size) {
-            return false;
-          }
-          offset += (array_len * item_size);
+          // Every scalar item type is decoded above; never store an array
+          // entry without its values.
+          return false;
         }
         break;
       }
@@ -899,117 +867,6 @@ bool GgufReader::HasVisionTensors() const noexcept {
     return t.name.starts_with("model.visual") ||
            t.name.starts_with("visual.") || t.name.starts_with("v.");
   });
-}
-
-std::optional<ModelConfig> GgufReader::ExtractModelConfig(
-    std::string* error_msg) const {
-  ModelConfig config;
-
-  // 1. Check architecture prefix (e.g. "qwen2", "qwen3", "qwen35", "llama")
-  auto arch_str = GetMetadataString("general.architecture").value_or("qwen");
-  config.architecture = std::string(arch_str);
-  const std::string prefix = config.architecture + ".";
-
-  // 2. Read standard architectural hyperparameters
-  const auto total_layers =
-      GetMetadataUint32(prefix + "block_count").value_or(config.num_layers);
-  if (auto val = GetMetadataUint32(prefix + "embedding_length")) {
-    config.hidden_size = *val;
-  }
-  if (auto val = GetMetadataUint32(prefix + "feed_forward_length")) {
-    config.intermediate_size = *val;
-  }
-  if (auto val = GetMetadataUint32(prefix + "attention.head_count")) {
-    config.num_attention_heads = *val;
-  }
-  if (auto val = GetMetadataUint32(prefix + "attention.head_count_kv")) {
-    config.num_key_value_heads = *val;
-  }
-  if (auto val = GetMetadataUint32(prefix + "attention.key_length")) {
-    config.head_dim = *val;
-  } else if (config.num_attention_heads > 0) {
-    config.head_dim = config.hidden_size / config.num_attention_heads;
-  }
-  if (auto val = GetMetadataUint32(prefix + "context_length")) {
-    config.context_length = *val;
-  }
-  if (auto val = GetMetadataUint32(prefix + "full_attention_interval")) {
-    config.full_attention_interval = *val;
-  }
-  if (auto val = GetMetadataUint32(prefix + "ssm.conv_kernel")) {
-    config.ssm_conv_kernel = *val;
-  }
-  if (auto val = GetMetadataUint32(prefix + "ssm.state_size")) {
-    config.ssm_state_size = *val;
-  }
-  if (auto val = GetMetadataUint32(prefix + "ssm.group_count")) {
-    config.ssm_group_count = *val;
-  }
-  if (auto val = GetMetadataUint32(prefix + "ssm.time_step_rank")) {
-    config.ssm_time_step_rank = *val;
-  }
-  if (auto val = GetMetadataUint32(prefix + "ssm.inner_size")) {
-    config.ssm_inner_size = *val;
-  }
-  if (auto val = GetMetadataFloat32(prefix + "rope.freq_base")) {
-    config.rope_theta = *val;
-  }
-  if (auto val = GetMetadataUint32(prefix + "rope.dimension_count")) {
-    config.rotary_dim = *val;
-  } else {
-    config.rotary_dim = config.head_dim;
-  }
-
-  // 3. MTP speculative layers are included in qwen35.block_count but are not
-  // part of the main autoregressive transformer stack.
-  const auto embedded_mtp_layers =
-      GetMetadataUint32(prefix + "nextn_predict_layers");
-  config.mtp_num_layers =
-      embedded_mtp_layers.value_or(HasMtpTensors() ? 1U : 0U);
-  const std::uint32_t layers_in_block_count = embedded_mtp_layers.value_or(0U);
-  if (layers_in_block_count > total_layers) {
-    if (error_msg != nullptr) {
-      *error_msg = "MTP layer count exceeds qwen block count";
-    }
-    return std::nullopt;
-  }
-  config.num_layers = total_layers - layers_in_block_count;
-
-  // 4. Assert text-only contract
-  if (HasVisionTensors()) {
-    config.is_text_only = false;
-    if (error_msg != nullptr) {
-      *error_msg =
-          "Model contains vision encoder tensors; text-only contract violation";
-    }
-    return std::nullopt;
-  }
-  config.is_text_only = true;
-
-  // 5. Model name
-  if (auto name = GetMetadataString("general.name")) {
-    config.model_name = std::string(*name);
-  }
-  if (const auto* token_embd = FindTensor("token_embd.weight");
-      token_embd != nullptr && config.hidden_size > 0) {
-    const auto elements = token_embd->ElementCount();
-    if ((elements % config.hidden_size) == 0) {
-      config.vocab_size =
-          static_cast<std::uint32_t>(elements / config.hidden_size);
-    }
-  }
-
-  // 6. Validate configuration against Qwen3.5/3.8 structural rules
-  if (!config.IsValidQwen()) {
-    if (error_msg != nullptr) {
-      *error_msg = "Model config failed Qwen structural validation (head_dim=" +
-                   std::to_string(config.head_dim) +
-                   ", layers=" + std::to_string(config.num_layers) + ")";
-    }
-    return std::nullopt;
-  }
-
-  return config;
 }
 
 }  // namespace gufo::core

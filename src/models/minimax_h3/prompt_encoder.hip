@@ -4,12 +4,8 @@
 // h3_text_encoder.c at 8974cc055ea9c02fcd14cc27dfda3e1027c05153 (MIT).
 // Dense projections and residency/prefetch are independent ROCm/HIP code.
 
-#include <fcntl.h>
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -30,7 +26,8 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/mapped_prefetch.hpp"
+#include <gufo/ext/mapped_prefetch.hpp>
+#include <gufo/ext/platform/mapped_file.hpp>
 #include "src/models/minimax_h3/prompt_encoder.hpp"
 #include "src/models/minimax_h3/prompt_encoder_ops.hip.hpp"
 
@@ -207,46 +204,56 @@ struct FileInterval {
 
 struct HostMapping {
   std::filesystem::path shard;
+  platform::RawMappedFile mapping_file;
   void* host{nullptr};
   std::size_t bytes{0};
   std::uint64_t file_offset{0};
   void* device{nullptr};
   bool registered{false};
+  // `host` is pinned memory filled from the file, not a mapping view.
+  bool pinned{false};
 
   HostMapping() = default;
   HostMapping(const HostMapping&) = delete;
   HostMapping& operator=(const HostMapping&) = delete;
   HostMapping(HostMapping&& other) noexcept
       : shard(std::move(other.shard)),
+        mapping_file(std::exchange(other.mapping_file, {})),
         host(std::exchange(other.host, nullptr)),
         bytes(std::exchange(other.bytes, 0)),
         file_offset(other.file_offset),
         device(std::exchange(other.device, nullptr)),
-        registered(std::exchange(other.registered, false)) {}
+        registered(std::exchange(other.registered, false)),
+        pinned(std::exchange(other.pinned, false)) {}
   HostMapping& operator=(HostMapping&& other) noexcept {
     if (this != &other) {
       Release();
       shard = std::move(other.shard);
+      mapping_file = std::exchange(other.mapping_file, {});
       host = std::exchange(other.host, nullptr);
       bytes = std::exchange(other.bytes, 0);
       file_offset = other.file_offset;
       device = std::exchange(other.device, nullptr);
       registered = std::exchange(other.registered, false);
+      pinned = std::exchange(other.pinned, false);
     }
     return *this;
   }
   ~HostMapping() { Release(); }
 
   void Release() noexcept {
+    if (pinned && host != nullptr) {
+      (void)hipHostFree(host);
+      g_registered_host_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
+      pinned = false;
+    }
     if (registered && host != nullptr) {
       (void)hipHostUnregister(host);
       g_registered_host_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
       registered = false;
     }
-    if (host != nullptr && bytes != 0) {
-      (void)munmap(host, bytes);
-      host = nullptr;
-    }
+    mapping_file.Close();
+    host = nullptr;
     device = nullptr;
     bytes = 0;
   }
@@ -254,11 +261,7 @@ struct HostMapping {
 
 std::vector<FileInterval> BuildIntervals(
     std::span<const TensorDescriptor* const> descriptors) {
-  const long page_size_value = sysconf(_SC_PAGESIZE);
-  if (page_size_value <= 0) {
-    throw std::runtime_error("cannot determine host page size");
-  }
-  const auto page_size = static_cast<std::uint64_t>(page_size_value);
+  const auto page_size = static_cast<std::uint64_t>(platform::SystemPageSize());
   std::vector<FileInterval> intervals;
   intervals.reserve(descriptors.size());
   for (const TensorDescriptor* descriptor : descriptors) {
@@ -316,6 +319,44 @@ struct BatchLoadResult {
   std::string error;
 };
 
+// Windows HIP rejects hipHostRegister on file mapping views, so there the
+// interval is read into mapped pinned memory that the GPU reads the same way.
+bool ReadIntervalPinned(const std::filesystem::path& path, std::uint64_t offset,
+                        std::size_t length, HostMapping* mapping,
+                        std::string* error) {
+  hipError_t status =
+      hipHostMalloc(&mapping->host, length, hipHostMallocMapped);
+  if (status != hipSuccess) {
+    mapping->host = nullptr;
+    *error = HipError("hipHostMalloc(H3 text weight)", status);
+    return false;
+  }
+  mapping->pinned = true;
+  mapping->bytes = length;
+  std::string open_error;
+  const platform::PlatformFile file = platform::OpenReadFile(path, &open_error);
+  if (!platform::FileValid(file)) {
+    *error = "cannot open H3 text shard " + path.string() + ": " + open_error;
+    return false;
+  }
+  std::size_t read_bytes = 0;
+  while (read_bytes < length) {
+    const std::size_t result = platform::ReadFileAt(
+        file, static_cast<std::byte*>(mapping->host) + read_bytes,
+        length - read_bytes, offset + read_bytes);
+    if (result == 0) {
+      break;
+    }
+    read_bytes += result;
+  }
+  platform::CloseFile(file);
+  if (read_bytes != length) {
+    *error = "short read loading H3 text shard " + path.string();
+    return false;
+  }
+  return true;
+}
+
 BatchLoadResult LoadBatch(const ModelInventory& inventory,
                           std::vector<const TensorDescriptor*> descriptors,
                           int device, const CancellationToken* cancellation) {
@@ -341,41 +382,41 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
         return result;
       }
       const auto path = inventory.model_root() / interval.shard;
-      const int file = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-      if (file < 0) {
-        result.error = "cannot open H3 text shard " + path.string() + ": " +
-                       std::strerror(errno);
-        return result;
-      }
       const std::uint64_t length64 = interval.end - interval.begin;
       if (length64 > std::numeric_limits<std::size_t>::max()) {
-        close(file);
         result.error = "H3 text mapping is too large";
         return result;
       }
       const auto length = static_cast<std::size_t>(length64);
-      void* host = mmap(nullptr, length, PROT_READ, MAP_PRIVATE, file,
-                        static_cast<off_t>(interval.begin));
-      close(file);
-      if (host == MAP_FAILED) {
-        result.error = "cannot map H3 text shard " + path.string() + ": " +
-                       std::strerror(errno);
-        return result;
-      }
       HostMapping mapping;
       mapping.shard = interval.shard;
-      mapping.host = host;
-      mapping.bytes = length;
       mapping.file_offset = interval.begin;
-      core::PrefaultMappedRange(host, length);
-      status = hipHostRegister(host, length,
+#if defined(_WIN32)
+      if (!ReadIntervalPinned(path, interval.begin, length, &mapping,
+                              &result.error)) {
+        return result;
+      }
+#else
+      std::string map_error;
+      if (!mapping.mapping_file.OpenRange(path, interval.begin, length,
+                                          platform::MapHint::kNone,
+                                          &map_error)) {
+        result.error =
+            "cannot map H3 text shard " + path.string() + ": " + map_error;
+        return result;
+      }
+      mapping.host = mapping.mapping_file.data;
+      mapping.bytes = length;
+      core::PrefaultMappedRange(mapping.host, length);
+      status = hipHostRegister(mapping.host, length,
                                hipHostRegisterMapped | hipHostRegisterReadOnly);
       if (status != hipSuccess) {
         result.error = HipError("hipHostRegister(mapped|readonly)", status);
         return result;
       }
       mapping.registered = true;
-      status = hipHostGetDevicePointer(&mapping.device, host, 0);
+#endif
+      status = hipHostGetDevicePointer(&mapping.device, mapping.host, 0);
       if (status != hipSuccess) {
         result.error =
             HipError("hipHostGetDevicePointer(H3 text weight)", status);

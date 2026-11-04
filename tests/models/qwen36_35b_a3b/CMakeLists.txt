@@ -20,26 +20,24 @@ target_link_libraries(qwen36_35b_a3b_reference_probe PRIVATE
 set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 
 if (ENGINE_ENABLE_HIP)
+  add_library(qwen36_35b_a3b_test_hip INTERFACE)
+  target_link_libraries(qwen36_35b_a3b_test_hip INTERFACE
+    gufo_qwen36_35b_a3b_hip gufo_qwen36_35b_a3b_mmq hip::host)
+  target_compile_definitions(qwen36_35b_a3b_test_hip INTERFACE ENGINE_ENABLE_HIP=1)
   foreach(name IN ITEMS mtp_ops blaslt_ops gdn_ops attention_ops
       moe_epilogue_ops moe_ids_ops projection_ops routed_wmma_ops)
-    add_qwen36_35b_a3b_test(${name} gufo_qwen36_35b_a3b "hip;gpu;gfx1151")
+    add_qwen36_35b_a3b_test(${name} qwen36_35b_a3b_test_hip "hip;gpu;gfx1151")
   endforeach()
 
-  add_executable(qwen36_35b_a3b_session_test EXCLUDE_FROM_ALL session_test.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
-  target_link_libraries(qwen36_35b_a3b_session_test PRIVATE gufo_logging
-    gufo_qwen36_35b_a3b gufo_qwen38_flash_next gufo_deepseek_v4_flash
-    hip::host)
+  add_executable(qwen36_35b_a3b_session_test EXCLUDE_FROM_ALL session_test.cpp)
+  target_link_libraries(qwen36_35b_a3b_session_test PRIVATE gufo_serving
+    qwen36_35b_a3b_test_hip)
   add_executable(qwen36_35b_a3b_snapshot_test EXCLUDE_FROM_ALL snapshot_test.cpp)
   target_link_libraries(qwen36_35b_a3b_snapshot_test PRIVATE
-    gufo_qwen36_35b_a3b)
+    qwen36_35b_a3b_test_hip)
   add_custom_target(qwen36_35b_a3b_model_tests
     DEPENDS qwen36_35b_a3b_session_test qwen36_35b_a3b_snapshot_test)
 
   add_executable(qwen36_35b_a3b_gpu_probe EXCLUDE_FROM_ALL gpu_probe.cpp)
-  target_link_libraries(qwen36_35b_a3b_gpu_probe PRIVATE gufo_qwen36_35b_a3b)
+  target_link_libraries(qwen36_35b_a3b_gpu_probe PRIVATE qwen36_35b_a3b_test_hip)
 endif()

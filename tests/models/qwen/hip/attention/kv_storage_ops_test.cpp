@@ -12,9 +12,9 @@
 #include <hip/hip_runtime.h>
 
 #include "src/core/hip/hip_utils.hpp"
-#include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/families/qwen/hip_common/attention_policy.hpp"
+#include "src/families/qwen/kernels/ops.hpp"
 #include "src/models/qwen/hip/executor.hpp"
-#include "src/models/qwen/hip/ops.hpp"
 #include "tests/models/qwen/hip/support/device.hpp"
 #include "tests/models/qwen/hip/support/device_buffer.hpp"
 #include "tests/models/qwen/support/synthetic_weights.hpp"
@@ -66,12 +66,14 @@ gufo::core::ModelConfig ProductionQwen27BConfig() {
 }
 
 // Verification must preserve every scalar attention bit across the online,
-// split-K and shared-KV routes, including a single-row scratch fallback.
-void TestCausalDecodeRows() {
+// split-K, shared-KV and wave64 routes, including a single-row scratch
+// fallback. Even KV head counts reach the wave64 kernel from 512 tokens;
+// four KV heads is the production 27B shape (24 query heads of 256).
+void TestCausalDecodeRows(unsigned kv_heads) {
   using gufo::test::DeviceBuffer;
-  constexpr unsigned heads = 6, kv_heads = 1, dim = 256, rows = 8;
-  constexpr unsigned context = 65544, layer = 1, width = heads * dim;
-  constexpr std::size_t cache_size = 2U * context * kv_heads * dim;
+  constexpr unsigned dim = 256, rows = 8, context = 65544, layer = 1;
+  const unsigned heads = 6 * kv_heads, width = heads * dim;
+  const std::size_t cache_size = std::size_t{2} * context * kv_heads * dim;
   std::vector<float> query(rows * width), gate(query.size()), cache(cache_size);
   std::vector<__half> cache_half(cache_size);
   for (std::size_t i = 0; i < query.size(); ++i) {
@@ -194,8 +196,12 @@ void TestCanonicalMemoryAccountingAndSnapshot() {
   HIP_CHECK(hipMemcpy(fp32_arena.d_kv_cache, source.data(),
                       source.size() * sizeof(float), hipMemcpyHostToDevice));
   auto saved = fp32_arena.SaveSnapshot(7);
-  std::vector<std::uint8_t> serialized(saved->CompactPayloadBytes());
+  std::vector<std::uint8_t> serialized(saved->CompactPayloadBytes(), 0xA5);
   saved->SerializeCompact(serialized);
+  std::vector<std::uint8_t> overwritten(serialized.size(), 0x5A);
+  saved->SerializeCompact(overwritten);
+  Expect(overwritten == serialized,
+         "FP32 snapshot must overwrite every destination byte");
   for (const bool disk : {false, true}) {
     HIP_CHECK(
         hipMemset(fp32_arena.d_kv_cache, 0, source.size() * sizeof(float)));
@@ -279,9 +285,13 @@ void TestCompactPersistentSnapshotRoundTrip() {
              snapshot->PayloadBytes() + header_bytes,
          "GPU and disk snapshots must retain the same compact state");
 
-  std::vector<std::uint8_t> payload(snapshot->CompactPayloadBytes());
+  std::vector<std::uint8_t> payload(snapshot->CompactPayloadBytes(), 0xA5);
   Expect(snapshot->SerializeCompact(payload) == payload.size(),
          "compact snapshot serializer byte count");
+  std::vector<std::uint8_t> overwritten(payload.size(), 0x5A);
+  Expect(snapshot->SerializeCompact(overwritten) == overwritten.size() &&
+             overwritten == payload,
+         "compact snapshot must overwrite every destination byte");
 
   QwenGpuArena restored(config, context, policy);
   HIP_CHECK(hipMemset(restored.d_attention_kv_f16, 0xA5,
@@ -351,6 +361,48 @@ void TestCompactPersistentSnapshotRoundTrip() {
     rejected = true;
   }
   Expect(rejected, "incompatible compact snapshot must be rejected");
+}
+
+void TestCompactImageLayout() {
+  // A compact layout-only payload isolates validation from device allocation.
+  constexpr std::uint32_t images = 257, header = 80;
+  std::vector<std::uint8_t> payload(header + images * 12);
+  std::memcpy(payload.data(), "GQKVSNP1", 8);
+  const auto put = [&](std::size_t offset, std::uint32_t value) {
+    for (unsigned byte = 0; byte < 4; ++byte)
+      payload[offset + byte] = value >> (byte * 8);
+  };
+  put(8, 2);
+  put(12, header);
+  put(24, images);
+  put(28, images);
+  put(64, payload.size());
+  put(72, images);
+  for (std::uint32_t i = 0; i < images; ++i) {
+    put(header + i * 12, i);
+    put(header + i * 12 + 4, 1);
+    put(header + i * 12 + 8, 1);
+  }
+  const auto layout = gufo::hip::QwenGpuSnapshot::ReadRopeLayout(payload);
+  Expect(layout.images.size() == images &&
+             layout.images.back().offset == images - 1,
+         "compact snapshots retain every image beyond 256");
+  const auto rejected = [&] {
+    try {
+      gufo::hip::QwenGpuSnapshot::ReadRopeLayout(payload);
+      return false;
+    } catch (const std::invalid_argument&) {
+      return true;
+    }
+  };
+  put(28, images - 1);
+  Expect(rejected(), "image count cannot exceed populated tokens");
+  put(28, images);
+  put(8, 1);
+  Expect(rejected(), "version one cannot contain image grids");
+  put(8, 2);
+  payload.pop_back();
+  Expect(rejected(), "truncated image grids must be rejected");
 }
 
 void FillDecodeInputs(std::vector<float>* query, std::vector<float>* key,
@@ -614,10 +666,13 @@ int main() {
   if (device_status != 0) {
     return device_status;
   }
-  TestCausalDecodeRows();
+  for (const unsigned kv_heads : {1U, 2U, 4U}) {
+    TestCausalDecodeRows(kv_heads);
+  }
   TestProductionMemoryScaling();
   TestCanonicalMemoryAccountingAndSnapshot();
   TestCompactPersistentSnapshotRoundTrip();
+  TestCompactImageLayout();
   TestOnlineAndGraphDecodeFp16Equivalence();
   TestSplitKDecodeFp16Equivalence();
   std::cout << "Qwen FP16 KV storage tests passed.\n";

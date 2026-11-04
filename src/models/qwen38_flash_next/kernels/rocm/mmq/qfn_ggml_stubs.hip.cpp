@@ -1,4 +1,5 @@
 #include "qfn_mmq_prelude.h"
+#include <gufo/ext/experimental/managed_alloc.hpp>
 namespace qfn_mmq {
 // SPDX-License-Identifier: MIT
 // Implementations of the ggml-API stubs declared in qfn_ggml_stubs.h plus
@@ -16,6 +17,7 @@ namespace qfn_mmq {
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -106,58 +108,90 @@ int64_t ggml_time_us() {
 namespace {
 
 /* qwen38: every allocation the tier makes is scoped to one entry point and
- * released in reverse order, and every kernel runs on the executor's single
- * stream, so a stack over one device arena is enough. It replaces
+ * released in reverse order, and each arena serves one stream (qfn_pool_for_stream),
+ * so stream order makes a stack over device memory enough. It replaces
  * hipMallocAsync/hipFreeAsync, whose reuse of a just-freed block raced with
- * in-flight kernels on this ROCm and made prefill logits nondeterministic. */
+ * in-flight kernels on this ROCm and made prefill logits nondeterministic.
+ *
+ * The stack spans a list of blocks. An allocation that doesn't fit the current
+ * block goes to the next one that fits (added if needed, at least twice the
+ * last), so an arena can start small: the MTP and DFlash2 streams only quantize
+ * a few rows. Blocks live as long as the pool: captured graphs bake in their
+ * addresses and replay them after the arena has grown. */
 struct qfn_stack_pool : public ggml_hip_pool {
+    static constexpr size_t kFirstBlockBytes = (size_t) 16 << 20;
+
+    struct block {
+        char *base;
+        size_t capacity;
+        size_t top;
+    };
+
+    struct live_alloc {
+        char *ptr;
+        size_t bytes;
+        size_t block;
+    };
+
     int device;
-    char *base = nullptr;
-    size_t capacity = 0;
-    size_t top = 0;
-    std::vector<std::pair<char *, size_t>> live;
+    std::vector<block> blocks;
+    size_t current = 0;
+    std::vector<live_alloc> live;
 
     explicit qfn_stack_pool(int device) : device(device) {}
 
     ~qfn_stack_pool() override {
-        if (base) (void)hipFree(base);
+        for (const block &b : blocks) (void)hipFree(b.base);
     }
 
-    void reserve(size_t bytes) {
-        if (bytes <= capacity) return;
-        /* Growing invalidates outstanding pointers, so it only happens while
-         * nothing is live; the arena starts generous to keep that true. */
-        if (top != 0) {
-            fprintf(stderr, "qfn_stack_pool: arena exhausted with live allocations\n");
-            abort();
-        }
+    void add_block(size_t bytes) {
+        /* Drain the device first, as the single arena did. On ROCm 10.1 an
+         * allocation made while kernels are in flight leaves later kernel
+         * launches slower for seconds (+14 ms per short MTP request). Blocks
+         * are only added by eager passes, never during capture. */
         (void)hipDeviceSynchronize();
-        if (base) (void)hipFree(base);
-        size_t next = capacity ? capacity : (size_t) 256 << 20;
-        while (next < bytes) next *= 2;
-        HIP_CHECK(hipMalloc((void **) &base, next));
-        capacity = next;
+        char *base = nullptr;
+        HIP_CHECK(gufo::hip::AllocateDevice(&base, bytes));
+        blocks.push_back({base, bytes, 0});
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
         ggml_hip_set_device(device);
         const size_t aligned = (size + 255) & ~(size_t) 255;
-        if (top + aligned > capacity) reserve(top + aligned);
-        char *ptr = base + top;
-        top += aligned;
-        live.emplace_back(ptr, aligned);
+        if (blocks.empty()) {
+            size_t first = kFirstBlockBytes;
+            while (first < aligned) first *= 2;
+            add_block(first);
+        }
+        if (blocks[current].top + aligned > blocks[current].capacity) {
+            // Blocks after `current` are empty: the stack only reaches them through it.
+            size_t next = current + 1;
+            while (next < blocks.size() && blocks[next].capacity < aligned) ++next;
+            if (next == blocks.size()) {
+                size_t bytes = blocks.back().capacity * 2;
+                while (bytes < aligned) bytes *= 2;
+                add_block(bytes);
+            }
+            current = next;
+        }
+        block &b = blocks[current];
+        char *ptr = b.base + b.top;
+        b.top += aligned;
+        live.push_back({ptr, aligned, current});
         if (actual_size) *actual_size = aligned;
         return ptr;
     }
 
     void free(void * ptr, size_t /*size*/) override {
         if (!ptr) return;
-        if (live.empty() || live.back().first != ptr) {
+        if (live.empty() || live.back().ptr != ptr) {
             fprintf(stderr, "qfn_stack_pool: non-LIFO free\n");
             abort();
         }
-        top -= live.back().second;
+        const live_alloc a = live.back();
         live.pop_back();
+        blocks[a.block].top -= a.bytes;
+        while (current > 0 && blocks[current].top == 0) --current;
     }
 };
 
@@ -165,6 +199,43 @@ struct qfn_stack_pool : public ggml_hip_pool {
 
 std::unique_ptr<ggml_hip_pool> ggml_backend_hip_context::new_pool_for_device(int device, int /*stream_no*/) {
     return std::unique_ptr<ggml_hip_pool>(new qfn_stack_pool(device));
+}
+
+// One scratch arena per (device, stream). The stack pool above relies on stream order to
+// reuse memory safely, so it must never be shared by two streams: the MTP drafter runs on its
+// own stream and reached these kernels too, and reused the target's scratch while the target's
+// kernels were still reading it.
+namespace {
+std::mutex g_stream_pools_mutex;
+std::map<std::pair<int, hipStream_t>, std::unique_ptr<ggml_hip_pool>> g_stream_pools;
+} // anonymous namespace
+
+ggml_hip_pool & qfn_pool_for_stream(int device, hipStream_t stream) {
+    const std::lock_guard<std::mutex> lock(g_stream_pools_mutex);
+    auto & pool = g_stream_pools[{device, stream}];
+    if (!pool) pool = ggml_backend_hip_context::new_pool_for_device(device, 0);
+    return *pool;
+}
+
+// The caller must have stopped every host submission and allocation on `stream` first: the
+// lock protects the map, not the pool references handed out by qfn_pool_for_stream.
+extern "C" void qfn_mmq_release_stream(hipStream_t stream) {
+    const std::lock_guard<std::mutex> lock(g_stream_pools_mutex);
+    for (auto it = g_stream_pools.begin(); it != g_stream_pools.end();) {
+        if (it->first.second != stream) {
+            ++it;
+            continue;
+        }
+        // The arena may still back queued work on this stream. If the wait fails, the work
+        // may still be running, so keep (leak) the arena rather than free memory in use.
+        const hipError_t status = hipStreamSynchronize(stream);
+        if (status != hipSuccess) {
+            fprintf(stderr, "qfn_mmq_release_stream: stream %p not synchronized (%s); keeping its scratch arena\n",
+                    (void *) stream, hipGetErrorString(status));
+            (void) it->second.release();
+        }
+        it = g_stream_pools.erase(it);
+    }
 }
 
 ggml_backend_hip_context::~ggml_backend_hip_context() {

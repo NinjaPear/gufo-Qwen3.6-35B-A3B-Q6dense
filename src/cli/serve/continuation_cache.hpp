@@ -9,59 +9,17 @@
 #include <string_view>
 #include <vector>
 
+#include "src/ext/continuation.hpp"
+
 namespace gufo::server {
 
-using ContinuationToken = std::uint32_t;
-
-/// Supplemental input identity for prefixes ending at or before token_count.
-/// Ordered boundaries allow a checkpoint before a new image to retain its
-/// original identity. The complete request identity applies after the last one.
-struct ContinuationInputPrefix {
-  std::size_t token_count{0};
-  std::vector<std::uint8_t> identity;
-};
-
-[[nodiscard]] inline std::span<const std::uint8_t> PrefixInputIdentity(
-    std::span<const std::uint8_t> complete,
-    std::span<const ContinuationInputPrefix> prefixes, std::size_t count) {
-  for (const auto& prefix : prefixes) {
-    if (count <= prefix.token_count)
-      return prefix.identity;
-  }
-  return complete;
-}
-
-/// Model-private continuation state retained by the common serving cache.
-///
-/// Implementations own all attention, recurrent, position, and graph-bound
-/// state. The cache deliberately cannot inspect or copy those bytes.
-class ContinuationState {
-public:
-  ContinuationState() = default;
-  virtual ~ContinuationState() = default;
-
-  ContinuationState(const ContinuationState&) = delete;
-  ContinuationState& operator=(const ContinuationState&) = delete;
-  ContinuationState(ContinuationState&&) = delete;
-  ContinuationState& operator=(ContinuationState&&) = delete;
-
-  /// Discards any partially or fully computed continuation.
-  virtual void Invalidate() noexcept = 0;
-};
-
-/// Immutable model-private continuation payload.
-class ContinuationSnapshot {
-public:
-  ContinuationSnapshot() = default;
-  virtual ~ContinuationSnapshot() = default;
-
-  ContinuationSnapshot(const ContinuationSnapshot&) = delete;
-  ContinuationSnapshot& operator=(const ContinuationSnapshot&) = delete;
-  ContinuationSnapshot(ContinuationSnapshot&&) = delete;
-  ContinuationSnapshot& operator=(ContinuationSnapshot&&) = delete;
-
-  [[nodiscard]] virtual std::size_t PayloadBytes() const noexcept = 0;
-};
+// The continuation bases and token id are runtime contracts (RFC step 6).
+// These aliases keep the serving spelling; cache policy below stays here.
+using ext::ContinuationInputPrefix;
+using ext::ContinuationSnapshot;
+using ext::ContinuationState;
+using ext::ContinuationToken;
+using ext::PrefixInputIdentity;
 
 enum class SnapshotEventAction : std::uint8_t {
   kRemoved,
@@ -77,10 +35,13 @@ enum class SnapshotEventReason : std::uint8_t {
 };
 
 /// Continuation boundaries take precedence over optional history/retry copies.
+/// A branch point is a continuation boundary learned where two prompts
+/// diverged; it stays a branch point after the older prompt's checkpoints go.
 enum class SnapshotPurpose : std::uint8_t {
   kContinuation,
   kHistory,
   kRetry,
+  kBranchPoint,
 };
 
 /// Sanitized snapshot-retention event.
@@ -242,6 +203,22 @@ public:
       bool reuse_prompt = true, std::size_t stable_prefix_tokens = 0,
       std::span<const ContinuationInputPrefix> input_prefixes = {});
 
+  /// Longest retained prefix of prompt with a matching input identity,
+  /// ignoring stable-prefix fallback rules. Leases nothing.
+  [[nodiscard]] std::size_t CachedPrefixTokens(
+      std::span<const ContinuationToken> prompt,
+      std::span<const std::uint8_t> input_identity = {},
+      std::span<const ContinuationInputPrefix> input_prefixes = {}) const;
+
+  /// Longest prefix prompt shares with any retained checkpoint or live
+  /// frontier of the same input identity, whether or not that record ends
+  /// there. This is where prompts diverge, so a checkpoint captured there
+  /// serves later prompts that share it. Leases nothing.
+  [[nodiscard]] std::size_t CommonPrefixTokens(
+      std::span<const ContinuationToken> prompt,
+      std::span<const std::uint8_t> input_identity = {},
+      std::span<const ContinuationInputPrefix> input_prefixes = {}) const;
+
   [[nodiscard]] std::size_t capacity() const noexcept;
   /// Immutable checkpoint records, independent of execution capacity().
   [[nodiscard]] std::size_t entry_capacity() const noexcept;
@@ -253,9 +230,11 @@ private:
   struct Entry;
 
   [[nodiscard]] ContinuationState& StateAt(std::size_t index);
+  /// Reclaiming a retained copy of the same prefix keeps its learned branch
+  /// point: purpose becomes kBranchPoint for the publication.
   [[nodiscard]] bool ReserveSnapshot(
       std::size_t source_index, std::size_t snapshot_bytes,
-      std::size_t token_count, bool preserve_source, SnapshotPurpose purpose,
+      std::size_t token_count, bool preserve_source, SnapshotPurpose& purpose,
       std::span<const ContinuationToken> replacement_prefix,
       std::span<const std::uint8_t> input_identity);
   void SkipSnapshot(std::size_t reservation_bytes, SnapshotEventReason reason,

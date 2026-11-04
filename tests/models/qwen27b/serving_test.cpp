@@ -1,6 +1,8 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -18,10 +20,13 @@
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/hip_utils.hpp"
-#include "src/models/qwen/chat_template.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
+#include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/runner.hpp"
 #include "tests/models/qwen27b/sampling_cases.hpp"
+#include "tests/support/temporary_directory.hpp"
 
 namespace {
 
@@ -31,6 +36,64 @@ void Expect(bool condition, const std::string& message) {
   if (!condition) {
     throw std::runtime_error(message);
   }
+}
+
+bool LoadBackend(
+    gufo::server::InferenceBackend& backend,
+    std::shared_ptr<const gufo::hip::QwenGpuModel> model, std::string* error,
+    std::uint32_t max_context = 0, std::size_t session_count = 1,
+    gufo::server::TextPrefillPolicy prefill_policy = {},
+    gufo::server::TextSchedulerPolicy scheduler_policy = {},
+    gufo::server::TextSpeculativeConfig speculative_config = {},
+    gufo::server::TextDiskCacheConfig disk_cache_config = {},
+    gufo::server::TextRunnerRamCacheOptions ram_cache_config = {}) {
+  if (model == nullptr) {
+    if (error)
+      *error = "Qwen GPU model must not be null";
+    return false;
+  }
+  if (max_context == 0)
+    max_context = model->GetConfig().context_length;
+  if (max_context < 2 || max_context > model->GetConfig().context_length) {
+    if (error)
+      *error = "HTTP context exceeds the loaded Qwen model context";
+    return false;
+  }
+  if (speculative_config.backend ==
+      gufo::server::TextSpeculativeBackend::kMtp) {
+    if (error)
+      *error = "Flash-Next MTP HTTP decoding requires --mtp-model";
+    return false;
+  }
+  if (speculative_config.backend ==
+          gufo::server::TextSpeculativeBackend::kDFlash &&
+      speculative_config.min_draft_tokens != 1) {
+    if (error)
+      *error = "DFlash min-draft-tokens error";
+    return false;
+  }
+  std::shared_ptr<const gufo::hip::QwenDFlashGpuModel> dflash_model;
+  gufo::speculative::SpeculativeOptions spec_opts;
+  if (speculative_config.backend ==
+      gufo::server::TextSpeculativeBackend::kDFlash) {
+    std::string err;
+    dflash_model = gufo::hip::QwenDFlashGpuModel::Open(
+        speculative_config.draft_model_path, &err);
+    if (!dflash_model) {
+      if (error)
+        *error = "Failed to open DFlash model: " + err;
+      return false;
+    }
+    spec_opts.max_draft_tokens = speculative_config.max_draft_tokens;
+    spec_opts.min_draft_tokens = speculative_config.min_draft_tokens;
+  }
+  auto runner = gufo::models::qwen::CreateQwenTextRunner(
+      model, max_context, dflash_model, spec_opts,
+      speculative_config.dflash_policy,
+      disk_cache_config.model_artifact_fingerprint,
+      disk_cache_config.draft_model_artifact_fingerprint);
+  return backend.load(std::move(runner), error, session_count, prefill_policy,
+                      scheduler_policy, disk_cache_config, ram_cache_config);
 }
 
 std::vector<TokenId> GenerateDirect(gufo::hip::QwenGpuExecutor& executor,
@@ -46,6 +109,112 @@ void ExpectStableGpuMemory(std::size_t before, std::size_t after) {
   constexpr std::size_t tolerance = 16ULL * 1024ULL * 1024ULL;
   Expect(after + tolerance >= before,
          "request cleanup leaked more than 16 MiB of GPU memory");
+}
+
+void CheckLogprobs(const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
+                   const char* draft_path) {
+  std::string error;
+  auto reference = gufo::hip::QwenGpuExecutor::Create(model, &error, 256);
+  Expect(reference != nullptr, error);
+  const std::string prompt =
+      "Continue this list: red blue green red blue green red blue green";
+  const auto input = model->GetTokenizer().Encode(prompt);
+  for (const bool speculative : {false, true}) {
+    if (speculative && draft_path == nullptr)
+      continue;
+    gufo::server::TextSpeculativeConfig mode;
+    if (speculative) {
+      mode.backend = gufo::server::TextSpeculativeBackend::kDFlash;
+      mode.draft_model_path = draft_path;
+    }
+    gufo::server::InferenceBackend backend;
+    Expect(
+        LoadBackend(backend, model, &error, 256, 2, {.decode_active_tokens = 8},
+                    {.max_pending_requests_per_client = 2}, mode, {},
+                    {.capacity_bytes = std::size_t{1} << 30}),
+        error);
+    for (const float temperature : {0.F, 0.7F}) {
+      gufo::sampling::SamplingConfig config;
+      config.temperature = temperature;
+      config.top_k = 20;
+      config.seed = 73;
+      const auto plain =
+          backend.start_complete(prompt, 32, config, {}, false, true)->Wait();
+      Expect(plain.logprobs.empty(), "disabled requests collected logprobs");
+      config.logprobs = 5;
+      const auto actual =
+          backend.start_complete(prompt, 32, config, {}, false, true)->Wait();
+      Expect(actual.cache_hit && actual.tokens == plain.tokens &&
+                 actual.draft_tokens == plain.draft_tokens &&
+                 actual.draft_accepted_tokens == plain.draft_accepted_tokens,
+             "logprobs changed cached tokens or speculative acceptance");
+      Expect(actual.tokens.size() == 32 && actual.logprobs.size() == 32,
+             "logprobs must cover every generated token");
+      if (speculative)
+        Expect(actual.draft_tokens > 0, "logprob fixture must execute drafts");
+      reference->Reset();
+      (void)reference->ForwardPromptBatch(input);
+      double maximum_error = 0;
+      for (std::size_t index = 0; index < actual.tokens.size(); ++index) {
+        const auto logits = reference->CopyLastLogits();
+        Expect(
+            !logits.empty() &&
+                std::ranges::all_of(
+                    logits, [](float value) { return std::isfinite(value); }),
+            "reference logits must be finite and nonempty");
+        const double maximum = *std::max_element(logits.begin(), logits.end());
+        double sum = 0;
+        for (const float value : logits)
+          sum += std::exp(double(value) - maximum);
+        const auto& entries = actual.logprobs[index].entries;
+        Expect(!entries.empty() && entries.front().id == actual.tokens[index],
+               "logprob records lost sampled-token alignment");
+        for (const auto& entry : entries) {
+          Expect(static_cast<std::size_t>(entry.id) < logits.size() &&
+                     std::isfinite(entry.logprob),
+                 "invalid logprob token or nonfinite probability");
+          const double expected =
+              double(logits[entry.id]) - maximum - std::log(sum);
+          maximum_error =
+              std::max(maximum_error, std::abs(entry.logprob - expected));
+        }
+        (void)reference->ForwardToken(actual.tokens[index],
+                                      input.size() + index);
+      }
+      Expect(
+          maximum_error < 1e-5,
+          "logprobs disagree with independent teacher-forced target logits: " +
+              std::to_string(maximum_error));
+      // Two cached requests share execution but retain private observation
+      // settings. Neither may change the other's selected token sequence.
+      const auto observed =
+          backend.start_complete(prompt, 32, config, {}, false, true);
+      config.logprobs.reset();
+      const auto disabled =
+          backend.start_complete(prompt, 32, config, {}, false, true);
+      const auto replay = observed->Wait();
+      const auto peer = disabled->Wait();
+      Expect(replay.tokens == actual.tokens && peer.tokens == plain.tokens &&
+                 peer.logprobs.empty() && replay.logprobs.size() == 32,
+             "concurrent requests changed tokens or mixed logprob settings");
+      for (std::size_t i = 0; i < actual.logprobs.size(); ++i) {
+        const auto& a = actual.logprobs[i].entries;
+        const auto& b = replay.logprobs[i].entries;
+        Expect(a.size() == b.size(), "cached replay changed candidate count");
+        for (std::size_t j = 0; j < a.size(); ++j)
+          Expect(a[j].id == b[j].id &&
+                     std::abs(a[j].logprob - b[j].logprob) < 1e-5,
+                 "concurrent cached replay changed logprobs");
+      }
+      std::cout << "logprobs dflash2=" << speculative
+                << " temperature=" << temperature
+                << " tokens=32 drafted=" << actual.draft_tokens
+                << " accepted=" << actual.draft_accepted_tokens
+                << " max_error=" << maximum_error
+                << " physical_width=" << replay.physical_execution_width << '\n'
+                << std::flush;
+    }
+  }
 }
 
 void CheckSamplingStrategies(
@@ -135,35 +304,6 @@ void CheckSamplingStrategies(
   Expect(shared_ar && (speculative_backend == nullptr || shared_speculative),
          "concurrent sampling did not exercise shared target execution");
 }
-
-class TemporaryDirectory {
-public:
-  TemporaryDirectory() {
-    std::string pattern =
-        (std::filesystem::temp_directory_path() / "gufo-qwen-disk-cache-XXXXXX")
-            .string();
-    const char* created = ::mkdtemp(pattern.data());
-    if (created == nullptr) {
-      throw std::runtime_error("failed to create Qwen cache directory");
-    }
-    path_ = created;
-  }
-
-  ~TemporaryDirectory() {
-    std::error_code error;
-    std::filesystem::remove_all(path_, error);
-  }
-
-  TemporaryDirectory(const TemporaryDirectory&) = delete;
-  TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
-
-  [[nodiscard]] const std::filesystem::path& path() const noexcept {
-    return path_;
-  }
-
-private:
-  std::filesystem::path path_;
-};
 
 void RunPromptReuseSmoke(
     const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
@@ -287,7 +427,7 @@ void CheckGeneratedFrontierReuse(
       // The prompt checkpoint has a published but unconsumed token. Persist
       // both AR and DFlash2 checkpoints, then restore into fresh sessions.
       for (const bool speculative : {false, true}) {
-        TemporaryDirectory directory;
+        TemporaryDirectory directory("gufo-qwen-disk-cache");
         const gufo::server::TextDiskCacheConfig disk{
             .directory = directory.path(),
             .model_artifact_fingerprint = std::string(64, 'a'),
@@ -350,7 +490,12 @@ void CheckGeneratedFrontierReuse(
                    result.cached_prompt_tokens >= root.prompt_tokens + 7 &&
                    result.tokens == expected.tokens,
                "a concurrent fork re-prefilled generated tokens or changed "
-               "the isolated replay");
+               "the isolated replay: speculative=" +
+                   std::to_string(speculative) +
+                   " cached=" + std::to_string(result.cached_prompt_tokens) +
+                   " required=" + std::to_string(root.prompt_tokens + 7) +
+                   " tokens_equal=" +
+                   std::to_string(result.tokens == expected.tokens));
         if (sampling.temperature > 0.0F)
           Expect(result.draft_tokens == expected.draft_tokens &&
                      result.draft_accepted_tokens ==
@@ -404,6 +549,85 @@ void CheckGeneratedFrontierReuse(
   }
 }
 
+void CheckCompletedPrefillRetention(
+    const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
+    const char* draft_path) {
+  using Backend = gufo::server::InferenceBackend;
+  std::string error;
+  for (const bool speculative : {false, true}) {
+    if (speculative && draft_path == nullptr)
+      continue;
+    const gufo::server::TextSpeculativeConfig draft{
+        .backend = speculative
+                       ? gufo::server::TextSpeculativeBackend::kDFlash
+                       : gufo::server::TextSpeculativeBackend::kDisabled,
+        .draft_model_path = draft_path == nullptr ? "" : draft_path,
+    };
+    Backend backend;
+    Expect(LoadBackend(backend, model, &error, 256, 2,
+                       {.decode_active_tokens = 8}, {}, draft),
+           error);
+    std::string prompt = "Cancelled prefill retention: ";
+    while (backend.count_tokens(prompt) < 160)
+      prompt += "red blue green orange violet. ";
+    prompt += "Name the first color.";
+    const auto tokens = model->GetTokenizer().Encode(prompt);
+    gufo::hip::QwenGpuExecutor oracle(model, 256);
+    const auto expected = GenerateDirect(oracle, tokens, 8);
+
+    // An already decoding peer bounds the first prefill pass. Cancel from
+    // actual completed-pass progress, rather than a timer or callback count.
+    std::promise<void> decoding;
+    auto started = decoding.get_future();
+    const gufo::sampling::SamplingConfig greedy{.temperature = 0.0F};
+    auto peer = backend.start_complete(
+        "Count from one to one hundred, without stopping.", 64, greedy, {},
+        true, true, "prefill-cancel-peer");
+    auto peer_result = std::async(std::launch::async, [&] {
+      bool signalled = false;
+      return peer->Wait([&](std::string_view) {
+        if (!signalled) {
+          decoding.set_value();
+          signalled = true;
+        }
+        return true;
+      });
+    });
+    Expect(
+        started.wait_for(std::chrono::seconds(30)) == std::future_status::ready,
+        "prefill cancellation peer never reached decode");
+    auto pending = backend.start_complete(prompt, 8, greedy, {}, true, false,
+                                          "prefill-cancel-target", {}, true);
+    std::size_t observed = 0;
+    const auto cancelled =
+        pending->Wait({}, [&](const Backend::PromptProgress& progress) {
+          observed = progress.processed;
+          return progress.processed == 0;
+        });
+    Expect(observed > 0 && cancelled.cancelled &&
+               cancelled.completion_tokens == 0 &&
+               cancelled.prefill_tokens >= observed &&
+               cancelled.prefill_tokens < cancelled.prompt_tokens,
+           "fixture must cancel after a completed partial prefill pass");
+    peer->Cancel();
+    (void)peer_result.get();
+    const auto resumed = backend.complete(prompt, 8, 0.0F);
+    Expect(resumed.cache_hit &&
+               resumed.cached_prompt_tokens == cancelled.prefill_tokens &&
+               resumed.prefill_tokens + resumed.cached_prompt_tokens ==
+                   resumed.prompt_tokens,
+           "cancelled prefill lost or recomputed its completed frontier");
+    Expect(resumed.tokens == expected,
+           "cancelled prefill resume differs from independent cold execution");
+    if (speculative)
+      Expect(resumed.draft_tokens > 0,
+             "cancelled DFlash prefill resume bypassed drafting");
+    std::cout << "Completed prefill cancel/resume "
+              << (speculative ? "DFlash2" : "AR")
+              << " retained=" << resumed.cached_prompt_tokens << " exact\n";
+  }
+}
+
 }  // namespace
 
 int main(int argc, const char* const* argv) {
@@ -421,6 +645,8 @@ int main(int argc, const char* const* argv) {
     bool sampling_only = false;
     bool cache_only = false;
     bool continuation_only = false;
+    bool prefill_cancel_only = false;
+    bool logprobs_only = false;
     auto sampling_policy = gufo::speculative::DFlashDraftPolicy::kAdaptive;
     for (int index = 2; index < argc; ++index) {
       const std::string_view argument = argv[index];
@@ -432,6 +658,10 @@ int main(int argc, const char* const* argv) {
         run_full_suite = cache_only = true;
       } else if (argument == "--continuation-only") {
         continuation_only = true;
+      } else if (argument == "--prefill-cancel-only") {
+        prefill_cancel_only = true;
+      } else if (argument == "--logprobs-only") {
+        logprobs_only = true;
       } else if (argument == "--fixed") {
         sampling_policy = gufo::speculative::DFlashDraftPolicy::kFixed;
       } else if (argument.starts_with("--")) {
@@ -454,30 +684,40 @@ int main(int argc, const char* const* argv) {
     Expect(model->GetWeightRegionCount() == reader->GetMappedRegions().size(),
            "every mapped GGUF shard must have one shared GPU region");
 
+    if (logprobs_only) {
+      CheckLogprobs(model, draft_model_path);
+      return 0;
+    }
+
+    if (prefill_cancel_only) {
+      CheckCompletedPrefillRetention(model, draft_model_path);
+      return 0;
+    }
     if (continuation_only ||
         (run_full_suite && draft_model_path != nullptr && !sampling_only)) {
       Expect(draft_model_path != nullptr,
              "continuation qualification requires a DFlash2 model");
       CheckGeneratedFrontierReuse(model, draft_model_path);
+      CheckCompletedPrefillRetention(model, draft_model_path);
       if (continuation_only)
         return 0;
     }
     const std::uint32_t context = run_full_suite ? 256U : 64U;
     const std::size_t state_count = run_full_suite ? 8U : 1U;
     gufo::server::InferenceBackend backend;
-    Expect(!backend.load(
-               model, &error, context, state_count, {}, {},
-               {.backend = gufo::server::TextSpeculativeBackend::kMtp}) &&
-               error.find("Flash-Next") != std::string::npos,
-           "Qwen27B must reject MTP instead of silently running AR");
     Expect(
-        !backend.load(model, &error, context, state_count, {}, {},
-                      {.backend = gufo::server::TextSpeculativeBackend::kDFlash,
-                       .min_draft_tokens = 2}) &&
+        !LoadBackend(backend, model, &error, context, state_count, {}, {},
+                     {.backend = gufo::server::TextSpeculativeBackend::kMtp}) &&
+            error.find("Flash-Next") != std::string::npos,
+        "Qwen27B must reject MTP instead of silently running AR");
+    Expect(
+        !LoadBackend(backend, model, &error, context, state_count, {}, {},
+                     {.backend = gufo::server::TextSpeculativeBackend::kDFlash,
+                      .min_draft_tokens = 2}) &&
             error.find("min-draft-tokens") != std::string::npos,
         "DFlash must reject an unused adaptive draft floor");
-    Expect(backend.load(model, &error, context, state_count, {},
-                        {.max_pending_requests_per_client = 8}),
+    Expect(LoadBackend(backend, model, &error, context, state_count, {},
+                       {.max_pending_requests_per_client = 8}),
            error);
     Expect(backend.model_id() == model->GetConfig().model_name,
            "HTTP model identifier");
@@ -487,8 +727,8 @@ int main(int argc, const char* const* argv) {
         CheckSamplingStrategies(backend);
       } else {
         gufo::server::InferenceBackend speculative_backend;
-        Expect(speculative_backend.load(
-                   model, &error, context, state_count,
+        Expect(LoadBackend(
+                   speculative_backend, model, &error, context, state_count,
                    {.decode_active_tokens = 8},
                    {.max_pending_requests_per_client = 8},
                    {.backend = gufo::server::TextSpeculativeBackend::kDFlash,
@@ -549,19 +789,19 @@ int main(int argc, const char* const* argv) {
 
     if (draft_model_path != nullptr) {
       gufo::server::InferenceBackend speculative_backend;
-      Expect(
-          speculative_backend.load(
-              model, &error, context, state_count, {.decode_active_tokens = 8},
-              {.max_pending_requests_per_client = 8},
-              gufo::server::TextSpeculativeConfig{
-                  .backend = gufo::server::TextSpeculativeBackend::kDFlash,
-                  .draft_model_path = draft_model_path,
-                  .max_draft_tokens = 7,
-                  .min_draft_tokens = 1,
-                  .dflash_policy =
-                      gufo::speculative::DFlashDraftPolicy::kAdaptive,
-              }),
-          error);
+      Expect(LoadBackend(
+                 speculative_backend, model, &error, context, state_count,
+                 {.decode_active_tokens = 8},
+                 {.max_pending_requests_per_client = 8},
+                 gufo::server::TextSpeculativeConfig{
+                     .backend = gufo::server::TextSpeculativeBackend::kDFlash,
+                     .draft_model_path = draft_model_path,
+                     .max_draft_tokens = 7,
+                     .min_draft_tokens = 1,
+                     .dflash_policy =
+                         gufo::speculative::DFlashDraftPolicy::kAdaptive,
+                 }),
+             error);
       const auto direct_spec = GenerateDirect(*direct, raw_prompt_tokens, 8);
       const auto http_spec = speculative_backend.complete(raw_prompt, 8, 0.0F);
       Expect(http_spec.tokens == direct_spec,
@@ -759,6 +999,15 @@ int main(int argc, const char* const* argv) {
     Expect(rendered_chat.has_value() && !rendered_chat->empty(),
            "CLI chat prompt rendering");
     const auto chat_prompt = model->GetTokenizer().Encode(*rendered_chat);
+    // Disk spacing keeps the stable message boundary, not the adjacent
+    // assistant opening. Keep this framing oracle independent of the renderer.
+    const auto stable_chat_prompt = model->GetTokenizer().Encode(
+        "<|im_start|>system\nAnswer with one short sentence.<|im_end|>\n"
+        "<|im_start|>user\nName one primary color.<|im_end|>\n");
+    Expect(stable_chat_prompt.size() < chat_prompt.size() &&
+               std::equal(stable_chat_prompt.begin(), stable_chat_prompt.end(),
+                          chat_prompt.begin()),
+           "stable disk fixture is not the prompt's message prefix");
     const auto direct_chat = GenerateDirect(*direct, chat_prompt, 2);
     const auto http_chat = backend.chat(cache_request(messages), 2, {});
     Expect(http_chat.tokens == direct_chat,
@@ -850,7 +1099,7 @@ int main(int argc, const char* const* argv) {
     const auto direct_fork = GenerateDirect(*direct, fork_prompt, 2);
 
     {
-      TemporaryDirectory cache_directory;
+      TemporaryDirectory cache_directory("gufo-qwen-disk-cache");
       const gufo::server::TextDiskCacheConfig disk_cache{
           .directory = cache_directory.path(),
           .capacity_bytes = 1024ULL * 1024ULL * 1024ULL,
@@ -872,36 +1121,42 @@ int main(int argc, const char* const* argv) {
                "Qwen disk writer did not publish a compact snapshot");
       }
 
-      gufo::server::InferenceBackend restarted;
-      Expect(restarted.load(model, &error, context, 1, {}, {}, {}, disk_cache),
-             error);
-      const auto restored_continuation =
-          restarted.chat(cache_request(continued_messages), 2, {});
-      Expect(restored_continuation.cache_hit &&
-                 restored_continuation.cache_disk_hit,
-             "fresh Qwen backend did not restore its disk prefix");
-      Expect(restored_continuation.cached_prompt_tokens == chat_prompt.size() &&
-                 restored_continuation.cached_prompt_tokens <
-                     restored_continuation.prompt_tokens,
-             "Qwen disk restore did not report its exact reusable prefix");
-      Expect(restored_continuation.cache_restore_bytes > 0,
-             "Qwen disk restore did not report restored bytes");
-      Expect(restored_continuation.tokens == direct_continuation,
-             "Qwen disk continuation differs from cold full prefill");
+      {
+        gufo::server::InferenceBackend restarted;
+        Expect(
+            restarted.load(model, &error, context, 1, {}, {}, {}, disk_cache),
+            error);
+        const auto restored_continuation =
+            restarted.chat(cache_request(continued_messages), 2, {});
+        Expect(restored_continuation.cache_hit &&
+                   restored_continuation.cache_disk_hit,
+               "fresh Qwen backend did not restore its disk prefix");
+        Expect(restored_continuation.cached_prompt_tokens ==
+                       stable_chat_prompt.size() &&
+                   restored_continuation.cached_prompt_tokens <
+                       restored_continuation.prompt_tokens,
+               "Qwen disk restore did not report its exact reusable prefix");
+        Expect(restored_continuation.cache_restore_bytes > 0,
+               "Qwen disk restore did not report restored bytes");
+        Expect(restored_continuation.tokens == direct_continuation,
+               "Qwen disk continuation differs from cold full prefill");
+      }
 
       auto incompatible_cache = disk_cache;
       incompatible_cache.model_artifact_fingerprint = std::string(64, 'b');
-      gufo::server::InferenceBackend incompatible;
-      Expect(incompatible.load(model, &error, context, 1, {}, {}, {},
-                               incompatible_cache),
-             error);
-      const auto incompatible_result =
-          incompatible.chat(cache_request(continued_messages), 2, {});
-      Expect(
-          !incompatible_result.cache_hit && !incompatible_result.cache_disk_hit,
-          "changed Qwen artifact fingerprint must be a cold miss");
-      Expect(incompatible_result.tokens == direct_continuation,
-             "Qwen compatibility miss changed cold execution");
+      {
+        gufo::server::InferenceBackend incompatible;
+        Expect(incompatible.load(model, &error, context, 1, {}, {}, {},
+                                 incompatible_cache),
+               error);
+        const auto incompatible_result =
+            incompatible.chat(cache_request(continued_messages), 2, {});
+        Expect(!incompatible_result.cache_hit &&
+                   !incompatible_result.cache_disk_hit,
+               "changed Qwen artifact fingerprint must be a cold miss");
+        Expect(incompatible_result.tokens == direct_continuation,
+               "Qwen compatibility miss changed cold execution");
+      }
 
       if (draft_model_path != nullptr) {
         const gufo::server::TextSpeculativeConfig dflash_config{
@@ -945,30 +1200,32 @@ int main(int argc, const char* const* argv) {
                  "DFlash disk writer did not publish a compact snapshot");
         }
 
-        gufo::server::InferenceBackend restarted_dflash;
-        Expect(restarted_dflash.load(model, &error, context, 1, {}, {},
-                                     dflash_config, dflash_disk_cache),
-               error);
-        const auto restored_dflash_continuation =
-            restarted_dflash.chat(cache_request(continued_messages), 8, {});
-        Expect(restored_dflash_continuation.cache_hit &&
-                   restored_dflash_continuation.cache_disk_hit,
-               "fresh DFlash backend did not restore its disk prefix");
-        Expect(restored_dflash_continuation.cached_prompt_tokens ==
-                       chat_prompt.size() &&
-                   warm_dflash_continuation.cached_prompt_tokens >=
-                       restored_dflash_continuation.cached_prompt_tokens &&
-                   restored_dflash_continuation.cached_prompt_tokens <
-                       restored_dflash_continuation.prompt_tokens,
-               "DFlash disk restore did not report its exact prefix");
-        Expect(restored_dflash_continuation.tokens ==
-                   warm_dflash_continuation.tokens,
-               "DFlash disk restore changed continuation tokens");
-        Expect(restored_dflash_continuation.draft_tokens ==
-                       warm_dflash_continuation.draft_tokens &&
-                   restored_dflash_continuation.draft_accepted_tokens ==
-                       warm_dflash_continuation.draft_accepted_tokens,
-               "DFlash disk restore changed the speculative trajectory");
+        {
+          gufo::server::InferenceBackend restarted_dflash;
+          Expect(restarted_dflash.load(model, &error, context, 1, {}, {},
+                                       dflash_config, dflash_disk_cache),
+                 error);
+          const auto restored_dflash_continuation =
+              restarted_dflash.chat(cache_request(continued_messages), 8, {});
+          Expect(restored_dflash_continuation.cache_hit &&
+                     restored_dflash_continuation.cache_disk_hit,
+                 "fresh DFlash backend did not restore its disk prefix");
+          Expect(restored_dflash_continuation.cached_prompt_tokens ==
+                         stable_chat_prompt.size() &&
+                     warm_dflash_continuation.cached_prompt_tokens >=
+                         restored_dflash_continuation.cached_prompt_tokens &&
+                     restored_dflash_continuation.cached_prompt_tokens <
+                         restored_dflash_continuation.prompt_tokens,
+                 "DFlash disk restore did not report its exact prefix");
+          Expect(restored_dflash_continuation.tokens ==
+                     warm_dflash_continuation.tokens,
+                 "DFlash disk restore changed continuation tokens");
+          Expect(restored_dflash_continuation.draft_tokens ==
+                         warm_dflash_continuation.draft_tokens &&
+                     restored_dflash_continuation.draft_accepted_tokens ==
+                         warm_dflash_continuation.draft_accepted_tokens,
+                 "DFlash disk restore changed the speculative trajectory");
+        }
 
         auto incompatible_dflash_cache = dflash_disk_cache;
         incompatible_dflash_cache.draft_model_artifact_fingerprint =
@@ -990,7 +1247,7 @@ int main(int argc, const char* const* argv) {
 
     // Prime exactly one live frontier. Earlier repeated requests can leave
     // two equivalent live sessions, legitimately avoiding both restore copies.
-    Expect(backend.load(model, &error, context, 2), error);
+    Expect(LoadBackend(backend, model, &error, context, 2), error);
     Expect(backend.chat(cache_request(messages), 2, {}).tokens == direct_chat,
            "fork fixture must start at the qualified root");
     auto continuation_request = cache_request(continued_messages);
@@ -1030,10 +1287,12 @@ int main(int argc, const char* const* argv) {
     Expect(http_fork.tokens == direct_fork,
            "forked Qwen continuation differs from cold full prefill");
 
-    // Both prompts must generate enough tokens to exercise an actual decode
-    // batch. The old "complete this phrase" fixtures ended after one token.
+    // The first request must still decode after its peer's bounded prefill
+    // completes. Eight outputs can finish before that peer reaches decode.
     // Small chunks also cover bounded prefill before the concurrent decode.
-    Expect(backend.load(model, &error, context, 2, {.decode_active_tokens = 8}),
+    constexpr std::uint32_t concurrent_output_tokens = 32;
+    Expect(LoadBackend(backend, model, &error, context, 2,
+                       {.decode_active_tokens = 8}),
            error);
     gufo::server::ChatRequest concurrent_a({
         {gufo::tokenization::ChatRole::kUser,
@@ -1056,14 +1315,19 @@ int main(int argc, const char* const* argv) {
     Expect(rendered_a.has_value() && rendered_b.has_value(),
            "concurrent chat prompt rendering");
     const auto direct_a =
-        GenerateDirect(*direct, model->GetTokenizer().Encode(*rendered_a), 8);
+        GenerateDirect(*direct, model->GetTokenizer().Encode(*rendered_a),
+                       concurrent_output_tokens);
     const auto direct_b =
-        GenerateDirect(*direct, model->GetTokenizer().Encode(*rendered_b), 8);
-    Expect(direct_a.size() == 8 && direct_b.size() == 8,
-           "concurrency fixtures must retain eight generated tokens");
+        GenerateDirect(*direct, model->GetTokenizer().Encode(*rendered_b),
+                       concurrent_output_tokens);
+    Expect(direct_a.size() == concurrent_output_tokens &&
+               direct_b.size() == concurrent_output_tokens,
+           "concurrency fixtures must retain the complete output budget");
 
-    auto pending_a = backend.start_chat(concurrent_a, 8, 0.0F);
-    auto pending_b = backend.start_chat(concurrent_b, 8, 0.0F);
+    auto pending_a =
+        backend.start_chat(concurrent_a, concurrent_output_tokens, 0.0F);
+    auto pending_b =
+        backend.start_chat(concurrent_b, concurrent_output_tokens, 0.0F);
     const auto concurrent_result_a = pending_a->Wait();
     const auto concurrent_result_b = pending_b->Wait();
     Expect(concurrent_result_a.tokens == direct_a,
@@ -1096,6 +1360,12 @@ int main(int argc, const char* const* argv) {
                concurrent_result_b.execution_plan == "batched-w2",
            "concurrent Qwen requests did not report the W=2 plan");
 
+    // Retaining this new prompt legitimately allocates a full checkpoint.
+    // Establish that retention before measuring cancellation/error cleanup.
+    const auto cleanup_root = backend.complete(raw_prompt, 2, 0.0F);
+    Expect(cleanup_root.tokens == direct_raw,
+           "cleanup fixture must establish the exact reusable prompt");
+    HIP_CHECK(hipDeviceSynchronize());
     std::size_t free_before = 0;
     std::size_t total_memory = 0;
     HIP_CHECK(hipMemGetInfo(&free_before, &total_memory));

@@ -134,8 +134,20 @@ private:
   std::vector<std::string_view> prefetched_groups_;
   Matrix packed_source_, packed_input_;
   std::size_t weight_bytes_{0};
+  // Pinned buffers for weight uploads; see Runtime::UploadMapped.
+  std::array<void*, 2> staging_{};
+  std::array<hipEvent_t, 2> staging_done_{};
+  /// Device buffers for one weight: `m` in BF16, plus `raw` for F32 sources.
+  struct StagedWeight {
+    Matrix m, raw;
+  };
   Matrix Raw(std::size_t bytes);
   Matrix PackedInput(const Matrix& x);
+  void UploadMapped(void* device, const void* host, std::size_t bytes);
+  StagedWeight Stage(const qwen_image_21::Weight& w);
+  bool UploadGroup(std::string_view prefix);
+  Matrix Store(std::string_view name, const qwen_image_21::Weight& w,
+               StagedWeight target);
   void Matmul(const Matrix& x, const Matrix& w, Matrix& output,
               const Matrix* bias = nullptr, bool convolution = false);
 };

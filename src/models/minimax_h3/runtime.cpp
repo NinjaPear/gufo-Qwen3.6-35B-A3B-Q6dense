@@ -1,10 +1,5 @@
 #include "src/models/minimax_h3/runtime.hpp"
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -36,12 +31,6 @@ void SetError(std::string* error, std::string message) {
   if (error != nullptr) {
     *error = std::move(message);
   }
-}
-
-std::string ErrnoMessage(std::string_view operation,
-                         const std::filesystem::path& path) {
-  return std::string(operation) + " " + path.string() + ": " +
-         std::strerror(errno);
 }
 
 const json::Value& RequireField(const json::Value& object,
@@ -108,18 +97,18 @@ Phase TensorPhase(std::string_view component, std::string_view name) {
   return Phase::kDitCore;
 }
 
-bool ReadExact(int descriptor, void* output, std::size_t bytes,
-               std::uint64_t offset) {
+bool ReadExact(platform::PlatformFile descriptor, void* output,
+               std::size_t bytes, std::uint64_t offset) {
   auto* destination = static_cast<std::byte*>(output);
   std::size_t completed = 0;
   while (completed < bytes) {
-    const ssize_t result =
-        pread(descriptor, destination + completed, bytes - completed,
-              static_cast<off_t>(offset + completed));
-    if (result <= 0) {
+    const std::size_t result =
+        platform::ReadFileAt(descriptor, destination + completed,
+                             bytes - completed, offset + completed);
+    if (result == 0) {
       return false;
     }
-    completed += static_cast<std::size_t>(result);
+    completed += result;
   }
   return true;
 }
@@ -149,39 +138,42 @@ struct ParsedHeader {
 
 ParsedHeader ParseSafetensorsHeader(const std::filesystem::path& path,
                                     InspectionTelemetry* telemetry) {
-  const int descriptor = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (descriptor < 0) {
-    throw json::Error(ErrnoMessage("cannot open", path));
+  std::string open_error;
+  const platform::PlatformFile descriptor =
+      platform::OpenReadFile(path, &open_error);
+  if (!platform::FileValid(descriptor)) {
+    throw json::Error(open_error.empty() ? "cannot open " + path.string()
+                                         : open_error);
   }
-  struct stat status{};
-  if (fstat(descriptor, &status) != 0 || status.st_size < 8) {
-    close(descriptor);
+  const auto file_size = platform::FileSizeBytes(descriptor);
+  if (!file_size.has_value() || *file_size < 8) {
+    platform::CloseFile(descriptor);
     throw json::Error("invalid safetensors file " + path.string());
   }
   std::array<std::byte, 8> encoded_length{};
   if (!ReadExact(descriptor, encoded_length.data(), encoded_length.size(), 0)) {
-    close(descriptor);
+    platform::CloseFile(descriptor);
     throw json::Error("cannot read safetensors length " + path.string());
   }
   const std::uint64_t header_bytes = DecodeLittleEndian64(encoded_length);
   if (header_bytes == 0 || header_bytes > kMaximumHeaderBytes ||
-      header_bytes > static_cast<std::uint64_t>(status.st_size) - 8U) {
-    close(descriptor);
+      header_bytes > *file_size - 8U) {
+    platform::CloseFile(descriptor);
     throw json::Error("invalid safetensors header length " + path.string());
   }
   std::string header(static_cast<std::size_t>(header_bytes), '\0');
   if (!ReadExact(descriptor, header.data(), header.size(), 8)) {
-    close(descriptor);
+    platform::CloseFile(descriptor);
     throw json::Error("cannot read safetensors header " + path.string());
   }
-  close(descriptor);
+  platform::CloseFile(descriptor);
   telemetry->safetensors_header_bytes_read += 8U + header_bytes;
 
   const json::Value root = json::Parse(header);
   const auto& object = root.AsObject();
   ParsedHeader parsed;
   parsed.payload_offset = 8U + header_bytes;
-  parsed.file_bytes = static_cast<std::uint64_t>(status.st_size);
+  parsed.file_bytes = *file_size;
   std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
   for (const auto& [name, value] : object) {
     if (name == "__metadata__") {
@@ -281,11 +273,8 @@ struct FileInterval {
 
 std::vector<FileInterval> BuildIntervals(
     std::span<const TensorDescriptor* const> tensors) {
-  const long page_size_long = sysconf(_SC_PAGESIZE);
-  if (page_size_long <= 0) {
-    throw std::runtime_error("cannot determine host page size");
-  }
-  const std::uint64_t page_size = static_cast<std::uint64_t>(page_size_long);
+  const std::uint64_t page_size =
+      static_cast<std::uint64_t>(platform::SystemPageSize());
   std::vector<FileInterval> intervals;
   intervals.reserve(tensors.size());
   for (const TensorDescriptor* tensor : tensors) {
@@ -655,9 +644,8 @@ void PhaseSession::Release() noexcept {
     if (iterator->registered) {
       backend_->Unregister(iterator->host);
     }
-    if (iterator->host != nullptr && iterator->bytes != 0) {
-      munmap(iterator->host, iterator->bytes);
-    }
+    iterator->mapping_file.Close();
+    iterator->host = nullptr;
   }
   mappings_.clear();
   if (stream_ != nullptr) {
@@ -721,37 +709,34 @@ std::optional<PhaseSession> PhaseSession::Load(
         return std::nullopt;
       }
       const auto path = inventory.model_root() / interval.shard;
-      const int descriptor = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-      if (descriptor < 0) {
-        SetError(error, ErrnoMessage("cannot open", path));
-        return std::nullopt;
-      }
       const std::uint64_t length64 = interval.end - interval.begin;
       if (length64 > std::numeric_limits<std::size_t>::max()) {
-        close(descriptor);
         SetError(error, "MiniMax H3 mapping is too large");
         return std::nullopt;
       }
       const std::size_t length = static_cast<std::size_t>(length64);
-      void* mapping = mmap(nullptr, length, PROT_READ, MAP_PRIVATE, descriptor,
-                           static_cast<off_t>(interval.begin));
-      close(descriptor);
-      if (mapping == MAP_FAILED) {
-        SetError(error, ErrnoMessage("cannot mmap", path));
+      Mapping mapping;
+      mapping.shard = interval.shard;
+      std::string map_error;
+      if (!mapping.mapping_file.OpenRange(path, interval.begin, length,
+                                          platform::MapHint::kSequential,
+                                          &map_error)) {
+        SetError(error, "cannot map " + path.string() + ": " + map_error);
         return std::nullopt;
       }
-      (void)madvise(mapping, length, MADV_SEQUENTIAL);
-      session.mappings_.push_back(
-          {interval.shard, mapping, nullptr, length, interval.begin, false});
+      mapping.host = mapping.mapping_file.data;
+      mapping.bytes = length;
+      mapping.file_offset = interval.begin;
+      session.mappings_.push_back(std::move(mapping));
       session.telemetry_.file_backed_bytes += length;
       if (options.prefault) {
         if (InjectFailure(failures, "prefault", error)) {
           return std::nullopt;
         }
-        const long page_size_long = sysconf(_SC_PAGESIZE);
-        const std::size_t page_size = static_cast<std::size_t>(page_size_long);
+        const std::size_t page_size = platform::SystemPageSize();
         volatile std::uint8_t accumulator = 0;
-        const auto* bytes = static_cast<const std::uint8_t*>(mapping);
+        const auto* bytes =
+            static_cast<const std::uint8_t*>(session.mappings_.back().host);
         for (std::size_t offset = 0; offset < length; offset += page_size) {
           accumulator = static_cast<std::uint8_t>(accumulator ^ bytes[offset]);
         }
@@ -865,7 +850,7 @@ std::optional<PhaseSession> PhaseSession::Load(
         return std::nullopt;
       }
       for (auto& mapping : session.mappings_) {
-        munmap(mapping.host, mapping.bytes);
+        mapping.mapping_file.Close();
         mapping.host = nullptr;
       }
       session.mappings_.clear();

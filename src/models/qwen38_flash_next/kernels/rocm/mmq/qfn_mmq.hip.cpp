@@ -10,6 +10,7 @@ namespace qfn_mmq {
 #include "mmid.hpp"
 static int g_routed_max_expert_rows = 0;
 static int g_routed_tile_cols = 0;
+static int prepare_decode_kernels();
 extern "C" int qfn_mmq_init(int device) {
     if (device < 0) {
         fprintf(stderr, "qfn_mmq_init: invalid device %d\n", device);
@@ -28,7 +29,7 @@ extern "C" int qfn_mmq_init(int device) {
         return -1;
     }
 
-    return 0;
+    return prepare_decode_kernels();
 }
 
 extern "C" void qfn_mmq_set_routed_max_expert_rows(int rows) {
@@ -130,7 +131,7 @@ int qfn_mmq_dense_impl(
             y_values_per_block +
         get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
 
-    ggml_hip_pool_alloc<char> src1_q8_1_pool(ctx->pool(), nbytes_src1_q8_1);
+    ggml_hip_pool_alloc<char> src1_q8_1_pool(qfn_pool_for_stream(ctx->device, stream), nbytes_src1_q8_1);
     char *src1_q8_1 = src1_q8_1_pool.get();
 
         quantize_mmq_q8_1_hip(
@@ -244,9 +245,9 @@ int qfn_mmq_moe_impl(
     const int64_t s01          = (int64_t)K / blck;
     const int64_t s02          = (int64_t)M * s01;
 
-    ggml_hip_pool_alloc<int32_t> ids_src1(ctx->pool(), ne_get_rows);
-    ggml_hip_pool_alloc<int32_t> ids_dst(ctx->pool(), ne_get_rows);
-    ggml_hip_pool_alloc<int32_t> expert_bounds(ctx->pool(), n_experts + 1);
+    ggml_hip_pool_alloc<int32_t> ids_src1(qfn_pool_for_stream(ctx->device, stream), ne_get_rows);
+    ggml_hip_pool_alloc<int32_t> ids_dst(qfn_pool_for_stream(ctx->device, stream), ne_get_rows);
+    ggml_hip_pool_alloc<int32_t> expert_bounds(qfn_pool_for_stream(ctx->device, stream), n_experts + 1);
 
     hipMemsetAsync(ids_src1.get(), 0, ne_get_rows * sizeof(int32_t), stream);
     hipMemsetAsync(ids_dst.get(),  0, ne_get_rows * sizeof(int32_t), stream);
@@ -269,7 +270,7 @@ int qfn_mmq_moe_impl(
     const size_t nbytes_src1_q8_1 =
         ne_get_rows * ne10_padded * y_block_size / y_values_per_block +
         get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
-    ggml_hip_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
+    ggml_hip_pool_alloc<char> src1_q8_1(qfn_pool_for_stream(ctx->device, stream), nbytes_src1_q8_1);
 
     const int64_t s11_src = (int64_t)K;
     const int64_t s12_src = (int64_t)K * ne11;
@@ -353,7 +354,8 @@ static int moe_vector_projection(int weight_type, const void* W,
                                  float* out_f32, int M, int K, int n_tokens,
                                  int n_experts, int n_expert_used,
                                  hipStream_t stream, const void* W_b,
-                                 float* out_b, bool gated) {
+                                 float* out_b, bool gated,
+                                 const void* X_q8 = nullptr) {
   constexpr const char* tag = "qfn_mmq_moe_vec";
   const auto type = static_cast<ggml_type>(weight_type);
   if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
@@ -362,7 +364,7 @@ static int moe_vector_projection(int weight_type, const void* W,
     return -1;
   }
 
-  if (!W || !X_f32 || !ids || !out_f32 ||
+  if (!W || !(X_f32 || X_q8) || !ids || !out_f32 ||
       (gated ? !W_b : bool(W_b) != bool(out_b))) {
     fprintf(stderr, "%s: null pointer\n", tag);
     return -1;
@@ -404,39 +406,68 @@ static int moe_vector_projection(int weight_type, const void* W,
   const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
   const size_t nbytes_q8_1 =
       (size_t)n_tokens * ne10_padded * sizeof(block_q8_1) / QK8_1;
+  // The down projection's slot rows are quantized in expert order, so the
+  // slots that share an expert read its weights in the same block.
+  const bool by_expert =
+      !gated && !W_b && !X_q8 &&
+      (type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0) && K == 640 &&
+      n_expert_used == 1 && n_tokens > 1;
   const size_t group_bytes =
-      gated && n_tokens > 1
+      by_expert ? 2 * size_t(n_tokens) * sizeof(int32_t)
+      : gated && n_tokens > 1
           ? (n_tokens > MMVQ_MAX_BATCH_SIZE
                  ? sizeof(int32_t) +
                        size_t(n_tokens) * n_expert_used * sizeof(MoeBatchGroup)
-                 : size_t(n_tokens) * n_expert_used * (n_tokens + 1) *
+                 : size_t(mmvq_moe_group_ints(n_tokens, n_expert_used)) *
                        sizeof(int32_t))
           : 0;
+  // A caller-quantized input (the same rows quantize_row_q8_1 writes) only
+  // needs the pool for the gated route's expert groups.
+  const size_t input_bytes = X_q8 ? 0 : nbytes_q8_1;
   ggml_hip_pool_alloc<char> src1_q8_1_pool;
-  src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1 + group_bytes);
-  char* src1_q8_1_ptr = src1_q8_1_pool.get();
-
-  quantize_row_q8_1_hip(X_f32, nullptr, (void*)src1_q8_1_ptr, type, K,
-                        (int64_t)K, (int64_t)K, (int64_t)K * n_tokens,
-                        ne10_padded, 1, n_tokens, 1, stream);
-
-  hipError_t err = hipGetLastError();
-  if (err != hipSuccess) {
-    fprintf(stderr, "%s: quantize_row_q8_1_hip failed: %s\n", tag,
-            hipGetErrorString(err));
-    return -2;
+  char* src1_q8_1_ptr = nullptr;
+  if (input_bytes + group_bytes > 0) {
+    src1_q8_1_pool.alloc(qfn_pool_for_stream(ctx->device, stream), input_bytes + group_bytes);
+    src1_q8_1_ptr = src1_q8_1_pool.get();
   }
+  hipError_t err = hipSuccess;
+  int32_t* const sorted_ids =
+      by_expert ? reinterpret_cast<int32_t*>(src1_q8_1_ptr + input_bytes)
+                : nullptr;
+  int32_t* const slot_of_rank = by_expert ? sorted_ids + n_tokens : nullptr;
+  if (by_expert) {
+    quantize_row_q8_1_by_expert_hip(X_f32, ids, (void*)src1_q8_1_ptr,
+                                    sorted_ids, slot_of_rank, K, K,
+                                    ne10_padded, n_tokens, stream);
+    err = hipGetLastError();
+    if (err != hipSuccess) {
+      fprintf(stderr, "%s: quantize_row_q8_1_by_expert_hip failed: %s\n", tag,
+              hipGetErrorString(err));
+      return -2;
+    }
+  } else if (!X_q8) {
+    quantize_row_q8_1_hip(X_f32, nullptr, (void*)src1_q8_1_ptr, type, K,
+                          (int64_t)K, (int64_t)K, (int64_t)K * n_tokens,
+                          ne10_padded, 1, n_tokens, 1, stream);
+
+    err = hipGetLastError();
+    if (err != hipSuccess) {
+      fprintf(stderr, "%s: quantize_row_q8_1_hip failed: %s\n", tag,
+              hipGetErrorString(err));
+      return -2;
+    }
+  }
+  const auto* input = reinterpret_cast<const block_q8_1*>(
+      X_q8 ? X_q8 : static_cast<const void*>(src1_q8_1_ptr));
+  int32_t* groups = reinterpret_cast<int32_t*>(src1_q8_1_ptr + input_bytes);
 
   const int input_stride = ne10_padded / QK8_1;
   if (gated) {
     if (n_tokens > MMVQ_MAX_BATCH_SIZE &&
-        hipMemsetAsync(src1_q8_1_ptr + nbytes_q8_1, 0, sizeof(int32_t),
-                       stream) != hipSuccess)
+        hipMemsetAsync(groups, 0, sizeof(int32_t), stream) != hipSuccess)
       return -2;
-    mul_mat_vec_moe_gated(
-        W, W_b, type, reinterpret_cast<const block_q8_1*>(src1_q8_1_ptr), ids,
-        reinterpret_cast<int32_t*>(src1_q8_1_ptr + nbytes_q8_1), out_f32, K, M,
-        n_tokens, n_expert_used, input_stride, stream);
+    mul_mat_vec_moe_gated(W, W_b, type, input, ids, groups, out_f32, K, M,
+                          n_tokens, n_expert_used, input_stride, stream);
     err = hipGetLastError();
     if (err != hipSuccess) {
       fprintf(stderr, "%s: gated vector launch failed: %s\n", tag,
@@ -450,9 +481,10 @@ static int moe_vector_projection(int weight_type, const void* W,
   for (int projection = 0; projection < (W_b ? 2 : 1); ++projection) {
     const void* weights = projection == 0 ? W : W_b;
     float* output = projection == 0 ? out_f32 : out_b;
-    mul_mat_vec_moe_dispatch(
-        weights, type, reinterpret_cast<const block_q8_1*>(src1_q8_1_ptr), ids,
-        output, K, M, n_tokens, n_expert_used, input_stride, stream);
+    mul_mat_vec_moe_dispatch(weights, type, input,
+                             by_expert ? sorted_ids : ids, output, K, M,
+                             n_tokens, n_expert_used, input_stride, stream,
+                             slot_of_rank);
 
     err = hipGetLastError();
     if (err != hipSuccess) {
@@ -484,6 +516,17 @@ extern "C" int qfn_mmq_moe_gated_vec(int weight_type, const void* gate,
   return moe_vector_projection(weight_type, gate, x, ids, out, m, k, tokens,
                                experts, experts_used, stream, up, nullptr,
                                true);
+}
+
+extern "C" int qfn_mmq_moe_gated_vec_preq(int weight_type, const void* gate,
+                                          const void* up, const void* x_q8,
+                                          const int32_t* ids, float* out,
+                                          int m, int k, int tokens, int experts,
+                                          int experts_used,
+                                          hipStream_t stream) {
+  return moe_vector_projection(weight_type, gate, nullptr, ids, out, m, k,
+                               tokens, experts, experts_used, stream, up,
+                               nullptr, true, x_q8);
 }
 
 extern "C" int qfn_mmq_q8_0_moe_raw(const void* W, const float* X,
@@ -616,6 +659,26 @@ __launch_bounds__(32) __global__ static void qfn_q8_hc_down_kernel(
 }
 
 template<int tokens = 1>
+static int prepare_hc_down() {
+    hipFuncAttributes attributes{};
+    if (hipFuncGetAttributes(
+            &attributes,
+            reinterpret_cast<const void*>(qfn_q8_hc_down_kernel<tokens, false>)) != hipSuccess)
+        return -2;
+    if constexpr (tokens < MMVQ_MAX_BATCH_SIZE)
+        return prepare_hc_down<tokens + 1>();
+    return 0;
+}
+
+static int prepare_decode_kernels() {
+    // Resolving the first scalar HC function can leave a ~30 ms GPU idle
+    // gap after prefill. Load the AR/MTP functions before serving, without
+    // trial launches, temporary activations, or changes to session state.
+    const auto status = prepare_hc_down();
+    return status == 0 ? prepare_q8_decode() : status;
+}
+
+template<int tokens = 1>
 static void launch_q8_hc_down(const void* weights, const void* input,
                               float* output, int rows, hipStream_t stream) {
     if (rows == tokens) {
@@ -632,8 +695,11 @@ extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
                                            int M, int N, int K,
                                            hipStream_t stream) {
   const bool wide_matrix = K == 2560 && M >= 8192 && N <= 48;
+  const bool grouped_matrix =
+      N > 48 && N % 32 == 0 &&
+      ((K == 2560 && M >= 1024) || (K == 320 && M == 10240));
   if (!W || !X_q8 || !out_f32 || M <= 0 || N <= 0 || K <= 0 || K % 32 != 0 ||
-      (N > 32 && !wide_matrix &&
+      (N > 32 && !wide_matrix && !grouped_matrix &&
        (M != 320 || K != 10240 || N % 8 != 0)) ||
       (N > MMVQ_MAX_BATCH_SIZE && W_gate)) {
     fprintf(stderr,

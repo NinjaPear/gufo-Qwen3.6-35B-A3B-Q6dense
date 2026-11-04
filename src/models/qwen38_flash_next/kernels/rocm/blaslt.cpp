@@ -14,6 +14,19 @@ void AssignError(std::string* error, const char* message) {
   }
 }
 
+bool OwnF16(hipDataType type, int k) {
+  // Every F16 projection of the hidden row (router, GDN alpha/beta at any
+  // expert count): library plans are chosen per token count, so a row's
+  // logits would depend on its pass width.
+  return type == HIP_R_16F && k == 2560;
+}
+
+bool OwnBf16(hipDataType type, int m, int k) {
+  // The indexer query and key projections, and a TP2 rank's halves.
+  return type == HIP_R_16BF && k == 2560 &&
+         (m == 512 || m == 256 || m == 128 || m == 64);
+}
+
 }  // namespace
 
 struct BlasLt::Plan {
@@ -127,25 +140,60 @@ bool BlasLt::Gemm(const void* weights, const void* input, float* out,
   // Library edge tiles change the accumulation order when the same token
   // moves within a batch. Router and recurrent-gate errors then amplify across
   // layers. Keep one K reduction for every row and prefill chunk size.
-  if (type == HIP_R_16F && k == 2560 && (m == 96 || m == 513)) {
+  if (OwnF16(type, k)) {
     return UnquantizedF16Gemm(weights, static_cast<const __half*>(input), out,
                               n, m, k, stream_);
   }
+  // The library's MT32x32x64 BF16 kernel starts each 32-token tile's K loop
+  // at a block rotated by the tile's index in the batch, so a token's indexer
+  // score depended on its position modulo 128 tokens within the prefill
+  // chunk, and a top-k near-tie could select another key with the chunking.
+  if (OwnBf16(type, m, k)) {
+    return DenseBf16Gemm(weights, input, out, n, m, k, stream_);
+  }
+  Plan* p = FindPlan(type, m, n, k, error);
+  return p != nullptr && Run(*p, weights, input, out, error);
+}
+
+bool BlasLt::Prepare(hipDataType type, int m, int n, int k,
+                     std::string* error) {
+  if (m <= 0 || n <= 0 || k <= 0) {
+    AssignError(error, "hipBLASLt dimensions must be positive");
+    return false;
+  }
+  return OwnF16(type, k) || OwnBf16(type, m, k) ||
+         FindPlan(type, m, n, k, error) != nullptr;
+}
+
+BlasLt::Plan* BlasLt::FindPlan(hipDataType type, int m, int n, int k,
+                               std::string* error) {
   // Exact dimensions prevent the first ragged request from determining
   // which kernel later requests in the same size bucket receive.
   const std::array<int, 4> key{static_cast<int>(type), m, n, k};
   auto& p = plans_[key];
-  if (!p) {
+  if (!p)
     p = MakePlan(type, m, n, k, error);
-    if (!p) {
-      return false;
-    }
-  }
+  return p.get();
+}
+
+bool BlasLt::UsesOwnKernel(hipDataType type, int m, int k) {
+  return OwnF16(type, k) || OwnBf16(type, m, k);
+}
+
+bool BlasLt::LibraryGemm(const void* weights, const void* input, float* out,
+                         hipDataType type, int m, int n, int k,
+                         std::string* error) {
+  Plan* p = FindPlan(type, m, n, k, error);
+  return p != nullptr && Run(*p, weights, input, out, error);
+}
+
+bool BlasLt::Run(Plan& p, const void* weights, const void* input, float* out,
+                 std::string* error) {
   const float one = 1.0F;
   const float zero = 0.0F;
-  if (hipblasLtMatmul(handle_, p->operation, &one, weights, p->weights, input,
-                      p->input, &zero, out, p->output, out, p->output,
-                      &p->algorithm, nullptr, 0,
+  if (hipblasLtMatmul(handle_, p.operation, &one, weights, p.weights, input,
+                      p.input, &zero, out, p.output, out, p.output,
+                      &p.algorithm, nullptr, 0,
                       stream_) != HIPBLAS_STATUS_SUCCESS) {
     AssignError(error, "hipBLASLt GEMM failed");
     return false;

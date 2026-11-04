@@ -1,18 +1,28 @@
-#include <fcntl.h>
 #include <hip/hip_runtime.h>
-#include <unistd.h>
 
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#endif
+
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "src/core/hip/weight_upload.hpp"
+#include "src/core/platform/mapped_file.hpp"
+#include "tests/support/temporary_directory.hpp"
 
 using gufo::hip::WeightUpload;
 
@@ -25,17 +35,6 @@ void Require(bool ok, const std::string& message) {
   }
 }
 
-struct Files {
-  std::filesystem::path directory;
-  Files() {
-    char path[] = "/tmp/gufo-weight-upload-XXXXXX";
-    const char* result = ::mkdtemp(path);
-    Require(result != nullptr, "mkdtemp");
-    directory = result;
-  }
-  ~Files() { std::filesystem::remove_all(directory); }
-};
-
 struct Device {
   void* data{nullptr};
   explicit Device(std::size_t size) {
@@ -44,12 +43,45 @@ struct Device {
   ~Device() { (void)hipFree(data); }
 };
 
+#if defined(__linux__)
+// While set, reads from O_DIRECT descriptors fail with ENOMEM, the way Windows
+// fails an unbuffered read it cannot lock in memory.
+std::atomic<bool> fail_direct_reads{false};
+std::atomic<int> failed_direct_reads{0};
+
+using Pread = ssize_t (*)(int, void*, size_t, off_t);
+
+ssize_t FaultingPread(Pread next, int fd, void* buffer, size_t size,
+                      off_t offset) {
+  if (fail_direct_reads && (::fcntl(fd, F_GETFL) & O_DIRECT) != 0) {
+    ++failed_direct_reads;
+    errno = ENOMEM;
+    return -1;
+  }
+  return next(fd, buffer, size, offset);
+}
+#endif
+
 }  // namespace
 
+#if defined(__linux__)
+// The test links gufo_core statically, so these replace libc's pread for the
+// uploader's reads.
+extern "C" ssize_t pread(int fd, void* buffer, size_t size, off_t offset) {
+  static const auto next = reinterpret_cast<Pread>(::dlsym(RTLD_NEXT, "pread"));
+  return FaultingPread(next, fd, buffer, size, offset);
+}
+extern "C" ssize_t pread64(int fd, void* buffer, size_t size, off_t offset) {
+  static const auto next =
+      reinterpret_cast<Pread>(::dlsym(RTLD_NEXT, "pread64"));
+  return FaultingPread(next, fd, buffer, size, offset);
+}
+#endif
+
 int main() {
-  Files files;
-  std::array<std::filesystem::path, 2> paths{files.directory / "first",
-                                             files.directory / "second"};
+  TemporaryDirectory files("gufo-weight-upload");
+  std::array<std::filesystem::path, 2> paths{files.path() / "first",
+                                             files.path() / "second"};
   std::array<std::vector<std::uint8_t>, 2> source;
   source[0].resize((35U << 20) + 4079);
   source[1].resize((2U << 20) + 39);
@@ -66,9 +98,10 @@ int main() {
 
   std::array<gufo::core::GgufMappedRegion, 2> regions;
   for (std::size_t i = 0; i < paths.size(); ++i) {
-    regions[i] = {nullptr, source[i].size(),
-                  ::open(paths[i].c_str(), O_RDONLY | O_CLOEXEC)};
-    Require(regions[i].file_descriptor >= 0, "open original shard");
+    regions[i] = {source[i].data(), source[i].size(),
+                  gufo::platform::OpenReadFile(paths[i])};
+    Require(gufo::platform::FileValid(regions[i].file_descriptor),
+            "open original shard");
     std::filesystem::rename(paths[i], paths[i].string() + ".old");
     std::ofstream replacement(paths[i], std::ios::binary);
     replacement << "replacement must never supply model bytes";
@@ -99,15 +132,24 @@ int main() {
   Device device(expected.size());
   Require(hipMemset(device.data, 0xa5, expected.size()) == hipSuccess,
           "initialize guards");
+  // The uploads run on non-blocking streams, which do not wait for the null
+  // stream; a late guard fill would overwrite them.
+  Require(hipDeviceSynchronize() == hipSuccess, "wait for guards");
   std::string error;
   auto upload = WeightUpload::Create(regions, &error);
   Require(upload != nullptr, error);
+  // These addresses identify file offsets; their contents must never supply
+  // upload bytes or enter HIP's pageable host-registration cache.
+  for (auto& buffer : source)
+    std::fill(buffer.begin(), buffer.end(), 0);
   for (const auto& s : slices) {
-    Require(
-        upload->Copy(s.shard, s.offset, s.size,
-                     static_cast<char*>(device.data) + s.destination, &error),
-        error);
+    Require(upload->CopyMapped(source[s.shard].data() + s.offset, s.size,
+                               static_cast<char*>(device.data) + s.destination,
+                               &error),
+            error);
   }
+  Require(!upload->CopyMapped(&error, 1, device.data, &error),
+          "reject a pointer outside the source mappings");
   Require(upload->Copy(1, source[1].size(), 0, nullptr, &error),
           "empty range at EOF");
   Require(upload->Finish(&error), error);
@@ -138,6 +180,39 @@ int main() {
   std::puts(
       "PASS: byte-exact upload, EOF, guards, bounds and failed-read drain");
   upload.reset();
+
+#if defined(__linux__)
+  // A failed unbuffered read retries through the buffered descriptor instead
+  // of failing the load. Shard 1 was truncated above, so reopen shard 0 only.
+  const auto& first = slices.front();
+  Require(first.shard == 0, "the first slice reads shard 0");
+  Require(hipMemset(device.data, 0, expected.size()) == hipSuccess &&
+              hipDeviceSynchronize() == hipSuccess,
+          "clear the destination");
+  fail_direct_reads = true;
+  upload = WeightUpload::Create(std::span(regions).first(1), &error);
+  Require(upload != nullptr, error);
+  Require(
+      upload->Copy(first.shard, first.offset, first.size,
+                   static_cast<char*>(device.data) + first.destination, &error),
+      error);
+  Require(upload->Finish(&error), error);
+  fail_direct_reads = false;
+  upload.reset();
+  std::vector<std::uint8_t> fallback(first.size);
+  Require(hipMemcpy(fallback.data(),
+                    static_cast<char*>(device.data) + first.destination,
+                    fallback.size(), hipMemcpyDeviceToHost) == hipSuccess,
+          "download fallback bytes");
+  Require(std::equal(fallback.begin(), fallback.end(),
+                     expected.begin() + first.destination),
+          "buffered fallback supplies the shard bytes");
+  if (failed_direct_reads == 0) {
+    std::puts("SKIP: this filesystem refused unbuffered opens");
+  } else {
+    std::puts("PASS: failed unbuffered reads fall back to buffered reads");
+  }
+#endif
   for (const auto& region : regions)
-    ::close(region.file_descriptor);
+    gufo::platform::CloseFile(region.file_descriptor);
 }

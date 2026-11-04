@@ -1,9 +1,7 @@
 #include "src/cli/serve/serve.hpp"
 
-#include <arpa/inet.h>
-#include <unistd.h>
-
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -22,26 +20,32 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#include "gufo/ext/registry.hpp"
 #include "src/cli/arg_parser.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/cli/serve/asr_service.hpp"
+#include "src/cli/serve/decision_service.hpp"
+#include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
+#include "src/core/platform/shutdown_signal.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime_api.h>
 #endif
+#include "src/cli/serve/audio_buffer.hpp"
+#include "src/cli/serve/trace.hpp"
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_jobs.hpp"
 #include "src/cli/video/video.hpp"
-#include "src/models/qwen3_tts/audio.hpp"
 
 namespace gufo::cli {
 namespace {
@@ -71,6 +75,10 @@ public:
         << std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now() - start_)
                .count()
+        << " monotonic_us="
+        << std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+               .count()
         << ' ' << details << ' ' << server::Logger::MemoryStatus();
 #if defined(ENGINE_ENABLE_HIP)
     std::size_t free = 0, total = 0;
@@ -90,50 +98,8 @@ private:
   bool completed_{false};
 };
 
-// Reports a fatal signal on the way out. A driver or runtime failure during a
-// load can abort the process outright, which runs no destructor and no
-// terminate handler, leaving a log that stops at event=load_started. Only
-// async-signal-safe calls are allowed here, so the line is assembled by hand
-// and written straight to the descriptor.
-extern "C" void ReportFatalSignal(int number) {
-  static constexpr char kPrefix[] =
-      "[ERROR] [server] event=fatal_signal signal=";
-  char digits[8];
-  std::size_t length = 0;
-  int value = number;
-  if (value <= 0) {
-    digits[length++] = '0';
-  } else {
-    char reversed[8];
-    std::size_t count = 0;
-    while (value > 0 && count < sizeof(reversed)) {
-      reversed[count++] = static_cast<char>('0' + (value % 10));
-      value /= 10;
-    }
-    while (count > 0) {
-      digits[length++] = reversed[--count];
-    }
-  }
-  (void)::write(STDERR_FILENO, kPrefix, sizeof(kPrefix) - 1);
-  (void)::write(STDERR_FILENO, digits, length);
-  (void)::write(STDERR_FILENO, "\n", 1);
-  // Restore the default action and re-raise, so the exit status and any core
-  // dump still describe the original fault.
-  struct sigaction restore{};
-  restore.sa_handler = SIG_DFL;
-  (void)::sigemptyset(&restore.sa_mask);
-  (void)::sigaction(number, &restore, nullptr);
-  (void)::raise(number);
-}
-
 void InstallFatalSignalReporter() {
-  struct sigaction action{};
-  action.sa_handler = ReportFatalSignal;
-  (void)::sigemptyset(&action.sa_mask);
-  action.sa_flags = SA_RESETHAND;
-  for (const int number : {SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE}) {
-    (void)::sigaction(number, &action, nullptr);
-  }
+  platform::InstallFatalSignalReporter();
 }
 
 // Installs a terminate handler that names the reason before the process dies.
@@ -163,6 +129,35 @@ void ReportTerminationReason() {
     }
     std::abort();
   });
+}
+
+// Exit status after the GPU context is lost (EX_TEMPFAIL). Only a new process
+// recovers, so a supervisor must restart it.
+constexpr int kDeviceLostExitStatus = 75;
+// Deep snapshot captures and post-failure device probes legitimately hold
+// progress for tens of seconds.
+constexpr std::uint64_t kMinStallTimeoutMs = 60000;
+
+// A lost GPU context cannot recover in-process. Leave through the SIGTERM
+// shutdown path so a supervisor restarts the server, and bound that teardown:
+// joining requests or freeing device memory may block on the dead device.
+void ShutdownAfterDeviceLoss() {
+  constexpr auto kShutdownTimeout = std::chrono::seconds(10);
+  // Arm the watchdog before logging or shutdown: neither a blocked log sink
+  // nor a dead-device join may prevent the forced exit.
+  try {
+    std::thread([kShutdownTimeout] {
+      std::this_thread::sleep_for(kShutdownTimeout);
+      ::_exit(kDeviceLostExitStatus);
+    }).detach();
+  } catch (...) {
+    ::_exit(kDeviceLostExitStatus);
+  }
+  server::Logger::Error(
+      "server", "event=device_lost_shutdown exit_status=" +
+                    std::to_string(kDeviceLostExitStatus) +
+                    " timeout_s=" + std::to_string(kShutdownTimeout.count()));
+  (void)std::raise(SIGTERM);
 }
 
 std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
@@ -206,11 +201,33 @@ struct ServerLogOptions {
 constexpr std::string_view kLogLevelHelp =
     "Log verbosity: error, warn, info or debug (default: info)";
 constexpr std::string_view kVerboseHelp = "Shorthand for --log-level=debug";
+constexpr std::string_view kTraceHelp =
+    "Append text request bodies, rendered prompts, generated text and replies "
+    "to PATH as JSON Lines; the file holds client content";
+
+void AddCacheRamOption(gufo::cli::ArgParser& parser,
+                       server::TextRunnerRamCacheOptions* target) {
+  parser.AddCustomOption(
+      "", "--cache-ram-bytes", "N|off",
+      "Retained RAM-cache byte budget (default: 0 = auto: half of free "
+      "RAM, at most 32 GiB; explicit values may use free RAM minus 4 GiB). "
+      "off keeps no RAM checkpoints and commits no cache memory; "
+      "sessions still reuse their own live state, and --cache-disk still "
+      "works (Qwen and Flash-Next then use up to 512 MiB of backing for "
+      "disk captures)",
+      "Cache",
+      [target](std::string_view, std::string_view value, std::string* error) {
+        const auto parsed = server::ParseRamCacheOption(value, error);
+        if (parsed)
+          *target = *parsed;
+        return parsed.has_value();
+      });
+}
 
 void AddServerOptions(gufo::cli::ArgParser& parser, std::string* host,
                       int* port, std::size_t* session_count,
                       std::size_t* max_connections,
-                      std::size_t* max_request_body_bytes, std::string* api_key,
+                      std::size_t* max_request_body_bytes,
                       ServerLogOptions* log) {
   parser.AddOption("-i", "--host", "IP", "Bind address", "Server", host);
   parser.AddOption("-p", "--port", "N", "Port to listen on", "Server", port);
@@ -224,7 +241,6 @@ void AddServerOptions(gufo::cli::ArgParser& parser, std::string* host,
   parser.AddOption("", "--max-request-bytes", "N",
                    "Maximum HTTP request body bytes", "Server",
                    max_request_body_bytes);
-  parser.AddOption("", "--api-key", "KEY", "API key", "Server", api_key);
   parser.AddCustomOption(
       "", "--log-level", "LEVEL", kLogLevelHelp, "Logging",
       [log](std::string_view flag, std::string_view value, std::string* error) {
@@ -248,7 +264,6 @@ struct ServerOptionHelpTargets {
   std::size_t max_connections = 16;
   std::size_t max_request_body_bytes =
       static_cast<std::size_t>(8) * 1024 * 1024;
-  std::string api_key;
   ServerLogOptions log;
 };
 
@@ -258,7 +273,7 @@ void AddServerOptionsForHelp(gufo::cli::ArgParser& parser,
   AddServerOptions(parser, &targets->host, &targets->port,
                    include_sessions ? &targets->session_count : nullptr,
                    &targets->max_connections, &targets->max_request_body_bytes,
-                   &targets->api_key, &targets->log);
+                   &targets->log);
 }
 
 // Split a `NAME=VALUE` CLI spec. Returns false when either side is empty.
@@ -325,9 +340,8 @@ bool BuildVoicePresets(
 
     server::TtsVoicePreset preset;
     std::string decode_error;
-    if (!models::qwen3_tts::DecodeWav(
-            std::as_bytes(std::span<const char>(wav_bytes)),
-            &preset.reference_audio, &decode_error)) {
+    if (!server::DecodeWav(std::as_bytes(std::span<const char>(wav_bytes)),
+                           &preset.reference_audio, &decode_error)) {
       *error = wav_path.string() + ": " + decode_error;
       return false;
     }
@@ -410,26 +424,64 @@ std::optional<ReasoningOptions> ResolveReasoningDefaults(
   return options;
 }
 
+// `--served-model-name` is repeatable for every modality: the first ID is
+// primary and the rest are accepted aliases, so llama-swap `aliases:` entries
+// can reach the process unchanged (#957).
+void AddServedModelNamesOption(ArgParser& parser,
+                               std::vector<std::string>* names) {
+  parser.AddCustomOption(
+      "", "--served-model-name", "NAME",
+      "Public API model ID (repeatable; the first is primary)", "Model",
+      [names](std::string_view, std::string_view value, std::string* err) {
+        if (std::ranges::find(*names, value) != names->end()) {
+          *err = "duplicate --served-model-name";
+          return false;
+        }
+        if (!value.empty())
+          names->emplace_back(value);
+        return true;
+      });
+}
+
+// The primary served ID, or empty when the caller supplies none and the
+// service default applies.
+std::string PrimaryModelName(const std::vector<std::string>& names) {
+  return names.empty() ? std::string() : names.front();
+}
+
+// The accepted aliases after the primary ID.
+std::vector<std::string> ModelAliases(const std::vector<std::string>& names) {
+  if (names.size() <= 1)
+    return {};
+  return {names.begin() + 1, names.end()};
+}
+
 struct SpeechOptions {
   std::filesystem::path model;
+  std::filesystem::path mmproj;
   std::size_t context;
-  std::string served_model_name;
+  std::vector<std::string> served_model_names;
   std::vector<std::pair<std::string, std::string>> voice_specs;
   std::map<std::string, std::string> voice_text_specs;
   std::map<std::string, std::string> voice_lang_specs;
 };
 
 void AddSpeechOptions(ArgParser& parser, bool tts, SpeechOptions* options) {
-  parser.AddOption("-m", "--model", "DIR",
-                   tts ? "Qwen3-TTS 12Hz 1.7B model directory"
-                       : "Qwen3-ASR 1.7B model directory",
+  parser.AddOption("-m", "--model", "PATH",
+                   tts ? "Speech synthesis model (Qwen3-TTS 12Hz 1.7B "
+                         "directory, or an extension model's artifact)"
+                       : "Speech recognition model (Qwen3-ASR 1.7B "
+                         "directory, or an extension model's artifact)",
                    "Model", &options->model);
+  parser.AddOption("", "--mmproj", "GGUF",
+                   "Audio projector sidecar of models that take one (default: "
+                   "the model's own lookup)",
+                   "Model", &options->mmproj);
   parser.AddOption("-c", "--context", "N",
                    tts ? "Context capacity (default: 4096)"
                        : "Context capacity per audio chunk (default: 1024)",
                    "Model", &options->context);
-  parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
-                   "Model", &options->served_model_name);
+  AddServedModelNamesOption(parser, &options->served_model_names);
   if (!tts)
     return;
   parser.AddCustomOption(
@@ -485,19 +537,69 @@ void AddSpeechOptions(ArgParser& parser, bool tts, SpeechOptions* options) {
       });
 }
 
+void AddEmbeddingOptions(ArgParser& parser, std::filesystem::path* model,
+                         std::vector<std::string>* served_model_names,
+                         std::string* default_prompt_name) {
+  parser.AddOption("-m", "--model", "DIR", "EmbeddingGemma 2 model directory",
+                   "Model", model);
+  AddServedModelNamesOption(parser, served_model_names);
+  parser.AddOption("", "--default-prompt-name", "NAME",
+                   "Checkpoint prompt for text inputs without prompt_name "
+                   "(default: none)",
+                   "Model", default_prompt_name);
+}
+
+void AddDecisionOptions(ArgParser& parser, std::filesystem::path* model,
+                        std::filesystem::path* mmproj,
+                        std::vector<std::string>* names, std::size_t* context) {
+  parser.AddOption("-m", "--model", "PATH", "Decision model artifact", "Model",
+                   model);
+  parser.AddOption("", "--mmproj", "GGUF",
+                   "Image/audio projector sidecar of models that take one",
+                   "Model", mmproj);
+  AddServedModelNamesOption(parser, names);
+  parser.AddOption("-c", "--context", "N",
+                   "Longest complete decision prompt (default: 8192)", "Model",
+                   context);
+}
+
 }  // namespace
 
 void PrintServeHelp(std::string_view program_name,
                     std::string_view subcommand) {
+  if (subcommand == "decision") {
+    std::filesystem::path model, mmproj;
+    std::vector<std::string> names;
+    std::size_t context = 8192;
+    ArgParser parser(std::string(program_name) + " serve decision",
+                     "Serve decision models (/v1/systemone).");
+    AddDecisionOptions(parser, &model, &mmproj, &names, &context);
+    ServerOptionHelpTargets server_help;
+    AddServerOptionsForHelp(parser, &server_help, false);
+    parser.PrintHelp();
+    return;
+  }
   if (subcommand == "image") {
     std::filesystem::path model;
-    std::string name = "Qwen-Image-2.1";
+    std::vector<std::string> names;
     ArgParser parser(std::string(program_name) + " serve image",
                      "Serve Qwen-Image-2.1 generation and editing.");
     parser.AddOption("-m", "--model", "DIR",
                      "Qwen-Image-2.1 safetensors directory", "Model", &model);
-    parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
-                     "Model", &name);
+    AddServedModelNamesOption(parser, &names);
+    ServerOptionHelpTargets server_help;
+    AddServerOptionsForHelp(parser, &server_help, false);
+    parser.PrintHelp();
+    return;
+  }
+  if (subcommand == "embedding") {
+    std::filesystem::path model;
+    std::vector<std::string> names;
+    std::string default_prompt_name;
+    ArgParser parser(
+        std::string(program_name) + " serve embedding",
+        "Serve EmbeddingGemma 2 text, image and audio embeddings.");
+    AddEmbeddingOptions(parser, &model, &names, &default_prompt_name);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help, false);
     parser.PrintHelp();
@@ -524,6 +626,8 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--ttl", "SEC",
                      "Completed-artifact TTL in seconds (default: 3600)",
                      "Storage", &video_ttl_seconds);
+    std::vector<std::string> video_names;
+    AddServedModelNamesOption(parser, &video_names);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help);
     parser.PrintHelp();
@@ -553,6 +657,7 @@ void PrintServeHelp(std::string_view program_name,
     std::string reasoning_mode = "auto";
     std::string reasoning_effort = "auto";
     std::string preserve_thinking = "auto";
+    std::int64_t reasoning_budget = -1;
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string draft_policy;
@@ -564,19 +669,22 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
     std::size_t max_pending_requests = 16;
-    std::size_t max_pending_requests_per_client = 4;
+    std::size_t max_pending_requests_per_client = 0;
     std::uint64_t request_timeout_ms = 0;
+    std::uint64_t stall_timeout_ms = 0;
     std::size_t max_output_bytes = server::kDefaultMaxOutputBytes;
     std::size_t max_buffered_output_bytes =
         server::kDefaultMaxBufferedOutputBytes;
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
-    std::size_t cache_ram_bytes = 0;
+    server::TextRunnerRamCacheOptions cache_ram;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
+    bool enable_yarn = false;
+    std::string trace_path;
 
     gufo::cli::ArgParser parser(
         std::string(program_name) + " serve llm",
@@ -589,12 +697,17 @@ void PrintServeHelp(std::string_view program_name,
                      "Qwen BF16 vision sidecar (auto-discovered beside model)",
                      "Model", &vision_model_path);
     parser.AddOption("", "--served-model-name", "ID",
-                     "Model identifier exposed by the OpenAI API", "Model",
-                     &served_model_name);
+                     "Model identifier exposed by the OpenAI API (repeatable; "
+                     "the first is primary)",
+                     "Model", &served_model_name);
     parser.AddOption(
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
+    parser.AddFlag("", "--enable-yarn",
+                   "Flash-Next: static YaRN, required for --context above the "
+                   "native 262144; it applies to every request",
+                   "Model", &enable_yarn);
 
     // Sampling Defaults
     parser.AddOption(
@@ -616,6 +729,11 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--preserve-thinking", "MODE",
                      "Replay prior reasoning: on, off, or auto",
                      "Reasoning Defaults", &preserve_thinking);
+    parser.AddOption(
+        "", "--reasoning-budget", "N",
+        "Reasoning tokens before </think> is forced: -1 unlimited, 0 none "
+        "(default: -1)",
+        "Reasoning Defaults", &reasoning_budget);
 
     // Speculative & Hardware
     parser.AddOption("", "--speculative", "MODE",
@@ -651,13 +769,19 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--max-pending", "N",
                      "Maximum queued generation requests (default: 16)",
                      "Scheduling", &max_pending_requests);
-    parser.AddOption("", "--max-pending-per-client", "N",
-                     "Maximum queued requests per client IP (default: 4)",
-                     "Scheduling", &max_pending_requests_per_client);
+    parser.AddOption(
+        "", "--max-pending-per-client", "N",
+        "Maximum queued requests per client IP (default: --max-pending)",
+        "Scheduling", &max_pending_requests_per_client);
     parser.AddOption(
         "", "--request-timeout-ms", "MS",
         "Queue plus generation timeout; 0 disables it (default: 0)",
         "Scheduling", &request_timeout_ms);
+    parser.AddOption(
+        "", "--stall-timeout-ms", "MS",
+        "Exit as device_lost when generation makes no progress for this "
+        "long; at least 60000, 0 disables it (default: 0)",
+        "Scheduling", &stall_timeout_ms);
     parser.AddOption("", "--max-output-bytes", "N",
                      "Maximum generated bytes per request (default: 1048576)",
                      "Scheduling", &max_output_bytes);
@@ -668,25 +792,27 @@ void PrintServeHelp(std::string_view program_name,
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
-    parser.AddOption(
-        "", "--cache-ram-bytes", "N",
-        "Retained RAM-cache byte budget (default: 0 = auto, at most 32 GiB)",
-        "Cache", &cache_ram_bytes);
+    AddCacheRamOption(parser, &cache_ram);
     parser.AddOption("", "--cache-disk", "DIR",
-                     "Opt-in restart-safe continuation cache directory",
+                     "Opt-in restart-safe continuation cache directory "
+                     "(Flash-Next: owned by one process)",
                      "Cache", &cache_disk_directory);
     parser.AddOption("", "--cache-disk-bytes", "N",
                      "Retained disk-cache byte budget (default: " +
                          std::to_string(cache_disk_bytes) + ")",
                      "Cache", &cache_disk_bytes);
-    parser.AddOption("", "--cache-disk-staging-bytes", "N",
-                     "RAM limit for queued snapshots and each disk read "
-                     "(default: 0 = auto, at most 1 GiB and 1/8 available RAM)",
-                     "Cache", &cache_disk_staging_bytes);
+    parser.AddOption(
+        "", "--cache-disk-staging-bytes", "N",
+        "Flash-Next: pinned disk transfer buffer allocated at startup within "
+        "the RAM ceiling, not a checkpoint size limit (default: 0 = 1 MiB). "
+        "Other models: RAM limit for queued snapshots and each disk read "
+        "(default: 0 = auto, at most the disk budget and 1/8 available RAM)",
+        "Cache", &cache_disk_staging_bytes);
     parser.AddFlag("", "--log-progress",
                    "Log live prefill and decode progress (needs "
                    "--log-level=info or debug)",
                    "Logging", &log_progress);
+    parser.AddOption("", "--trace", "PATH", kTraceHelp, "Logging", &trace_path);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help);
     parser.PrintHelp();
@@ -707,7 +833,10 @@ void PrintServeHelp(std::string_view program_name,
          "/v1/images/edits)\n"
       << "  tts       Serve Qwen3-TTS speech synthesis (/v1/audio/speech)\n"
       << "  asr       Serve Qwen3-ASR transcription "
-         "(/v1/audio/transcriptions)\n\n"
+         "(/v1/audio/transcriptions)\n"
+      << "  embedding Serve EmbeddingGemma 2 text, image and audio embeddings "
+         "(/v1/embeddings)\n"
+      << "  decision  Serve decision models (/v1/systemone)\n\n"
       << "Server:\n"
       << "  -i, --host <IP>        Bind address (default: 127.0.0.1)\n"
       << "  -p, --port <N>         Port to listen on (default: 8080)\n"
@@ -719,7 +848,6 @@ void PrintServeHelp(std::string_view program_name,
       << "      --max-request-bytes <N>\n"
       << "                         Maximum HTTP request body bytes (default: "
          "8388608)\n"
-      << "      --api-key <KEY>    Require Bearer authorization for requests\n"
       << "\nLogging:\n"
       << "      --log-level <LEVEL>\n"
       << "                         " << kLogLevelHelp << "\n"
@@ -739,6 +867,9 @@ int RunServe(std::span<const char* const> args) {
   // that simply vanished after event=load_started.
   ReportTerminationReason();
   InstallFatalSignalReporter();
+
+  ext::Registry registry;
+  ext::RegisterBuiltExtensions(registry);
 
   std::string host = "127.0.0.1";
   if (const char* env_host = std::getenv("HOST");
@@ -774,7 +905,6 @@ int RunServe(std::span<const char* const> args) {
   std::size_t max_connections = 16;
   std::size_t max_request_body_bytes =
       static_cast<std::size_t>(8) * 1024 * 1024;
-  std::string api_key;
   ServerLogOptions log_options;
 
   // Identify the modality only after leading server options. The selected
@@ -783,9 +913,9 @@ int RunServe(std::span<const char* const> args) {
   ArgParser server_parser("gufo serve");
   const auto add_server_options = [&](ArgParser& parser,
                                       bool include_sessions = true) {
-    AddServerOptions(
-        parser, &host, &port, include_sessions ? &session_count : nullptr,
-        &max_connections, &max_request_body_bytes, &api_key, &log_options);
+    AddServerOptions(parser, &host, &port,
+                     include_sessions ? &session_count : nullptr,
+                     &max_connections, &max_request_body_bytes, &log_options);
   };
   add_server_options(server_parser);
   std::string subcommand = "llm";
@@ -801,14 +931,15 @@ int RunServe(std::span<const char* const> args) {
       continue;
     }
     if (arg == "llm" || arg == "video" || (arg == "tts" || arg == "asr") ||
-        arg == "image") {
+        arg == "image" || arg == "embedding" || arg == "decision") {
       subcommand = arg;
       sub_args.erase(sub_args.begin() + static_cast<std::ptrdiff_t>(i));
     } else if (arg == "--help" || arg == "-h" || arg == "help") {
       const std::string_view topic =
           arg == "help" && i + 1 < args.size() ? args[i + 1] : "";
       if (!topic.empty() && topic != "llm" && topic != "video" &&
-          topic != "tts" && topic != "asr" && topic != "image") {
+          topic != "tts" && topic != "asr" && topic != "image" &&
+          topic != "embedding" && topic != "decision") {
         std::cerr << "Error: unknown serve command '" << topic << "'\n";
         return 2;
       }
@@ -825,9 +956,8 @@ int RunServe(std::span<const char* const> args) {
   // and returns before that point.
 
   const auto prepare_server_options = [&] {
-    in_addr address{};
-    if (::inet_pton(AF_INET, host.c_str(), &address) != 1) {
-      std::cerr << "Error: --host must be an IPv4 address\n";
+    if (!gufo::server::IsListenAddress(host)) {
+      std::cerr << "Error: --host must be an IPv4 or IPv6 address\n";
       return false;
     }
     if (port < 0 || port > 65535) {
@@ -881,7 +1011,6 @@ int RunServe(std::span<const char* const> args) {
         "event=options host=" + host + " port=" + std::to_string(port) +
         " max_connections=" + std::to_string(max_connections) +
         " max_request_bytes=" + std::to_string(max_request_body_bytes) +
-        " api_key=" + (api_key.empty() ? "unset" : "set") +
         " log_level=" + std::string(server::LogLevelName(resolved));
     server::Logger::Debug("server", options_line);
     return true;
@@ -893,16 +1022,108 @@ int RunServe(std::span<const char* const> args) {
   std::shared_ptr<server::TtsService> tts;
   std::shared_ptr<server::AsrService> asr;
   std::shared_ptr<server::ImageService> images;
+  std::shared_ptr<server::EmbeddingService> embeddings;
+  std::shared_ptr<server::DecisionService> decisions;
 
-  if (subcommand == "image") {
+  if (subcommand == "decision") {
+    std::filesystem::path model, mmproj;
+    std::vector<std::string> names;
+    std::size_t context = 8192;
+    ArgParser parser("gufo serve decision",
+                     "Serve decision models (/v1/systemone).");
+    AddDecisionOptions(parser, &model, &mmproj, &names, &context);
+    add_server_options(parser, false);
+    if (!parser.Parse(sub_args, &parse_err)) {
+      std::cerr << "Error: " << parse_err << '\n';
+      return 2;
+    }
+    if (parser.IsHelpRequested()) {
+      PrintServeHelp("gufo", "decision");
+      return 0;
+    }
+    if (!prepare_server_options())
+      return 2;
+    if (model.empty() || context == 0) {
+      std::cerr << "Error: --model and a positive --context are required for "
+                   "decision server\n";
+      return 2;
+    }
+    ModelLoadLog load_log("decision", model);
+    std::string error;
+    decisions =
+        server::CreateDecisionService({.model_root = model.string(),
+                                       .projector_path = mmproj.string(),
+                                       .maximum_context_tokens = context},
+                                      PrimaryModelName(names), &error);
+    if (!decisions) {
+      std::cerr << "Error loading decision model: " << error << '\n';
+      return 1;
+    }
+    decisions->model_aliases = ModelAliases(names);
+    load_log.Complete("model=" + decisions->model_id +
+                      " context_tokens=" + std::to_string(context));
+  } else if (subcommand == "embedding") {
     std::filesystem::path model;
-    std::string name = "Qwen-Image-2.1";
+    std::vector<std::string> names;
+    std::string default_prompt_name;
+    ArgParser parser(
+        "gufo serve embedding",
+        "Serve EmbeddingGemma 2 text, image and audio embeddings.");
+    AddEmbeddingOptions(parser, &model, &names, &default_prompt_name);
+    add_server_options(parser, false);
+    if (!parser.Parse(sub_args, &parse_err)) {
+      std::cerr << "Error: " << parse_err << '\n';
+      return 2;
+    }
+    if (parser.IsHelpRequested()) {
+      PrintServeHelp("gufo", "embedding");
+      return 0;
+    }
+    if (!prepare_server_options())
+      return 2;
+    if (model.empty()) {
+      std::cerr << "Error: --model <DIR> is required for embedding server\n";
+      return 2;
+    }
+    ModelLoadLog load_log("embedding_gemma2", model);
+    std::map<std::string, std::string> prompts;
+    std::string prompts_error;
+    if (!server::LoadSentenceTransformerPrompts(model, &prompts,
+                                                &prompts_error)) {
+      std::cerr << "Error: " << prompts_error << '\n';
+      return 1;
+    }
+    try {
+      embeddings = std::make_shared<server::EmbeddingService>(
+          server::EmbeddingServiceOptions{
+              .model_root = model,
+              .validate_model = true,
+              .model_id = names.empty() ? "embeddinggemma-2" : names.front(),
+              .model_aliases = ModelAliases(names),
+              .prompts = std::move(prompts),
+              .default_prompt_name = default_prompt_name,
+              .runner = {},
+          });
+    } catch (const std::exception& error) {
+      std::cerr << "Error loading EmbeddingGemma 2: " << error.what() << '\n';
+      return 1;
+    }
+    if (!embeddings->ready()) {
+      std::cerr << "Error enabling EmbeddingGemma 2 service: "
+                << embeddings->initialization_error() << '\n';
+      return 1;
+    }
+    load_log.Complete(
+        "model=" + embeddings->model_id() + " context_tokens=" +
+        std::to_string(server::EmbeddingService::kMaxInputTokens));
+  } else if (subcommand == "image") {
+    std::filesystem::path model;
+    std::vector<std::string> names;
     ArgParser parser("gufo serve image",
                      "Serve Qwen-Image-2.1 generation and editing.");
     parser.AddOption("-m", "--model", "DIR",
                      "Qwen-Image-2.1 safetensors directory", "Model", &model);
-    parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
-                     "Model", &name);
+    AddServedModelNamesOption(parser, &names);
     add_server_options(parser, false);
     if (!parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << '\n';
@@ -920,12 +1141,15 @@ int RunServe(std::span<const char* const> args) {
     }
     ModelLoadLog load_log("qwen_image_21", model);
     try {
-      images = std::make_shared<server::ImageService>(model, name);
+      images = std::make_shared<server::ImageService>(
+          model, names.empty() ? "Qwen-Image-2.1" : names.front(),
+          server::ImageService::Runner{}, ModelAliases(names));
     } catch (const std::exception& error) {
       std::cerr << "Error loading Qwen-Image-2.1: " << error.what() << '\n';
       return 1;
     }
-    load_log.Complete("model=" + name + " weights=mapped upload=on_demand");
+    load_log.Complete("model=" + images->model_id() +
+                      " weights=mapped upload=on_demand");
   } else if (subcommand == "video") {
     std::filesystem::path video_model;
     std::filesystem::path video_root = "video-jobs";
@@ -946,6 +1170,8 @@ int RunServe(std::span<const char* const> args) {
     video_parser.AddOption("", "--ttl", "SEC",
                            "Completed-artifact TTL in seconds", "Storage",
                            &video_ttl_seconds);
+    std::vector<std::string> video_names;
+    AddServedModelNamesOption(video_parser, &video_names);
 
     add_server_options(video_parser);
     if (!video_parser.Parse(sub_args, &parse_err)) {
@@ -983,6 +1209,9 @@ int RunServe(std::span<const char* const> args) {
             .queue_capacity = 1,
             .artifact_ttl = std::chrono::seconds(
                 static_cast<std::chrono::seconds::rep>(video_ttl_seconds)),
+            // Video's canonical names select presets, so every supplied
+            // name is an accepted alias of the root minimax-h3 (#957).
+            .model_aliases = video_names,
             .validate_model_inventory = true,
             .id_factory = {},
             .now = {},
@@ -1035,9 +1264,11 @@ int RunServe(std::span<const char* const> args) {
       try {
         tts = std::make_shared<server::TtsService>(server::TtsServiceOptions{
             .model_root = options.model,
+            .projector_path = options.mmproj,
             .native_context_tokens = options.context,
             .validate_model = true,
-            .model_id = options.served_model_name,
+            .model_id = PrimaryModelName(options.served_model_names),
+            .model_aliases = ModelAliases(options.served_model_names),
             .voices = {},
             .voice_presets = std::move(voice_presets),
             .runner = {},
@@ -1058,9 +1289,11 @@ int RunServe(std::span<const char* const> args) {
       try {
         asr = std::make_shared<server::AsrService>(server::AsrServiceOptions{
             .model_root = options.model,
+            .projector_path = options.mmproj,
             .native_context_tokens = options.context,
             .validate_model = true,
-            .model_id = options.served_model_name,
+            .model_id = PrimaryModelName(options.served_model_names),
+            .model_aliases = ModelAliases(options.served_model_names),
             .runner = {},
         });
       } catch (const std::exception& error) {
@@ -1079,13 +1312,14 @@ int RunServe(std::span<const char* const> args) {
   } else {
     // Default to LLM server
     std::string model;
-    std::string served_model_name;
+    std::vector<std::string> served_model_names;
     std::uint32_t max_context = 0;
     std::int64_t max_tokens = -1;
     sampling::SamplingConfig sampling_config;
     std::string reasoning_mode = "auto";
     std::string reasoning_effort = "auto";
     std::string preserve_thinking = "auto";
+    std::int64_t reasoning_budget = -1;
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string draft_policy;
@@ -1097,19 +1331,23 @@ int RunServe(std::span<const char* const> args) {
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
     std::size_t max_pending_requests = 16;
-    std::size_t max_pending_requests_per_client = 4;
+    // Defaults to --max-pending after parsing unless supplied.
+    std::size_t max_pending_requests_per_client = 0;
     std::uint64_t request_timeout_ms = 0;
+    std::uint64_t stall_timeout_ms = 0;
     std::size_t max_output_bytes = server::kDefaultMaxOutputBytes;
     std::size_t max_buffered_output_bytes =
         server::kDefaultMaxBufferedOutputBytes;
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
-    std::size_t cache_ram_bytes = 0;
+    server::TextRunnerRamCacheOptions cache_ram;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
     std::size_t cache_disk_staging_bytes = 0;
     bool log_progress = false;
+    bool enable_yarn = false;
+    std::string trace_path;
 
     gufo::cli::ArgParser llm_parser(
         "gufo serve llm",
@@ -1120,13 +1358,30 @@ int RunServe(std::span<const char* const> args) {
         "", "--mmproj", "PATH",
         "Qwen BF16 vision sidecar (auto-discovered beside model)", "Model",
         &vision_model_path);
-    llm_parser.AddOption("", "--served-model-name", "ID",
-                         "Model identifier exposed by the OpenAI API", "Model",
-                         &served_model_name);
+    llm_parser.AddCustomOption(
+        "", "--served-model-name", "ID",
+        "Model identifier exposed by the OpenAI API (repeatable; the first "
+        "is primary)",
+        "Model",
+        [&served_model_names](std::string_view, std::string_view value,
+                              std::string* err) {
+          if (std::ranges::find(served_model_names, value) !=
+              served_model_names.end()) {
+            *err = "duplicate --served-model-name";
+            return false;
+          }
+          if (!value.empty())
+            served_model_names.emplace_back(value);
+          return true;
+        });
     llm_parser.AddOption(
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
+    llm_parser.AddFlag("", "--enable-yarn",
+                       "Flash-Next: static YaRN, required for --context above "
+                       "the native 262144; it applies to every request",
+                       "Model", &enable_yarn);
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default new-token limit (default: -1 = until EOS or context full)",
@@ -1144,6 +1399,11 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("", "--preserve-thinking", "MODE",
                          "Replay prior reasoning: on, off, or auto",
                          "Reasoning Defaults", &preserve_thinking);
+    llm_parser.AddOption(
+        "", "--reasoning-budget", "N",
+        "Reasoning tokens before </think> is forced: -1 unlimited, 0 none "
+        "(default: -1)",
+        "Reasoning Defaults", &reasoning_budget);
     llm_parser.AddOption("", "--speculative", "MODE",
                          "HTTP draft backend: dspark, dflash2, mtp, or off",
                          "Speculative", &speculative_backend);
@@ -1177,13 +1437,19 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("", "--max-pending", "N",
                          "Maximum queued generation requests (default: 16)",
                          "Scheduling", &max_pending_requests);
-    llm_parser.AddOption("", "--max-pending-per-client", "N",
-                         "Maximum queued requests per client IP (default: 4)",
-                         "Scheduling", &max_pending_requests_per_client);
+    llm_parser.AddOption(
+        "", "--max-pending-per-client", "N",
+        "Maximum queued requests per client IP (default: --max-pending)",
+        "Scheduling", &max_pending_requests_per_client);
     llm_parser.AddOption(
         "", "--request-timeout-ms", "MS",
         "Queue plus generation timeout; 0 disables it (default: 0)",
         "Scheduling", &request_timeout_ms);
+    llm_parser.AddOption(
+        "", "--stall-timeout-ms", "MS",
+        "Exit as device_lost when generation makes no progress for this "
+        "long; at least 60000, 0 disables it (default: 0)",
+        "Scheduling", &stall_timeout_ms);
     llm_parser.AddOption(
         "", "--max-output-bytes", "N",
         "Maximum generated bytes per request (default: 1048576)", "Scheduling",
@@ -1196,12 +1462,10 @@ int RunServe(std::span<const char* const> args) {
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
-    llm_parser.AddOption(
-        "", "--cache-ram-bytes", "N",
-        "Retained RAM-cache byte budget (default: 0 = auto, at most 32 GiB)",
-        "Cache", &cache_ram_bytes);
+    AddCacheRamOption(llm_parser, &cache_ram);
     llm_parser.AddOption("", "--cache-disk", "DIR",
-                         "Opt-in restart-safe continuation cache directory",
+                         "Opt-in restart-safe continuation cache directory "
+                         "(Flash-Next: owned by one process)",
                          "Cache", &cache_disk_directory);
     llm_parser.AddOption("", "--cache-disk-bytes", "N",
                          "Retained disk-cache byte budget (default: " +
@@ -1209,13 +1473,17 @@ int RunServe(std::span<const char* const> args) {
                          "Cache", &cache_disk_bytes);
     llm_parser.AddOption(
         "", "--cache-disk-staging-bytes", "N",
-        "RAM limit for queued snapshots and each disk read "
-        "(default: 0 = auto, at most 1 GiB and 1/8 available RAM)",
+        "Flash-Next: pinned disk transfer buffer allocated at startup within "
+        "the RAM ceiling, not a checkpoint size limit (default: 0 = 1 MiB). "
+        "Other models: RAM limit for queued snapshots and each disk read "
+        "(default: 0 = auto, at most the disk budget and 1/8 available RAM)",
         "Cache", &cache_disk_staging_bytes);
     llm_parser.AddFlag("", "--log-progress",
                        "Log live prefill and decode progress (needs "
                        "--log-level=info or debug)",
                        "Logging", &log_progress);
+    llm_parser.AddOption("", "--trace", "PATH", kTraceHelp, "Logging",
+                         &trace_path);
 
     add_server_options(llm_parser);
     if (!llm_parser.Parse(sub_args, &parse_err)) {
@@ -1227,6 +1495,9 @@ int RunServe(std::span<const char* const> args) {
       PrintServeHelp("gufo", "llm");
       return 0;
     }
+    if (!llm_parser.WasSupplied("--max-pending-per-client")) {
+      max_pending_requests_per_client = max_pending_requests;
+    }
     if (!prepare_server_options()) {
       return 2;
     }
@@ -1237,6 +1508,18 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --log-progress needs --log-level=info or "
                    "--log-level=debug\n";
       return 2;
+    }
+    // Opened before the model loads, so an unwritable path fails at once
+    // instead of after the weights are resident.
+    if (!trace_path.empty()) {
+      if (const auto error = server::Trace::Open(trace_path)) {
+        std::cerr << "Error: cannot open --trace file '" << trace_path
+                  << "': " << *error << "\n";
+        return 2;
+      }
+      server::Logger::Warn("trace",
+                           "event=trace_enabled path=" + trace_path +
+                               " content=prompts,generated_text,replies");
     }
     sampling::SamplingConfig validated_sampling;
     const bool sampling_valid = !server::ParseSamplingConfig(
@@ -1251,6 +1534,9 @@ int RunServe(std::span<const char* const> args) {
         (!cache_disk_directory.empty() && cache_disk_bytes == 0) ||
         request_timeout_ms > static_cast<std::uint64_t>(
                                  std::chrono::milliseconds::max().count()) ||
+        stall_timeout_ms > static_cast<std::uint64_t>(
+                               std::chrono::milliseconds::max().count()) ||
+        (stall_timeout_ms != 0 && stall_timeout_ms < kMinStallTimeoutMs) ||
         !sampling_valid) {
       std::cerr << "Error: sampling and scheduling limits are invalid\n";
       return 2;
@@ -1261,12 +1547,19 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: speculative draft limits are invalid\n";
       return 2;
     }
-    const auto reasoning_defaults = ResolveReasoningDefaults(
+    auto reasoning_defaults = ResolveReasoningDefaults(
         reasoning_mode, reasoning_effort, preserve_thinking, &parse_err);
     if (!reasoning_defaults.has_value()) {
       std::cerr << "Error: " << parse_err << "\n";
       return 2;
     }
+    if (reasoning_budget < -1) {
+      std::cerr << "Error: --reasoning-budget must be -1 or nonnegative\n";
+      return 2;
+    }
+    if (reasoning_budget >= 0)
+      reasoning_defaults->budget_tokens =
+          static_cast<std::size_t>(reasoning_budget);
 
     server::TextSpeculativeConfig speculative_config;
     if (speculative_backend.empty() && !dspark_model_path.empty()) {
@@ -1290,7 +1583,7 @@ int RunServe(std::span<const char* const> args) {
           speculative_config.backend != server::TextSpeculativeBackend::kDFlash)
         throw std::invalid_argument("--draft-policy requires DFlash2");
       speculative_config.dflash_policy =
-          speculative::ParseDFlashDraftPolicy(draft_policy);
+          server::speculative::ParseDFlashDraftPolicy(draft_policy);
     } catch (const std::invalid_argument& exception) {
       std::cerr << "Error: " << exception.what() << '\n';
       return 2;
@@ -1318,39 +1611,48 @@ int RunServe(std::span<const char* const> args) {
     std::string err;
     ModelLoadLog load_log("text", model);
     backend = std::make_shared<server::InferenceBackend>();
-    if (!backend->load(model, &err, max_context, session_count,
-                       server::TextPrefillPolicy{
-                           .decode_active_tokens = prefill_chunk_tokens,
-                       },
-                       server::TextSchedulerPolicy{
-                           .max_pending_requests = max_pending_requests,
-                           .max_pending_requests_per_client =
-                               max_pending_requests_per_client,
-                           .max_output_bytes_per_request = max_output_bytes,
-                           .max_buffered_output_bytes_per_request =
-                               max_buffered_output_bytes,
-                           .max_buffered_output_bytes_total =
-                               max_buffered_output_bytes_total,
-                           .request_timeout =
-                               std::chrono::milliseconds{
-                                   static_cast<std::chrono::milliseconds::rep>(
-                                       request_timeout_ms)},
-                           .log_progress = log_progress,
-                       },
-                       speculative_config,
-                       server::TextDiskCacheConfig{
-                           .directory = cache_disk_directory,
-                           .capacity_bytes = cache_disk_bytes,
-                           .staging_capacity_bytes = cache_disk_staging_bytes,
-                           .model_artifact_fingerprint = {},
-                       },
-                       vision_model_path,
-                       server::TextRunnerRamCacheOptions{
-                           .capacity_bytes = cache_ram_bytes})) {
+    // The disk snapshot tier is walked during load, which can take minutes.
+    // Answer 503 `Loading model` on the port meanwhile, as llama-server does,
+    // so supervisors see a loading server rather than a refused connection.
+    server::LoadingResponder loading(host, port);
+    const bool load_ok = backend->load(
+        model, &err, max_context, session_count,
+        server::TextPrefillPolicy{
+            .decode_active_tokens = prefill_chunk_tokens,
+        },
+        server::TextSchedulerPolicy{
+            .max_pending_requests = max_pending_requests,
+            .max_pending_requests_per_client = max_pending_requests_per_client,
+            .max_output_bytes_per_request = max_output_bytes,
+            .max_buffered_output_bytes_per_request = max_buffered_output_bytes,
+            .max_buffered_output_bytes_total = max_buffered_output_bytes_total,
+            .request_timeout =
+                std::chrono::milliseconds{
+                    static_cast<std::chrono::milliseconds::rep>(
+                        request_timeout_ms)},
+            .stall_timeout =
+                std::chrono::milliseconds{
+                    static_cast<std::chrono::milliseconds::rep>(
+                        stall_timeout_ms)},
+            .log_progress = log_progress,
+        },
+        speculative_config,
+        server::TextDiskCacheConfig{
+            .directory = cache_disk_directory,
+            .capacity_bytes = cache_disk_bytes,
+            .staging_capacity_bytes = cache_disk_staging_bytes,
+            .model_artifact_fingerprint = {},
+        },
+        vision_model_path, cache_ram, enable_yarn);
+    loading.stop();
+    if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }
-    backend->set_model_id(served_model_name);
+    backend->set_model_ids(std::move(served_model_names));
+    // As `gufo --version` prints it; CMake defines both for this target.
+    backend->set_served_artifact(model,
+                                 GUFO_RELEASE_VERSION " (" GUFO_REVISION ")");
     backend->set_sampling_defaults(
         max_tokens < 0 ? 0 : static_cast<std::size_t>(max_tokens),
         sampling_config, SamplingOptionsSupplied(llm_parser));
@@ -1389,28 +1691,55 @@ int RunServe(std::span<const char* const> args) {
         : speculative_config.backend == server::TextSpeculativeBackend::kMtp
             ? "mtp"
             : "off";
+    std::string served_names;
+    if (const auto ids = backend->model_ids(); ids.size() > 1) {
+      served_names = " served_names=" + ids.front();
+      for (std::size_t i = 1; i < ids.size(); ++i)
+        served_names += "," + ids[i];
+    }
     load_log.Complete(
         "model=" + backend->model_id() +
         " sessions=" + std::to_string(session_count) + " context_tokens=" +
         std::to_string(backend->max_context()) + " speculative=" + speculation +
         " draft_limit=" + std::to_string(speculative_config.max_draft_tokens) +
-        " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));
+        " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled") +
+        served_names);
   }
 
+  // run() joins every request thread, so no hook call outlives it.
+  std::atomic<bool> device_lost{false};
   server::HttpServer server(
       host, port, backend, video_jobs, tts, asr,
       server::HttpServerOptions{
           .max_request_body_bytes = max_request_body_bytes,
           .max_connections = max_connections,
-          .api_key = std::move(api_key),
+          .on_device_lost =
+              [&device_lost] {
+                device_lost.store(true);
+                ShutdownAfterDeviceLoss();
+              },
       },
-      images);
+      images, embeddings, decisions);
   std::string err;
   if (!server.start(&err)) {
     std::cerr << "Error starting HTTP server: " << err << "\n";
     return 1;
   }
-  server.run(/*handle_signals=*/true);
+  // Releasing model state on a lost device crashes; the kernel reclaims it.
+  // The backend is checked as well: an external SIGTERM can stop the server
+  // after the scheduler records the loss but before a request fires the hook.
+  const auto exit_if_device_lost = [&device_lost, &backend] {
+    if (device_lost.load() || (backend != nullptr && backend->device_lost())) {
+      ::_exit(kDeviceLostExitStatus);
+    }
+  };
+  try {
+    server.run(/*handle_signals=*/true);
+  } catch (...) {
+    exit_if_device_lost();
+    throw;
+  }
+  exit_if_device_lost();
   return 0;
 }
 

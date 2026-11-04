@@ -278,8 +278,9 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
     if (rows < c.ple_rows) {
       b.Fail("per_layer_token_embd.weight is missing or too short");
     } else {
-      w.ple_table = b.Get("per_layer_token_embd.weight", c.ple_head_dim, rows,
-                          1, {GgmlType::kIQ4_NL, GgmlType::kBF16});
+      w.ple_table =
+          b.Get("per_layer_token_embd.weight", c.ple_head_dim, rows, 1,
+                {GgmlType::kIQ4_NL, GgmlType::kQ8_0, GgmlType::kBF16});
     }
   }
   w.layers.reserve(c.num_layers);
@@ -316,6 +317,15 @@ std::optional<MtpWeights> MtpWeights::Bind(const core::GgufReader& reader,
     return std::nullopt;
   }
   return m;
+}
+
+std::size_t ExpandedQ8_0Tensors(const LayerWeights& layer) noexcept {
+  std::size_t count = 0;
+  for (const TensorRef* t : {&layer.hc_attn.inject, &layer.hc_ffn.inject,
+                             &layer.ssm_alpha, &layer.ssm_beta}) {
+    count += !t->empty() && t->type == GgmlType::kQ8_0;
+  }
+  return count;
 }
 
 }  // namespace gufo::models::qwen38_flash_next

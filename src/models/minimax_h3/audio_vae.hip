@@ -1,10 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 
-#include <fcntl.h>
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
-#include <sys/resource.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -19,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+#include <gufo/ext/platform/mapped_file.hpp>
+#include <gufo/ext/platform/os_info.hpp>
 #include "src/models/minimax_h3/audio_vae.hpp"
 #include "src/models/minimax_h3/audio_vae_ops.hip.hpp"
 #include "src/models/minimax_h3/json.hpp"
@@ -94,18 +93,9 @@ bool ValidateTarget(int* device, std::string* error) {
   return true;
 }
 
-struct Faults {
-  std::uint64_t minor{0};
-  std::uint64_t major{0};
-};
-
+using Faults = platform::PageFaults;
 Faults ReadFaults() {
-  struct rusage usage{};
-  if (getrusage(RUSAGE_SELF, &usage) != 0) {
-    return {};
-  }
-  return {static_cast<std::uint64_t>(usage.ru_minflt),
-          static_cast<std::uint64_t>(usage.ru_majflt)};
+  return platform::ReadPageFaults();
 }
 
 std::uint64_t ReadSwapBytes() {
@@ -216,9 +206,11 @@ bool LoadTensor(const ModelInventory& inventory,
     return false;
   }
   const std::filesystem::path path = inventory.model_root() / descriptor.shard;
-  const int file = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (file < 0) {
-    SetError(error, "cannot open MiniMax H3 AudioVAE shard " + path.string());
+  std::string open_error;
+  const platform::PlatformFile file = platform::OpenReadFile(path, &open_error);
+  if (!platform::FileValid(file)) {
+    SetError(error, "cannot open MiniMax H3 AudioVAE shard " + path.string() +
+                        ": " + open_error);
     output->Reset();
     return false;
   }
@@ -233,11 +225,10 @@ bool LoadTensor(const ModelInventory& inventory,
     const std::size_t chunk = std::min(staging_bytes, output->bytes() - copied);
     std::size_t read_bytes = 0;
     while (read_bytes < chunk) {
-      const ssize_t result = pread(
+      const std::size_t result = platform::ReadFileAt(
           file, static_cast<std::byte*>(staging) + read_bytes,
-          chunk - read_bytes,
-          static_cast<off_t>(descriptor.file_offset + copied + read_bytes));
-      if (result <= 0) {
+          chunk - read_bytes, descriptor.file_offset + copied + read_bytes);
+      if (result == 0) {
         SetError(error, "short read loading MiniMax H3 AudioVAE tensor " +
                             descriptor.name);
         success = false;
@@ -263,7 +254,7 @@ bool LoadTensor(const ModelInventory& inventory,
     }
     copied += chunk;
   }
-  (void)close(file);
+  platform::CloseFile(file);
   if (!success) {
     output->Reset();
   }

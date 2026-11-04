@@ -1,8 +1,10 @@
 """Exercise the installed CLI parser without loading model weights."""
 
 import os
+import stat
 import subprocess
 import sys
+import tempfile
 
 
 def main():
@@ -22,11 +24,13 @@ def main():
         return subprocess.run([binary, *args], env=env, text=True,
                               capture_output=True, timeout=10)
 
-    for modality in ("llm", "tts", "asr", "video", "image"):
-        check(["serve", "--port", "0", modality, "--help"], 0, "--api-key")
-        check(["serve", modality, "--port=0", "--help"], 0, "--api-key")
+    for modality in ("llm", "tts", "asr", "video", "image", "embedding"):
+        check(["serve", "--port", "0", modality, "--help"], 0,
+              "--max-connections")
+        check(["serve", modality, "--port=0", "--help"], 0,
+              "--max-connections")
         check(["serve", modality, "--help"], 0, "--log-level")
-        if modality in ("tts", "asr", "image"):
+        if modality in ("tts", "asr", "image", "embedding"):
             help_text = check(["serve", modality, "--help"], 0,
                               "--model")
             assert "--sessions" not in help_text
@@ -38,7 +42,24 @@ def main():
         check(["serve", modality, "unexpected"], 2, "Unexpected argument")
         check(["serve", modality, "--port", "65536"], 2, "--port must")
         check(["serve", modality, "--host", "bad.address"], 2, "--host must")
+    # Repeated --served-model-name is accepted by every naming modality, with
+    # duplicates refused at parse time (#957).
+    for modality in ("llm", "tts", "asr", "image", "embedding", "decision",
+                     "video"):
+        check(["serve", modality, "--help"], 0, "repeatable")
+        check(["serve", modality, "--served-model-name", "dup",
+               "--served-model-name", "dup", "--model", "missing.gguf"], 2,
+              "duplicate --served-model-name")
     check(["serve", "image"], 2, "--model <DIR> is required")
+    check(["serve", "embedding"], 2, "--model <DIR> is required")
+    text = check(["serve", "embedding", "--help"], 0, "--served-model-name")
+    assert "--context" not in text and "--sessions" not in text
+    assert "--default-prompt-name" in text
+    check(["serve", "embedding", "--context", "8"], 2, "Unknown option")
+    check(["serve", "help", "embedding"], 0, "EmbeddingGemma 2")
+    check(["serve", "embedding", "--model", "/missing"], 1,
+          "Error enabling EmbeddingGemma 2 service")
+    check(["serve", "--help"], 0, "/v1/embeddings")
     for modality in ("tts", "asr"):
         check(["serve", modality], 2, "--model <DIR> is required")
         check(["serve", modality, "--model", "/missing", "--context", "0"],
@@ -56,16 +77,42 @@ def main():
     for args in (["--model", "audio"], ["llm", "--model", "audio"],
                  ["--served-model-name", "-v", "--model", "audio"],
                  ["--port", "0", "llm", "--served-model-name", "-v", "--model", "audio"],
-                 ["--api-key", "test-key", "llm", "--model", "audio"],
                  ["llm", "--served-model-name", "--verbose", "--model", "audio"]):
         check(["serve", *args], 1, "Error loading model 'audio'")
+    # Repeated names parse and only fail at the missing model (#957).
+    for modality in ("tts", "asr"):
+        check(["serve", modality, "--served-model-name", "a",
+               "--served-model-name", "b", "--model", "audio"], 1, "Error")
     check(["serve", "help", "unknown"], 2, "unknown serve command")
     help_text = check(["serve", "llm", "--help"], 0, "model native context")
     assert "-1 = until EOS or context full" in help_text
     assert "Path to GGUF model file (required)" in help_text
     assert "8589934592" in help_text
-    assert "0 = auto, at most 1 GiB and 1/8 available RAM" in help_text
+    assert "0 = auto, at most the disk budget and 1/8 available RAM" in help_text
     assert "--log-progress" in help_text
+    assert "--enable-yarn" in help_text
+    assert "--cache-ram-bytes <N|off>" in help_text
+    for value in ("off", "0", "536870912"):
+        check(["serve", "llm", "--cache-ram-bytes", value,
+               "--model", "missing.gguf"], 1,
+              "Error loading model 'missing.gguf'")
+    for value in ("OFF", "-1", "16G"):
+        check(["serve", "llm", "--cache-ram-bytes", value], 2,
+              "--cache-ram-bytes must be off or a byte count")
+    assert "it applies to every request" in help_text
+    # The flag is a plain switch: it must not swallow the next argument.
+    check(["serve", "llm", "--enable-yarn", "--model", "missing.gguf"], 1,
+          "Error loading model 'missing.gguf'")
+    # One process can answer under several names; the first is primary.
+    name_help = next(line for line in help_text.splitlines()
+                     if "--served-model-name" in line)
+    assert "repeatable" in name_help, name_help
+    check(["serve", "llm", "--served-model-name", "a", "--served-model-name",
+           "b", "--model", "missing.gguf"], 1,
+          "Error loading model 'missing.gguf'")
+    check(["serve", "llm", "--served-model-name", "a", "--served-model-name",
+           "a", "--model", "missing.gguf"], 2,
+          "duplicate --served-model-name")
 
     # Verbosity must change the output, not merely parse. The config line is
     # emitted at the debug tier before the model file is opened, so these all
@@ -97,10 +144,13 @@ def main():
     for both in (["--log-level", "info", "-v"], ["-v", "--log-level", "warn"],
                  ["--verbose", "--log-level=debug"]):
         check(load + both, 2, "cannot combine with --log-level")
-    # Debug lines must not leak the API key they report as set.
-    keyed = run(load + ["-v", "--api-key", "super-secret-value"])
-    assert "api_key=set" in keyed.stderr
-    assert "super-secret-value" not in keyed.stderr
+    # The removed --api-key option no longer parses (#957).
+    check(["serve", "--api-key", "k", "llm", "--model", "audio"], 2,
+          "Unknown option")
+    # Structured output is prepared automatically, without a separate option.
+    assert "--prepare-structured-output" not in help_text
+    check(["serve", "llm", "--model", "missing.gguf",
+           "--prepare-structured-output"], 2, "Unknown option")
     for bad in ("trace", "Debug", "", "info,debug"):
         check(["serve", "llm", "--log-level", bad, "--model", "missing.gguf"],
               2, "--log-level must be error, warn, info or debug")
@@ -118,6 +168,20 @@ def main():
            "--log-level=info"], 1, "Error loading model")
     check(["serve", "llm", "--model", "missing.gguf", "--log-progress", "-v"],
           1, "Error loading model")
+    # --trace records client content, so it belongs to the text server only,
+    # fails before the model opens when the file cannot be written, and the
+    # startup log says the file is armed.
+    assert "--trace" in help_text
+    check(["serve", "tts", "--trace", "trace.jsonl"], 2, "Unknown option")
+    check(load + ["--trace", "/nonexistent-gufo-dir/trace.jsonl"], 2,
+          "cannot open --trace file")
+    with tempfile.TemporaryDirectory() as directory:
+        trace = os.path.join(directory, "trace.jsonl")
+        result = run(load + ["--trace", trace])
+        assert result.returncode == 1, result.stderr
+        assert "[WARN] [trace] event=trace_enabled" in result.stderr
+        if os.name != "nt":
+            assert stat.S_IMODE(os.stat(trace).st_mode) == 0o600
     # Every help variant groups verbosity the same way: a "Logging:" section,
     # with no hand-written "Server Options:" list to drift from the parser.
     for args in (["serve", "--help"], ["serve", "llm", "--help"],
@@ -139,6 +203,26 @@ def main():
               1, "Error loading model")
     for limit in ("0", "-2", "4294967296"):
         check(["serve", "llm", "--max-tokens", limit], 2,
+              "sampling and scheduling limits are invalid")
+    # The per-client cap defaults to --max-pending, so lowering the global
+    # queue alone is valid. An explicit per-client value is still bounded by it.
+    assert ("Maximum queued requests per client IP (default: --max-pending)"
+            in help_text)
+    for args in (["--max-pending", "2"], ["--max-pending", "1"],
+                 ["--max-pending", "2", "--max-pending-per-client", "2"],
+                 ["--max-pending-per-client", "16"]):
+        check(["serve", "llm", "--model", "missing.gguf", *args], 1,
+              "Error loading model")
+    for args in (["--max-pending", "2", "--max-pending-per-client", "3"],
+                 ["--max-pending-per-client", "17"],
+                 ["--max-pending-per-client", "0"], ["--max-pending", "0"]):
+        check(["serve", "llm", *args], 2,
+              "sampling and scheduling limits are invalid")
+    for value in ("0", "60000"):
+        check(["serve", "llm", "--model", "missing.gguf",
+               "--stall-timeout-ms", value], 1, "Error loading model")
+    for value in ("1", "59999"):
+        check(["serve", "llm", "--stall-timeout-ms", value], 2,
               "sampling and scheduling limits are invalid")
     for flag, value in (("--temperature", "2.01"), ("--presence-penalty", "2.01"),
                         ("--frequency-penalty", "-2.01")):

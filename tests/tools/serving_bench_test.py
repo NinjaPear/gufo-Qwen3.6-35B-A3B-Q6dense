@@ -18,12 +18,48 @@ from gufo.model_bench.charts import render_charts
 from gufo.model_bench.config import BenchConfig, load_config
 from gufo.model_bench.llm import Session, _measure_depth, run_loading, run_multi, run_single, run_table
 from gufo.model_bench.render import _serving_rate, layout_for, parse_table, render_table
-from gufo.model_bench.servers import Server
+from gufo.model_bench.servers import HipMemory, Server
 
 
 def check(condition, message):
     if not condition:
         raise AssertionError(message)
+
+
+with tempfile.TemporaryDirectory() as temporary:
+    directory = Path(temporary)
+    executable = directory / "gufo"
+    native = directory / ".gufo-wrapped"
+    link = directory / "result-gufo"
+    library = directory / "libamdhip64.so"
+    executable.write_bytes(b"#!/bin/sh\n")
+    native.write_bytes(b"\x7fELF")
+    library.touch()
+    link.symlink_to(executable)
+    output = MagicMock(stdout=f"libamdhip64.so => {library} (0x0)\n")
+    with patch("gufo.model_bench.servers.subprocess.run", return_value=output) as ldd, \
+            patch("gufo.model_bench.servers.ctypes.CDLL"):
+        check(HipMemory.for_binary(link).library == library, "wrapped HIP library resolution")
+        check(ldd.call_args.args[0] == ["ldd", str(native.resolve())], "inspect the wrapped ELF")
+        executable.write_bytes(b"\x7fELF")
+        check(HipMemory.for_binary(link).library == library, "direct HIP library resolution")
+        check(ldd.call_args.args[0] == ["ldd", str(executable.resolve())], "prefer a direct ELF")
+        executable.write_bytes(b"#!/bin/sh\n")
+        native.unlink()
+        ldd.reset_mock()
+        check(HipMemory.for_binary(link) is None, "unsupported wrapper has no HIP library")
+        check(not ldd.called, "do not inspect shell scripts with ldd")
+
+with tempfile.TemporaryDirectory() as temporary:
+    directory = Path(temporary)
+    executable = directory / "gufo.exe"
+    executable.touch()
+    with patch("gufo.model_bench.servers.sys.platform", "win32"), \
+            patch("gufo.model_bench.servers.ctypes.CDLL"), \
+            patch("gufo.model_bench.servers.subprocess.run") as ldd:
+        (directory / "amdhip64_7.dll").touch()
+        check(HipMemory.for_binary(executable) is None, "no outside memory sampler under WDDM")
+        check(not ldd.called, "Windows resolution does not run ldd")
 
 
 GUFO_USAGE = {
@@ -382,30 +418,6 @@ request_with(overridden_benchmark,
              extra_body={"temperature": .7, "presence_penalty": .5, "top_k": 7})
 
 
-for api_key in ("", "benchmark-test-secret"):
-    with patch.dict(os.environ, {"OPENAI_API_KEY": api_key}):
-        expected = f"Bearer {api_key}" if api_key else None
-
-        def authenticated_completion(request, timeout):
-            check(request.get_header("Authorization") == expected,
-                  "generation uses the configured bearer credential")
-            return fake_urlopen(request, timeout)
-
-        observation = request_with(authenticated_completion)
-        if api_key:
-            check(api_key not in json.dumps(observation.public()),
-                  "credentials are not included in benchmark observations")
-
-        def authenticated_discovery(request, timeout):
-            check(request.get_header("Authorization") == expected,
-                  "model discovery uses the configured bearer credential")
-            return io.BytesIO(b'{"data":[{"id":"test-model"}]}')
-
-        with patch.object(serving_bench.urllib.request, "urlopen",
-                          authenticated_discovery):
-            check(serving_bench.discover_model("https://private.example", 5)
-                  == "test-model", "authenticated model discovery succeeds")
-
 
 plain = request_with(
     fake_urlopen_openai, endpoint_profile="openai", cache_prompt=False
@@ -502,6 +514,34 @@ check(
     "openai profile, cache flag, notes, and reference are recorded",
 )
 check(openai_report["warnings"] == [], "no spurious warnings without metrics")
+
+
+# The benchmark client keeps bearer support for authenticated endpoints even
+# though the Gufo server no longer has one.
+for api_key in ("", "benchmark-test-secret"):
+    with patch.dict(os.environ, {"OPENAI_API_KEY": api_key}):
+        expected = f"Bearer {api_key}" if api_key else None
+
+        def authenticated_completion(request, timeout):
+            check(request.get_header("Authorization") == expected,
+                  "generation uses the configured bearer credential")
+            return fake_urlopen(request, timeout)
+
+        observation = request_with(authenticated_completion)
+        if api_key:
+            check(api_key not in json.dumps(observation.public()),
+                  "credentials are not included in benchmark observations")
+
+        def authenticated_discovery(request, timeout):
+            check(request.get_header("Authorization") == expected,
+                  "model discovery uses the configured bearer credential")
+            return io.BytesIO(b'{"data":[{"id":"test-model"}]}')
+
+        with patch.object(serving_bench.urllib.request, "urlopen",
+                          authenticated_discovery):
+            check(serving_bench.discover_model("https://private.example", 5)
+                  == "test-model", "authenticated model discovery succeeds")
+
 with patch.object(serving_bench.urllib.request, "urlopen", fake_urlopen):
     try:
         serving_bench.run_corpus_benchmark(
@@ -603,6 +643,24 @@ check(server.failure_exit_code is None and server.stop.called,
 server.process.poll.return_value = -9
 server.__exit__(RuntimeError, RuntimeError("connection closed"), None)
 check(server.failure_exit_code == -9, "an actual process failure remains distinguishable")
+
+# Ctrl-C while the server loads stops it: it runs in its own session, so the
+# terminal's SIGINT never reaches it.
+with tempfile.TemporaryDirectory() as interrupted_dir:
+    interrupted = Server(["sleep", "60"], "/health",
+                         Path(interrupted_dir, "server.log"))
+    with patch("gufo.model_bench.servers.urllib.request.urlopen",
+               side_effect=KeyboardInterrupt):
+        try:
+            interrupted.start()
+        except KeyboardInterrupt:
+            pass
+        else:
+            raise AssertionError("the interrupt must propagate")
+    stopped = (interrupted.process is not None and
+               interrupted.process.poll() is not None)
+    interrupted.stop()
+    check(stopped, "an interrupted start stops the server")
 
 
 def fake_urlopen_diverging(request, timeout):

@@ -24,6 +24,7 @@
 #include <cstring>
 #include <iostream>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -32,8 +33,8 @@
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
-#include "src/models/qwen/hip/ops.hpp"
-#include "src/models/qwen/hip/ops/prefill_fp16.hpp"
+#include "src/families/qwen/kernels/ops.hpp"
+#include "src/families/qwen/kernels/ops/prefill_fp16.hpp"
 #include "tests/models/qwen/hip/support/device_buffer.hpp"
 
 namespace {
@@ -782,9 +783,29 @@ void TestFp16Norm() {
   }
 }
 
+void TestRaggedFfnProjections() {
+  const FormatCase format{gufo::core::GgmlType::kIQ4_XS, "IQ4_XS"};
+  for (const auto rows : {17408U, 34816U})
+    TestSmallBatchExactness(format, 5, rows, 5120);
+  TestSmallBatchExactness(format, 5, 5120, 17408);
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  const FormatCase q4{gufo::core::GgmlType::kQ4_K, "Q4_K"};
+  if (argc == 2 && std::string_view(argv[1]) == "--verify-projections") {
+    TestDecodeGemv(q4);
+    TestDecodeGemv({gufo::core::GgmlType::kIQ4_XS, "IQ4_XS"});
+    TestRaggedFfnProjections();
+    for (const auto batch : {4U, 8U}) {
+      for (const auto rows : {17408U, 34816U})
+        TestSmallBatchExactness(q4, batch, rows, 5120);
+      TestSmallBatchExactness(q4, batch, 5120, 17408);
+    }
+    TestSmallBatchExactness(q4, 3, 17408, 5120);
+    return g_failed ? 1 : 0;
+  }
   TestFp16Norm();
   for (const auto& format : kFormats) {
     TestFp16Prefill(format, 4097, 257);
@@ -836,6 +857,10 @@ int main() {
       TestSmallBatchExactness(format, batch);
     }
   }
+  TestRaggedFfnProjections();
+  for (const auto rows : {17408U, 34816U})
+    TestSmallBatchExactness(q4, 4, rows, 5120);
+  TestSmallBatchExactness(q4, 4, 5120, 17408);
   TestSmallBatchExactness({gufo::core::GgmlType::kQ4_K, "Q4_K"}, 8, 1280, 5120);
   const FormatCase q8{gufo::core::GgmlType::kQ8_0, "Q8_0"};
   TestSmallBatchExactness(q8, 16, 34816, 5120);
@@ -876,6 +901,33 @@ int main() {
     TestSmallBatchExactness(format, 42, 17408, 5120);
     TestPackedProjectionSwiGLU(format);
   }
+  // Rows that would otherwise split run in one masked sixteen-row group; the
+  // guard rows check that no padded token is stored.
+  const FormatCase q5{Type::kQ5_K, "Q5_K"};
+  const FormatCase q6{Type::kQ6_K, "Q6_K"};
+  for (const auto batch : {9U, 12U, 13U, 15U, 25U})
+    TestSmallBatchExactness(q5, batch, 5120, 6144);
+  for (const auto batch : {9U, 12U, 13U})
+    TestSmallBatchExactness(q6, batch, 5120, 6144);
+  TestSmallBatchExactness(q6, 11, 5120, 17408);
+  TestSmallBatchExactness(q6, 10, 34816, 5120);
+  TestSmallBatchExactness(q6, 9, 17408, 5120);
+  // No masked Q6_K kernel covers this shape; the split route still runs.
+  TestSmallBatchExactness(q6, 13, 10240, 5120);
+  TestSmallBatchExactness(q4, 9, 10240, 5120);
+  TestSmallBatchExactness(q4, 11, 10240, 5120);
+  TestSmallBatchExactness(q4, 41, 10240, 5120);
+  TestSmallBatchExactness(q4, 14, 12288, 5120);
+  TestSmallBatchExactness(q4, 13, 5120, 6144);
+  TestSmallBatchExactness(q4, 13, 17408, 5120);
+  TestSmallBatchExactness(q5, 11, 10240, 5120);
+  TestSmallBatchExactness(q5, 9, 17408, 5120);
+  TestSmallBatchExactness(q5, 15, 17408, 5120);
+  TestSmallBatchExactness(iq4, 10, 17408, 5120);
+  TestSmallBatchExactness(iq4, 13, 17408, 5120);
+  TestSmallBatchExactness(iq4, 11, 6144, 5120);
+  TestSmallBatchExactness(iq4, 14, 6144, 5120);
+  TestSmallBatchExactness(iq4, 10, 5120, 6144);
   const std::pair<Type, Type> fused_formats[] = {
       {Type::kQ4_K, Type::kQ4_K},     {Type::kQ5_K, Type::kQ5_K},
       {Type::kIQ4_XS, Type::kIQ4_XS}, {Type::kQ4_K, Type::kQ5_K},

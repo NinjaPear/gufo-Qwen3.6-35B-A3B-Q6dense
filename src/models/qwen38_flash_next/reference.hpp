@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include "src/models/qwen/vision/prompt.hpp"
+#include "src/families/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
@@ -84,6 +84,7 @@ private:
 
   const ModelWeights& w_;
   const Config& c_;
+  YarnRope yarn_;  ///< From c_.rope_scaling.
   Storage storage_;
   NgramTable* ngram_;
   std::uint32_t max_context_;

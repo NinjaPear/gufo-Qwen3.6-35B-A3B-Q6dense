@@ -1,9 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 
-#include <fcntl.h>
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -20,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include <gufo/ext/platform/mapped_file.hpp>
 #include "src/models/minimax_h3/attention.hip.hpp"
 #include "src/models/minimax_h3/dense.hip.hpp"
 #include "src/models/minimax_h3/dit.hpp"
@@ -34,8 +33,8 @@ constexpr std::size_t kWeightStagingBytes = 16ULL << 20U;
 constexpr std::size_t kMaximumAttentionRows = 131'072;
 constexpr std::size_t kMaximumScalarAttentionRows = 16'384;
 constexpr std::size_t kShortAttentionRows = 4'096;
-// Pinned by byte-repeat validation on gfx1151 with the repository's ROCm
-// 7.2.3 toolchain. A changed rocBLAS database fails session construction.
+// Pinned by byte-repeat validation on gfx1151 with ROCm 7.2.3. If a newer
+// rocBLAS database removes an index, validate its default before using it.
 constexpr rocblas_int kGfx1151RocblasBf16Solution = -1162085109;
 
 rocblas_int PinnedBf16Solution(std::size_t batch, std::size_t rows,
@@ -271,9 +270,11 @@ bool LoadWeight(const ModelInventory& inventory,
     return false;
   }
   const std::filesystem::path path = inventory.model_root() / descriptor.shard;
-  const int file = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (file < 0) {
-    SetError(error, "cannot open MiniMax H3 DiT shard " + path.string());
+  std::string open_error;
+  const platform::PlatformFile file = platform::OpenReadFile(path, &open_error);
+  if (!platform::FileValid(file)) {
+    SetError(error, "cannot open MiniMax H3 DiT shard " + path.string() + ": " +
+                        open_error);
     return false;
   }
   std::size_t copied = 0;
@@ -287,17 +288,16 @@ bool LoadWeight(const ModelInventory& inventory,
     const std::size_t chunk = std::min(staging_bytes, bytes - copied);
     std::size_t read_bytes = 0;
     while (read_bytes < chunk) {
-      const ssize_t result = pread(
+      const std::size_t result = platform::ReadFileAt(
           file, static_cast<std::byte*>(staging) + read_bytes,
-          chunk - read_bytes,
-          static_cast<off_t>(descriptor.file_offset + copied + read_bytes));
-      if (result <= 0) {
+          chunk - read_bytes, descriptor.file_offset + copied + read_bytes);
+      if (result == 0) {
         SetError(error,
                  "short read loading MiniMax H3 DiT tensor " + descriptor.name);
         success = false;
         break;
       }
-      read_bytes += static_cast<std::size_t>(result);
+      read_bytes += result;
     }
     if (!success) {
       break;
@@ -318,7 +318,7 @@ bool LoadWeight(const ModelInventory& inventory,
     }
     copied += chunk;
   }
-  (void)close(file);
+  platform::CloseFile(file);
   if (!success) {
     output->storage.Reset();
     return false;
@@ -412,11 +412,20 @@ public:
       return false;
     }
     const std::size_t output_elements = batch * rows;
-    if (Execute(weight, input, output, batch, rows, columns,
-                plan->solution_index) != rocblas_status_success) {
-      SetError(error,
-               "pinned gfx1151 rocBLAS BF16 DiT solution is unavailable");
-      return false;
+    auto status = Execute(weight, input, output, batch, rows, columns,
+                          plan->solution_index);
+    if (status != rocblas_status_success) {
+      // Solution indices belong to a rocBLAS database, not to a matrix
+      // shape. Validate the current library's default when that database
+      // no longer contains the previously qualified index.
+      plan->solution_index = 0;
+      status = Execute(weight, input, output, batch, rows, columns,
+                       plan->solution_index);
+      if (status != rocblas_status_success) {
+        SetError(error, "rocBLAS BF16 DiT solution is unavailable: " +
+                            std::to_string(static_cast<int>(status)));
+        return false;
+      }
     }
     hipError_t hip_status = hipMemcpyAsync(
         reference, output, output_elements * sizeof(std::uint16_t),

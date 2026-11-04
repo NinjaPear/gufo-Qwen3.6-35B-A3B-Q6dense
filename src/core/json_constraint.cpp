@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <charconv>
 #include <cmath>
 #include <deque>
@@ -17,6 +18,7 @@ namespace gufo::sampling {
 namespace {
 constexpr std::uint32_t kTerminal = 1U << 31;
 constexpr std::uint32_t kLexeme = 1U << 30;
+constexpr std::uint32_t kArguments = 1U << 29;
 constexpr std::uint32_t kLeaf = kTerminal | kLexeme;
 constexpr std::size_t kMaxSchemaBytes = 2 * 1024 * 1024;
 constexpr std::size_t kMaxRules = 262144;
@@ -124,8 +126,12 @@ public:
   using Sequence = JsonConstraint::Sequence;
   using Rule = JsonConstraint::Rule;
   explicit JsonConstraintCompiler(const json::Value& schema, bool strict,
-                                  bool tool = false)
-      : schema_(schema), strict_(strict), open_objects_(tool && !strict) {
+                                  bool tool = false,
+                                  bool open_response_objects = false)
+      : schema_(schema),
+        strict_(strict),
+        open_objects_(tool && !strict),
+        open_response_objects_(open_response_objects) {
     // Literal bytes occupy the first 256 terminal classes.
     for (unsigned i = 0; i < 256; ++i) {
       std::bitset<256> bits;
@@ -202,17 +208,39 @@ private:
     // A recursive schema must have a finite witness. References that recurse
     // without first consuming input are invalid for a predictive grammar.
     std::vector<bool> productive(grammar_->rules_.size()), nullable(productive);
+    const auto is_productive = [&](std::uint32_t symbol) {
+      if (symbol & kLeaf)
+        return true;
+      if (symbol & kArguments) {
+        const auto& arguments =
+            grammar_->argument_sets_.at(symbol & ~kArguments);
+        for (std::size_t i = 0; i < arguments.members.size(); ++i)
+          if ((arguments.required[i / 64] & (1ULL << (i % 64))) &&
+              !productive[arguments.members[i]])
+            return false;
+        return true;
+      }
+      return static_cast<bool>(productive[symbol]);
+    };
+    const auto is_nullable = [&](std::uint32_t symbol) {
+      if (symbol & kLeaf)
+        return false;
+      if (symbol & kArguments) {
+        const auto& arguments =
+            grammar_->argument_sets_.at(symbol & ~kArguments);
+        // Every member starts with a nonempty native parameter tag.
+        return std::ranges::all_of(arguments.required,
+                                   [](auto word) { return word == 0; });
+      }
+      return static_cast<bool>(nullable[symbol]);
+    };
     bool changed = true;
     while (changed) {
       changed = false;
       for (std::size_t id = 0; id < grammar_->rules_.size(); ++id) {
         for (const auto& sequence : grammar_->rules_[id]) {
-          const bool p = std::ranges::all_of(sequence, [&](auto symbol) {
-            return (symbol & kLeaf) || productive[symbol];
-          });
-          const bool n = std::ranges::all_of(sequence, [&](auto symbol) {
-            return !(symbol & kLeaf) && nullable[symbol];
-          });
+          const bool p = std::ranges::all_of(sequence, is_productive);
+          const bool n = std::ranges::all_of(sequence, is_nullable);
           changed |= (p && !productive[id]) || (n && !nullable[id]);
           productive[id] = productive[id] || p;
           nullable[id] = nullable[id] || n;
@@ -230,8 +258,14 @@ private:
         for (const auto symbol : sequence) {
           if (symbol & kLeaf)
             break;
-          self(self, symbol);
-          if (!nullable[symbol])
+          if (symbol & kArguments) {
+            for (const auto member :
+                 grammar_->argument_sets_.at(symbol & ~kArguments).members)
+              self(self, member);
+          } else {
+            self(self, symbol);
+          }
+          if (!is_nullable(symbol))
             break;
         }
       }
@@ -244,9 +278,8 @@ private:
     // Discard impossible alternatives before they can admit dead prefixes.
     for (auto& rule : grammar_->rules_)
       std::erase_if(rule, [&](const auto& sequence) {
-        return std::ranges::any_of(sequence, [&](auto symbol) {
-          return !(symbol & kLeaf) && !productive[symbol];
-        });
+        return std::ranges::any_of(
+            sequence, [&](auto symbol) { return !is_productive(symbol); });
       });
     (void)grammar_->Start();
     return std::move(grammar_);
@@ -265,8 +298,7 @@ public:
     const auto* root = NativeSchema(schema_);
     if (!root)
       return {};
-    // JSON remains the exact fallback for object-level unions/finite values
-    // and schemas whose raw string/non-string alternatives are ambiguous.
+    // Object-level unions/finite values need the loose native route.
     if (root->member_str("type") != "object" || root->contains("anyOf") ||
         root->contains("const") || root->contains("enum"))
       return {};
@@ -299,22 +331,66 @@ public:
     for (const auto& [name, original] : properties->members()) {
       if (name.empty() || name.find_first_of("<>\"=\r\n") != std::string::npos)
         return {};
-      // Qwen's native parser trims tag names. JSON preserves these keys.
+      // The loose route handles literal names outside this simple subset.
       if (format == Format::kQwen &&
           (std::string_view(" \t\f\v").find(name.front()) !=
                std::string_view::npos ||
            std::string_view(" \t\f\v").find(name.back()) !=
                std::string_view::npos))
         return {};
-      const auto* schema = NativeSchema(original);
-      if (!schema)
-        return {};
-      const auto* type = schema->find("type");
-      if (!type || !type->is_string() || schema->contains("anyOf"))
-        return {};
-      const bool string = type->str() == "string";
       const std::string close =
-          format == Format::kQwen ? "\n</parameter>" : "</｜DSML｜parameter>";
+          format == Format::kQwen ? "\n</parameter>\n" : "</｜DSML｜parameter>";
+      const auto* schema = NativeSchema(original);
+      const auto* type = schema ? schema->find("type") : nullptr;
+      if (!type || !type->is_string() || schema->contains("anyOf")) {
+        // Strict unions use the loose native route below.
+        if (strict_)
+          return {};
+        // Agent harnesses routinely declare unions. Switching the whole
+        // request to a JSON envelope contradicts the chat template and the
+        // native calls in history; long conversations then mix both syntaxes
+        // (#383). Keep native framing as llama.cpp common/parsers/
+        // qwen3-coder.cpp does at 46ca246de: a union admitting strings is raw
+        // text, and the HTTP parser tries its typed alternatives first.
+        const auto types = ValueTypes(original, 0);
+        if (types.none())
+          return {};
+        const bool text = types[kStringType];
+        std::uint32_t typed = 0;
+        if (!text || format != Format::kQwen) {
+          bool supported = true;
+          try {
+            auto probe = JsonConstraintCompiler(schema_, strict_, true);
+            probe.ignore_unknown_keys_ = ignore_unknown_keys_;
+            (void)probe.Visit(original, 1);
+          } catch (const std::invalid_argument&) {
+            supported = false;
+          }
+          typed = supported ? Visit(original, 1) : GenericValue(kMaxDepth);
+        }
+        const auto raw = Optional(
+            Lexeme(JsonSchemaLexeme::RawString(json::Value::object(), close)));
+        std::uint32_t value;
+        if (format == Format::kQwen) {
+          value =
+              Seq({Literal("<parameter=" + name + ">\n"), text ? raw : typed});
+        } else {
+          const auto open =
+              "<｜DSML｜parameter name=\"" + name + "\" string=\"";
+          Sequence choices;
+          if (text)
+            choices.push_back(Seq({Literal(open + "true\">"), raw}));
+          if (types.count() > (text ? 1U : 0U))
+            choices.push_back(Seq({Literal(open + "false\">"), typed}));
+          value = Alt(choices);
+        }
+        members.emplace_back(
+            name,
+            Seq({value,
+                 Literal(format == Format::kQwen ? close : close + "\n")}));
+        continue;
+      }
+      const bool string = type->str() == "string";
       std::uint32_t value;
       if (string) {
         Sequence choices;
@@ -323,7 +399,7 @@ public:
                             ? schema->find("enum")->items()
                             : json::Value::Array{*schema->find("const")};
           for (const auto& item : values) {
-            if (item.str().find(close) != std::string::npos)
+            if ((item.str() + close).find(close) != item.str().size())
               return {};
             if (ValueFor(*schema, item))
               choices.push_back(Literal(item.str()));
@@ -332,7 +408,7 @@ public:
         } else {
           // A regex may require the raw parameter delimiter itself. Its
           // intersection with native framing could then be empty even though
-          // the JSON schema is satisfiable. Preserve the JSON representation.
+          // the JSON schema is satisfiable. Use the loose native route.
           if (schema->contains("pattern"))
             return {};
           const auto matcher =
@@ -365,40 +441,138 @@ public:
                             : "<｜DSML｜parameter name=\"" + name +
                                   "\" string=\"" + (string ? "true" : "false") +
                                   "\">";
-      members.emplace_back(name,
-                           Seq({Literal(open), value, Literal(close + "\n")}));
+      members.emplace_back(
+          name, Seq({Literal(open), value,
+                     Literal(format == Format::kQwen ? close : close + "\n")}));
     }
-    // Native Qwen may choose argument order. Share subset suffixes for small
-    // objects; bound compilation for large schemas by retaining schema order.
-    std::uint32_t body;
-    if (members.size() <= 10) {
-      std::map<unsigned, std::uint32_t> suffixes;
-      auto suffix = [&](auto&& self, unsigned used) -> std::uint32_t {
-        if (auto found = suffixes.find(used); found != suffixes.end())
-          return found->second;
-        Rule alternatives;
-        bool complete = true;
-        for (unsigned i = 0; i < members.size(); ++i) {
-          if (used & (1U << i))
-            continue;
-          complete &= !required.contains(members[i].first);
-          alternatives.push_back(
-              {members[i].second, self(self, used | (1U << i))});
-        }
-        if (complete)
-          alternatives.push_back({});
-        return suffixes[used] = New(std::move(alternatives));
-      };
-      body = suffix(suffix, 0);
-    } else {
-      Sequence ordered;
-      for (const auto& [name, rule] : members)
-        ordered.push_back(required.contains(name) ? rule : Optional(rule));
-      body = Seq(std::move(ordered));
-    }
+    const auto body = Arguments(members, required);
     grammar_->root_ =
         open ? Seq({body, Repeat(OpenToolParameter(format, *properties))})
              : body;
+    return Finish();
+  }
+
+  // Native parameters for schemas ToolParameters cannot enforce exactly, as
+  // llama.cpp common/parsers/qwen3-coder.cpp and deepseek.cpp build them: only
+  // the root object's declared properties are parameters, a parameter
+  // admitting strings is raw text, and other values follow the supported parts
+  // of their schema. The request keeps the template's native syntax instead of
+  // a JSON envelope.
+  std::shared_ptr<const JsonConstraint> LooseToolParameters(
+      JsonConstraint::ToolFormat format) {
+    using Format = JsonConstraint::ToolFormat;
+    ignore_unknown_keys_ = true;
+    const bool qwen = format == Format::kQwen;
+    const std::string close =
+        qwen ? "\n</parameter>\n" : "</｜DSML｜parameter>";
+    // A root reference is followed as ToolParameters does; other roots that
+    // are not objects declare no parameters, as in llama.cpp.
+    const auto* root = &schema_;
+    std::set<const json::Value*> seen;
+    while (const auto* reference = root->find("$ref")) {
+      if (!seen.insert(root).second)
+        break;
+      try {
+        root = Reference(*reference);
+      } catch (const std::invalid_argument&) {
+        break;
+      }
+    }
+    const auto* properties = root->find("properties");
+    if (!properties || !properties->is_object() || root->contains("anyOf") ||
+        root->contains("oneOf") || root->contains("const") ||
+        root->contains("enum"))
+      properties = nullptr;
+    std::set<std::string> required;
+    if (const auto* fields = root->find("required");
+        properties && fields && fields->is_array())
+      for (const auto& field : fields->items())
+        if (field.is_string() && properties->contains(field.str()))
+          required.insert(field.str());
+    static const auto kNone = json::Value::object();
+    std::vector<std::pair<std::string, std::uint32_t>> members;
+    for (const auto& [name, original] :
+         (properties ? *properties : kNone).members()) {
+      // A name holding the tag's own delimiter cannot be read back. Other
+      // names, including surrounding spaces, are written literally as llama.cpp
+      // does; the parser matches declared names exactly.
+      if (name.empty() ||
+          name.find_first_of(qwen ? ">\r\n" : "\"\r\n") != std::string::npos) {
+        required.erase(name);
+        continue;
+      }
+      auto types = ValueTypes(original, 0);
+      if (types.none())
+        types.set();
+      const bool text = types[kStringType];
+      std::uint32_t typed = 0;
+      if (!text || !qwen) {
+        // Probe separately, including productivity: an unsatisfiable value
+        // is guidance here and must not make the whole tool uncallable.
+        bool supported = true;
+        try {
+          auto probe = JsonConstraintCompiler(schema_, strict_, true);
+          probe.ignore_unknown_keys_ = true;
+          probe.grammar_->root_ = probe.Visit(original, 1);
+          (void)probe.Finish();
+        } catch (const std::invalid_argument&) {
+          supported = false;
+        }
+        typed = supported ? Visit(original, 1) : GenericValue(kMaxDepth);
+      }
+      auto raw = Optional(
+          Lexeme(JsonSchemaLexeme::RawString(json::Value::object(), close)));
+      // A plain string keeps the finite values, lengths and formats
+      // ToolParameters enforces, so another parameter needing this route
+      // never relaxes it. Patterns stay raw, as on both routes.
+      if (types.count() == 1 && text) {
+        try {
+          const auto* schema = NativeSchema(original);
+          const auto* type = schema ? schema->find("type") : nullptr;
+          if (type && type->is_string() && type->str() == "string" &&
+              !schema->contains("anyOf") && !schema->contains("pattern")) {
+            if (schema->contains("const") || schema->contains("enum")) {
+              const auto values =
+                  schema->contains("enum")
+                      ? schema->find("enum")->items()
+                      : json::Value::Array{*schema->find("const")};
+              Sequence choices;
+              bool literal = true;
+              for (const auto& item : values) {
+                literal = literal && item.is_string() &&
+                          (item.str() + close).find(close) == item.str().size();
+                if (literal && ValueFor(*schema, item))
+                  choices.push_back(Literal(item.str()));
+              }
+              if (literal && !choices.empty())
+                raw = Alt(choices);
+            } else {
+              const auto matcher =
+                  JsonSchemaLexeme::RawString(StringPredicate(*schema), close);
+              raw = matcher->Check("").complete ? Optional(Lexeme(matcher))
+                                                : Lexeme(matcher);
+            }
+          }
+        } catch (const std::invalid_argument&) {
+        }
+      }
+      std::uint32_t value;
+      if (qwen) {
+        value =
+            Seq({Literal("<parameter=" + name + ">\n"), text ? raw : typed});
+      } else {
+        const auto open = "<｜DSML｜parameter name=\"" + name + "\" string=\"";
+        Sequence choices;
+        if (text)
+          choices.push_back(Seq({Literal(open + "true\">"), raw}));
+        if (types.count() > (text ? 1U : 0U))
+          choices.push_back(Seq({Literal(open + "false\">"), typed}));
+        value = Alt(choices);
+      }
+      members.emplace_back(name,
+                           Seq({value, Literal(qwen ? close : close + "\n")}));
+    }
+    grammar_->root_ = Arguments(members, required);
     return Finish();
   }
 
@@ -409,6 +583,45 @@ public:
   }
 
 private:
+  // Native models choose argument order. Keep the small-object grammar, but
+  // represent wide objects with a request-local subset instead of compiling
+  // all 2^N subsets or forcing declaration order. Required fields and one-use
+  // parameter names keep the same contract in both representations.
+  std::uint32_t Arguments(
+      const std::vector<std::pair<std::string, std::uint32_t>>& members,
+      const std::set<std::string>& required) {
+    if (members.size() > 10) {
+      JsonConstraint::ArgumentSet arguments;
+      arguments.required.resize((members.size() + 63) / 64);
+      for (std::size_t i = 0; i < members.size(); ++i) {
+        arguments.members.push_back(members[i].second);
+        if (required.contains(members[i].first))
+          arguments.required[i / 64] |= 1ULL << (i % 64);
+      }
+      const auto id = grammar_->argument_sets_.size();
+      grammar_->argument_sets_.push_back(std::move(arguments));
+      return Seq({static_cast<std::uint32_t>(kArguments | id)});
+    }
+    std::map<unsigned, std::uint32_t> suffixes;
+    auto suffix = [&](auto&& self, unsigned used) -> std::uint32_t {
+      if (auto found = suffixes.find(used); found != suffixes.end())
+        return found->second;
+      Rule alternatives;
+      bool complete = true;
+      for (unsigned i = 0; i < members.size(); ++i) {
+        if (used & (1U << i))
+          continue;
+        complete &= !required.contains(members[i].first);
+        alternatives.push_back(
+            {members[i].second, self(self, used | (1U << i))});
+      }
+      if (complete)
+        alternatives.push_back({});
+      return suffixes[used] = New(std::move(alternatives));
+    };
+    return suffix(suffix, 0);
+  }
+
   std::uint32_t OpenToolParameter(JsonConstraint::ToolFormat format,
                                   const json::Value& properties) {
     using Format = JsonConstraint::ToolFormat;
@@ -433,7 +646,8 @@ private:
     }
     const auto name =
         Lexeme(JsonSchemaLexeme::RawString(name_schema, qwen ? ">" : "\""));
-    const std::string close = qwen ? "\n</parameter>" : "</｜DSML｜parameter>";
+    const std::string close =
+        qwen ? "\n</parameter>\n" : "</｜DSML｜parameter>";
     const auto raw = Optional(
         Lexeme(JsonSchemaLexeme::RawString(json::Value::object(), close)));
     const auto value = qwen ? Seq({Literal(">\n"), raw})
@@ -441,7 +655,89 @@ private:
                                    Seq({Literal("\" string=\"false\">"),
                                         GenericValue(kMaxDepth)})});
     return Seq({Literal(qwen ? "<parameter=" : "<｜DSML｜parameter name=\""),
-                name, value, Literal(close + "\n")});
+                name, value, Literal(qwen ? close : close + "\n")});
+  }
+
+  // JSON value kinds a parameter admits, as llama.cpp common/json-schema.cpp
+  // value_types() computes them: unions add, untyped schemas admit all.
+  static constexpr std::size_t kStringType = 0;
+  using ValueTypeSet = std::bitset<6>;
+  ValueTypeSet ValueTypes(const json::Value& schema, std::size_t depth) const {
+    static constexpr std::array<std::string_view, 6> kNames{
+        "string", "number", "boolean", "null", "array", "object"};
+    const auto of = [&](const json::Value& value) {
+      ValueTypeSet types;
+      types.set(value.is_string()   ? 0
+                : value.is_number() ? 1
+                : value.is_bool()   ? 2
+                : value.is_null()   ? 3
+                : value.is_array()  ? 4
+                                    : 5);
+      return types;
+    };
+    if (schema.is_bool())
+      return schema.as_bool() ? ValueTypeSet().set() : ValueTypeSet();
+    if (!schema.is_object() || depth > kMaxDepth)
+      return ValueTypeSet().set();
+    if (const auto* reference = schema.find("$ref")) {
+      try {
+        if (const auto* target = Reference(*reference))
+          return ValueTypes(*target, depth + 1);
+      } catch (const std::invalid_argument&) {
+      }
+      return ValueTypeSet().set();
+    }
+    if (const auto* value = schema.find("const"))
+      return of(*value);
+    if (const auto* values = schema.find("enum");
+        values && values->is_array()) {
+      ValueTypeSet types;
+      for (const auto& value : values->items())
+        types |= of(value);
+      return types;
+    }
+    if (const auto* type = schema.find("type")) {
+      ValueTypeSet types;
+      const auto add = [&](const json::Value& name) {
+        if (!name.is_string())
+          return;
+        const auto spelling = name.str() == "integer" ? "number" : name.str();
+        for (std::size_t i = 0; i < kNames.size(); ++i)
+          types[i] = types[i] || kNames[i] == spelling;
+      };
+      if (type->is_array())
+        for (const auto& name : type->items())
+          add(name);
+      else
+        add(*type);
+      return types;
+    }
+    for (const auto* key : {"anyOf", "oneOf"}) {
+      if (const auto* choices = schema.find(key);
+          choices && choices->is_array()) {
+        ValueTypeSet types;
+        for (const auto& choice : choices->items())
+          types |= ValueTypes(choice, depth + 1);
+        return types;
+      }
+    }
+    if (schema.contains("properties") ||
+        (schema.contains("additionalProperties") &&
+         !(schema.find("additionalProperties")->is_bool() &&
+           schema.find("additionalProperties")->as_bool())))
+      return ValueTypeSet().set(5);
+    if (const auto* parts = schema.find("allOf"); parts && parts->is_array()) {
+      auto types = ValueTypeSet().set();
+      for (const auto& part : parts->items())
+        types &= ValueTypes(part, depth + 1);
+      return types;
+    }
+    if (schema.contains("items") || schema.contains("prefixItems"))
+      return ValueTypeSet().set(4);
+    if (schema.contains("pattern") || schema.contains("minLength") ||
+        schema.contains("maxLength"))
+      return ValueTypeSet().set(kStringType);
+    return ValueTypeSet().set();
   }
 
   const json::Value* NativeSchema(const json::Value& original) const {
@@ -819,7 +1115,8 @@ private:
         constant && !EqualValue(value, *constant))
       return {};
     if (value.is_string() || value.is_number()) {
-      auto& check = value_checks_[&schema];
+      // An untyped schema can admit both strings and numbers; cache each kind.
+      auto& check = value_checks_[{&schema, value.is_string()}];
       if (!check)
         check = value.is_string()
                     ? JsonSchemaLexeme::String(StringPredicate(schema))
@@ -1301,11 +1598,15 @@ private:
     if (!properties)
       properties = &empty_properties;
     const auto* additional = schema.find("additionalProperties");
-    const bool closed = ClosedProperties(schema, ignore_unknown_keys_);
+    // As in llama.cpp common/json-schema.cpp at 23b0202a1, a response object
+    // that declares properties without additionalProperties stays closed.
+    const bool closed = ClosedProperties(schema, ignore_unknown_keys_) ||
+                        (open_response_objects_ && !additional &&
+                         schema.contains("properties"));
     if (!properties->is_object() ||
         (additional && !additional->is_bool() && !additional->is_object()))
       Invalid("invalid object properties or additionalProperties");
-    if (!closed && !open_objects_)
+    if (!closed && !open_objects_ && !open_response_objects_)
       Invalid("objects require properties and additionalProperties: false");
     properties_ += properties->size();
     if (properties_ > 5000)
@@ -1415,20 +1716,26 @@ private:
   const json::Value& schema_;
   bool strict_;
   bool open_objects_;
+  // Unlike open_objects_, this admits undeclared keys only when
+  // additionalProperties is true or a schema, or the object declares no
+  // properties. Untyped leaves and unsupported keywords remain errors.
+  bool open_response_objects_;
   bool ignore_unknown_keys_{false};
   std::shared_ptr<JsonConstraint> grammar_{new JsonConstraint};
   std::uint32_t ws_, string_, integer_, number_, bool_, null_;
   std::map<std::size_t, std::uint32_t> generic_values_;
   std::map<const json::Value*, std::uint32_t> compiled_;
   std::deque<json::Value> derived_;
-  std::map<const json::Value*, std::shared_ptr<const JsonSchemaLexeme>>
+  std::map<std::pair<const json::Value*, bool>,
+           std::shared_ptr<const JsonSchemaLexeme>>
       value_checks_;
   std::size_t properties_{0}, enum_values_{0}, string_characters_{0};
 };
 
 std::shared_ptr<const JsonConstraint> JsonConstraint::Compile(
-    const json::Value& schema, bool strict) {
-  const auto key = std::string(strict ? "strict:" : "schema:") + schema.dump();
+    const json::Value& schema, bool strict, bool open_objects) {
+  const auto key = std::string(strict ? "strict:" : "schema:") +
+                   (open_objects ? "open:" : "") + schema.dump();
   if (key.size() > kMaxSchemaBytes)
     Invalid("maximum schema size is 2 MiB");
   // Bounded cache; compile outside the lock so unrelated HTTP requests proceed.
@@ -1439,7 +1746,8 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::Compile(
     if (const auto found = cache.find(key); found != cache.end())
       return found->second;
   }
-  auto grammar = JsonConstraintCompiler(schema, strict).Compile(false);
+  auto grammar = JsonConstraintCompiler(schema, strict, false, open_objects)
+                     .Compile(false);
   const std::lock_guard lock(mutex);
   if (cache.size() >= 16)
     cache.erase(cache.begin());
@@ -1455,14 +1763,14 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::Object() {
 }
 
 std::shared_ptr<const JsonConstraint> JsonConstraint::ToolParameters(
-    const json::Value& schema, bool strict, ToolFormat format, bool required) {
+    const json::Value& schema, bool strict, ToolFormat format) {
   // Ordinary agent tools leave nested objects open. Preserve their declared
   // requirements/types and native framing without relaxing strict output
   // schemas or injecting a second protocol into the model's chat template.
-  using Key = std::tuple<std::string, bool, ToolFormat, bool>;
+  using Key = std::tuple<std::string, bool, ToolFormat>;
   static std::mutex mutex;
   static std::map<Key, std::shared_ptr<const JsonConstraint>> cache;
-  const Key key{schema.dump(), strict, format, required};
+  const Key key{schema.dump(), strict, format};
   if (std::get<0>(key).size() > kMaxSchemaBytes)
     Invalid("maximum schema size is 2 MiB");
   {
@@ -1490,25 +1798,22 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::ToolParameters(
   }
   std::shared_ptr<const JsonConstraint> grammar;
   bool best_effort = false;
-  const bool extended_native =
-      !required || format == ToolFormat::kJson || untyped;
+  // As in llama.cpp, a required call uses the same argument grammar as an
+  // optional one; tool_choice only decides whether a call must happen.
   try {
-    // Validation-only on the native route; JSON fallback keeps this grammar.
-    grammar = JsonConstraintCompiler(normalized, strict, extended_native)
-                  .Compile(false);
+    // Validation-only on native models; generic JSON models keep this grammar.
+    grammar = JsonConstraintCompiler(normalized, strict, true).Compile(false);
   } catch (const std::invalid_argument&) {
     if (strict)
       throw;
     best_effort = true;
     // Unsupported non-strict keywords are guidance, but must not discard
     // supported nested requirements, bounds or finite values.
-    if (extended_native) {
-      try {
-        grammar = JsonConstraintCompiler(normalized, strict, true)
-                      .Compile(false, true);
-      } catch (const std::invalid_argument&) {
-        grammar.reset();
-      }
+    try {
+      grammar =
+          JsonConstraintCompiler(normalized, strict, true).Compile(false, true);
+    } catch (const std::invalid_argument&) {
+      grammar.reset();
     }
   }
   const bool preserve_root =
@@ -1537,12 +1842,18 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::ToolParameters(
   }
   if (!grammar && format == ToolFormat::kJson && !strict)
     grammar = Object();
-  if (!grammar && best_effort) {
-    // Only untyped tools can use arbitrary native parameters. A typed schema
-    // may have failed native compilation because literal delimiters or unions
-    // cannot be represented faithfully; keep its JSON envelope in that case.
-    if (open_untyped)
+  if (!grammar && best_effort && open_untyped)
+    grammar = OpenToolParameters(format);
+  // Never switch a native model to a JSON envelope: one tool's schema would
+  // change every call's syntax and contradict the chat template and history
+  // (#383). Keep native tags and enforce what they can carry, as llama.cpp.
+  if (!grammar && format != ToolFormat::kJson) {
+    try {
+      grammar = JsonConstraintCompiler(normalized, strict, true)
+                    .LooseToolParameters(format);
+    } catch (const std::invalid_argument&) {
       grammar = OpenToolParameters(format);
+    }
   }
   const std::lock_guard lock(mutex);
   if (cache.size() >= 16)
@@ -1582,6 +1893,28 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithReasoning(
       return found->second;
   }
   auto grammar = std::shared_ptr<JsonConstraint>(new JsonConstraint(*answer));
+  if (!answer->reasoning_tool_prefix_.empty()) {
+    using End = JsonSchemaLexeme::ReasoningEnd;
+    const auto lexeme = [&](End end) {
+      const auto id =
+          static_cast<std::uint32_t>(kLexeme | grammar->lexemes_.size());
+      grammar->lexemes_.push_back(
+          JsonSchemaLexeme::Reasoning(answer->reasoning_tool_prefix_, end));
+      return id;
+    };
+    Rule roots{{lexeme(End::kExplicit), answer->root_},
+               {lexeme(End::kTool), answer->reasoning_tool_root_}};
+    if (grammar->automatic_tools_) {
+      roots.push_back({});
+      roots.push_back({lexeme(End::kUnfinished)});
+    }
+    grammar->root_ = grammar->rules_.size();
+    grammar->rules_.push_back(std::move(roots));
+    const std::lock_guard lock(mutex);
+    if (cache.size() >= 16)
+      cache.erase(cache.begin());
+    return cache.emplace(std::move(answer), std::move(grammar)).first->second;
+  }
   constexpr std::string_view end = "</think>";
   const auto base = static_cast<std::uint32_t>(grammar->rules_.size());
   grammar->rules_.resize(base + end.size());
@@ -1643,13 +1976,15 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
   if (!required && answer)
     alternatives.push_back({answer->root_});
   auto check_capacity = [&](std::size_t rules, std::size_t classes,
-                            std::size_t lexemes) {
+                            std::size_t lexemes,
+                            std::size_t argument_sets = 0) {
     auto fits = [](std::size_t current, std::size_t extra) {
       return current <= kMaxRules && extra <= kMaxRules - current;
     };
     if (!fits(grammar->rules_.size(), rules) ||
         !fits(grammar->classes_.size(), classes) ||
-        !fits(grammar->lexemes_.size(), lexemes))
+        !fits(grammar->lexemes_.size(), lexemes) ||
+        !fits(grammar->argument_sets_.size(), argument_sets))
       Invalid("combined tool grammar exceeds its resource budget");
   };
   auto literal = [&](std::string_view text) {
@@ -1703,12 +2038,45 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
     return base;
   };
   const auto prose = plain_answer ? text(calls) : UINT32_MAX;
-  auto after = plain_answer
-                   ? (parallel ? prose : text(UINT32_MAX))
-                   : static_cast<std::uint32_t>(grammar->rules_.size());
-  if (!plain_answer) {
+  // As in llama.cpp's DeepSeek V4 and Qwen3-Coder parsers, calls end the
+  // output: parallel calls share one DeepSeek block, Qwen calls may follow
+  // each other, and no text may follow them. Text after a call is where
+  // echoed framing used to leak into content (#383, #438).
+  const bool qwen = format == ToolFormat::kQwen;
+  const bool ends_output = deepseek || qwen || !plain_answer;
+  auto after = ends_output ? static_cast<std::uint32_t>(grammar->rules_.size())
+               : parallel  ? prose
+                           : text(UINT32_MAX);
+  if (ends_output) {
     grammar->rules_.push_back({{}});
-    if (parallel) {
+    if (qwen) {
+      // llama.cpp SPACE_RULE: empty, one space, or 1–2 newlines followed
+      // by up to 20 spaces/tabs (common/json-schema-to-grammar.cpp).
+      const auto space = static_cast<std::uint32_t>(grammar->rules_.size());
+      grammar->rules_.push_back({{}});
+      const auto single_space = literal(" ");
+      const auto newline = literal("\n");
+      const auto double_newline = literal("\n\n");
+      std::bitset<256> indentation;
+      indentation.set(' ');
+      indentation.set('\t');
+      const auto indent =
+          static_cast<std::uint32_t>(kTerminal | grammar->classes_.size());
+      grammar->classes_.push_back(indentation);
+      auto padding = static_cast<std::uint32_t>(grammar->rules_.size());
+      grammar->rules_.push_back({{}});
+      for (unsigned count = 0; count < 20; ++count) {
+        const auto next = static_cast<std::uint32_t>(grammar->rules_.size());
+        grammar->rules_.push_back({{}, {indent, padding}});
+        padding = next;
+      }
+      grammar->rules_[space].push_back({single_space});
+      grammar->rules_[space].push_back({newline, padding});
+      grammar->rules_[space].push_back({double_newline, padding});
+      grammar->rules_[after] = {{space}};
+      if (parallel)
+        grammar->rules_[after].push_back({space, literal(marker), calls});
+    } else if (parallel && !deepseek) {
       const auto begin = literal(marker);
       grammar->rules_[after].push_back({begin, calls});
     }
@@ -1724,6 +2092,13 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
   std::map<const JsonConstraint*, std::uint32_t> imported;
   if (answer)
     imported.emplace(answer.get(), answer->root_);
+  if (format != ToolFormat::kJson) {
+    grammar->reasoning_tool_prefix_ =
+        deepseek ? "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\""
+                 : "<tool_call>\n<function=";
+    grammar->reasoning_tool_root_ = grammar->rules_.size();
+    grammar->rules_.push_back({});
+  }
   for (const auto& [name, arguments] : tools) {
     const auto begin = literal(
         format == ToolFormat::kJson
@@ -1733,19 +2108,31 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
     if (const auto found = imported.find(arguments.get());
         found != imported.end()) {
       grammar->rules_[calls].push_back({begin, found->second, end, after});
+      if (format != ToolFormat::kJson) {
+        const auto named = literal(name + (deepseek ? "\">\n" : ">\n"));
+        grammar->rules_[grammar->reasoning_tool_root_].push_back(
+            {named, found->second, end, after});
+      }
       continue;
     }
     check_capacity(arguments->rules_.size(), arguments->classes_.size(),
-                   arguments->lexemes_.size());
+                   arguments->lexemes_.size(),
+                   arguments->argument_sets_.size());
     const auto rules = grammar->rules_.size();
     const auto classes = grammar->classes_.size();
     const auto lexemes = grammar->lexemes_.size();
+    const auto argument_sets = grammar->argument_sets_.size();
     grammar->classes_.insert(grammar->classes_.end(),
                              arguments->classes_.begin(),
                              arguments->classes_.end());
     grammar->lexemes_.insert(grammar->lexemes_.end(),
                              arguments->lexemes_.begin(),
                              arguments->lexemes_.end());
+    for (auto set : arguments->argument_sets_) {
+      for (auto& member : set.members)
+        member += rules;
+      grammar->argument_sets_.push_back(std::move(set));
+    }
     for (auto rule : arguments->rules_) {
       for (auto& sequence : rule)
         for (auto& symbol : sequence)
@@ -1753,12 +2140,19 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
                        ? kTerminal | ((symbol & ~kTerminal) + classes)
                    : (symbol & kLexeme)
                        ? kLexeme | ((symbol & ~kLexeme) + lexemes)
+                   : (symbol & kArguments)
+                       ? kArguments | ((symbol & ~kArguments) + argument_sets)
                        : symbol + rules;
       grammar->rules_.push_back(std::move(rule));
     }
     const auto root = static_cast<std::uint32_t>(arguments->root_ + rules);
     imported.emplace(arguments.get(), root);
     grammar->rules_[calls].push_back({begin, root, end, after});
+    if (format != ToolFormat::kJson) {
+      const auto named = literal(name + (deepseek ? "\">\n" : ">\n"));
+      grammar->rules_[grammar->reasoning_tool_root_].push_back(
+          {named, root, end, after});
+    }
   }
   if (plain_answer && !required)
     alternatives.push_back({prose});
@@ -1800,6 +2194,34 @@ JsonConstraint::State JsonConstraint::Expand(State pending) const {
     }
     const auto rule = stack.symbols.back();
     stack.symbols.pop_back();
+    if (rule & kArguments) {
+      const auto& arguments = argument_sets_.at(rule & ~kArguments);
+      if (stack.used_parameters.empty())
+        stack.used_parameters.resize(arguments.required.size());
+      if (stack.symbols.size() + 2 > kMaxStack)
+        throw std::runtime_error("JSON grammar stack limit exceeded");
+      bool complete = true;
+      for (std::size_t word = 0; word < arguments.required.size(); ++word)
+        complete &= (stack.used_parameters[word] & arguments.required[word]) ==
+                    arguments.required[word];
+      for (std::size_t i = 0; i < arguments.members.size(); ++i) {
+        const auto bit = 1ULL << (i % 64);
+        if (stack.used_parameters[i / 64] & bit)
+          continue;
+        if (pending.size() + output.size() >= kMaxStates)
+          throw std::runtime_error("JSON grammar state limit exceeded");
+        auto next = stack;
+        next.used_parameters[i / 64] |= bit;
+        next.symbols.push_back(rule);
+        next.symbols.push_back(arguments.members[i]);
+        pending.push_back(std::move(next));
+      }
+      if (complete) {
+        stack.used_parameters.clear();
+        pending.push_back(std::move(stack));
+      }
+      continue;
+    }
     for (const auto& sequence : rules_.at(rule)) {
       if (stack.symbols.size() + sequence.size() > kMaxStack)
         throw std::runtime_error("JSON grammar stack limit exceeded");
@@ -1815,7 +2237,7 @@ JsonConstraint::State JsonConstraint::Expand(State pending) const {
 }
 
 JsonConstraint::State JsonConstraint::Start() const {
-  return Expand({{{root_}, {}}});
+  return Expand({{{root_}, {}, {}}});
 }
 
 JsonConstraint::State JsonConstraint::Advance(const State& state,
@@ -1882,6 +2304,9 @@ ConstraintVocabulary::ConstraintVocabulary(std::uint32_t size,
   for (std::uint32_t token = 0; token < size; ++token) {
     pieces_.push_back(reader(token));
     const auto& piece = pieces_.back();
+    if (piece.stop || piece.text.empty() ||
+        piece.text.find('<') != std::string::npos)
+      reasoning_boundary_tokens_.push_back(token);
     total_bytes += piece.text.size();
     if (total_bytes > 64 * 1024 * 1024)
       throw std::invalid_argument("constraint vocabulary exceeds 64 MiB");
@@ -1932,6 +2357,20 @@ ConstraintVocabulary::ConstraintVocabulary(std::uint32_t size,
 
 std::vector<std::uint8_t> ConstraintVocabulary::Allowed(
     const JsonConstraint& grammar, const JsonConstraint::State& state) const {
+  if (std::ranges::any_of(state, [&](const auto& stack) {
+        return !stack.symbols.empty() && (stack.symbols.back() & kLexeme) &&
+               grammar.lexemes_.at(stack.symbols.back() & ~kLexeme)
+                   ->PlainReasoning(stack.lexeme);
+      })) {
+    // Neither native boundary can begin without '<'. Most vocabulary entries
+    // are therefore provably valid without walking their bytes. Boundary,
+    // empty and stop tokens still use the complete grammar, including tokens
+    // that contain both a boundary and constrained output.
+    std::vector<std::uint8_t> mask(pieces_.size(), 1);
+    for (const auto token : reasoning_boundary_tokens_)
+      mask[token] = Allows(grammar, state, token);
+    return mask;
+  }
   std::vector<std::uint8_t> mask(pieces_.size());
   if (grammar.Complete(state)) {
     for (std::size_t i = 0; i < pieces_.size(); ++i)
@@ -2057,14 +2496,26 @@ std::shared_ptr<const std::vector<std::uint8_t>> TokenConstraint::Allowed(
       grammar->CanonicalMaskState(state, vocabulary->max_token_bytes_);
   {
     const std::lock_guard lock(mutex_);
+    if (initial_state_.empty())
+      initial_state_ = grammar->CanonicalMaskState(
+          grammar->Start(), vocabulary->max_token_bytes_);
     if (const auto found = masks_.find(canonical); found != masks_.end())
       return found->second;
   }
   auto mask = std::make_shared<const std::vector<std::uint8_t>>(
       vocabulary->Allowed(*grammar, canonical));
   const std::lock_guard lock(mutex_);
-  if (masks_.size() >= 16)
-    masks_.erase(masks_.begin());
+  if (const auto found = masks_.find(canonical); found != masks_.end())
+    return found->second;
+  if (masks_.size() >= 16) {
+    // Every request needs the initial mask, even when the model state is
+    // cached. Keep it within the same 16-entry budget instead of rebuilding
+    // the entire vocabulary mask after each completed native call.
+    auto victim = masks_.begin();
+    if (victim->first == initial_state_)
+      ++victim;
+    masks_.erase(victim);
+  }
   return masks_.emplace(std::move(canonical), std::move(mask)).first->second;
 }
 }  // namespace gufo::sampling

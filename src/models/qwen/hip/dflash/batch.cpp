@@ -5,16 +5,16 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <gufo/ext/experimental/hip_utils.hpp>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "src/core/hip/hip_utils.hpp"
+#include "src/families/qwen/kernels/dflash_kernels.hpp"
+#include "src/families/qwen/kernels/ops.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
-#include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
-#include "src/models/qwen/hip/ops.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -150,6 +150,7 @@ void QwenDFlashGpuExecutor::InjectTargetContextBatch(
       if (requests[previous].executor == executor)
         throw std::invalid_argument("DFlash2 context batch repeats a session");
     }
+    executor->CheckContinuation();
     counts[index] =
         static_cast<std::uint32_t>(request.features.size() / feature_width);
     offsets[index + 1] = offsets[index] + counts[index];
@@ -257,6 +258,11 @@ void QwenDFlashGpuExecutor::InjectTargetContextBatch(
 std::vector<speculative::DraftProposal>
 QwenDFlashGpuExecutor::ForwardBlockBatch(
     std::span<const QwenDFlashBlockRequest> requests) {
+  for (const auto& request : requests) {
+    if (request.executor)
+      request.executor->CheckContinuation();
+  }
+
   if (requests.empty() || requests.size() > 8 ||
       requests.front().executor == nullptr)
     throw std::invalid_argument(
@@ -305,7 +311,7 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
           request.temperature > 0.0F ? &proposal.candidate_ids : nullptr,
           request.temperature > 0.0F ? &proposal.candidate_probabilities
                                      : nullptr,
-          request.trace);
+          request.trace, request.sampler);
     }
     return proposals;
   }
@@ -489,7 +495,9 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
   emit("logits", scratch.logits, config.vocab_size, true);
   std::array<kernels::DFlashSelectorSequence, 8> sequences{};
   for (std::size_t index = 0; index < requests.size(); ++index)
-    sequences[index] = {counts[index], requests[index].temperature};
+    sequences[index] = {counts[index], requests[index].temperature,
+                        requests[index].executor->PrepareDraftSampling(
+                            requests[index].sampler, stream)};
   kernels::LaunchDFlashSelectorBatch(
       scratch.logits, scratch.selector, weights.selector_predecessor.data,
       weights.selector_successor.data, scratch.tokens, scratch.confidences,

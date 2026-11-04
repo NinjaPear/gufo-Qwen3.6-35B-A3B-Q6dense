@@ -143,13 +143,75 @@ void CheckConditionalProposals() {
              "joint p");
     }
 }
+
+void CheckGreedyAcceptance() {
+  // The #612 cycle: anchor 721, drafts 72048 and EOS, each reproduced by the
+  // target argmax of the preceding row.
+  constexpr int eos = 1;
+  const int32_t tokens[]{721, 72048, eos};
+  const int32_t tops[]{72048, eos, 48};
+  Expect(ds4_dspark_greedy_accept(tops, tokens, 3, -1) == 3,
+         "greedy acceptance takes every reproduced draft");
+  const uint32_t accepted = ds4_dspark_greedy_accept(tops, tokens, 3, eos);
+  Expect(accepted == 2 && tops[accepted - 1] == eos,
+         "an accepted stop token stays the frontier row's next anchor");
+  const int32_t rejected[]{5, eos, 48};
+  Expect(ds4_dspark_greedy_accept(rejected, tokens, 3, eos) == 1 &&
+             ds4_dspark_greedy_accept(tops, tokens, 1, eos) == 1,
+         "greedy acceptance always keeps the anchor");
+}
+
+void CheckSerialBackoff() {
+  Expect(!ds4_dspark_serial_backoff(3, 3, 0),
+         "cold policy gathers at least four probes");
+  Expect(ds4_dspark_serial_backoff(4, 4, 0),
+         "four rejected short drafts trigger bounded backoff");
+  Expect(!ds4_dspark_serial_backoff(4, 10, 4) &&
+             !ds4_dspark_serial_backoff(8, 20, 8),
+         "target anchors keep useful short drafts above break-even");
+  Expect(!ds4_dspark_serial_backoff(4, 8, 2),
+         "one marginal four-cycle window waits for more evidence");
+  Expect(ds4_dspark_serial_backoff(8, 16, 3),
+         "sustained unprofitable drafting backs off");
+  Expect(!ds4_dspark_serial_backoff(8, 40, 40),
+         "full-width acceptance remains profitable");
+}
 }  // namespace
 
+void CheckLogprobs() {
+  constexpr std::array<float, 3> logits{2, 1, -1};
+  for (const float temperature : {0.F, 0.8F}) {
+    SamplingConfig config;
+    config.temperature = temperature;
+    config.seed = 73;
+    DsparkSamplerBridge plain{SamplerState(config)};
+    config.logprobs = 2;
+    DsparkSamplerBridge observed{SamplerState(config)};
+    const auto* a = plain.hook();
+    const auto* b = observed.hook();
+    const auto token = b->sample(b->ctx, logits.data(), logits.size());
+    Expect(token == a->sample(a->ctx, logits.data(), logits.size()) &&
+               observed.rng_state() == plain.rng_state(),
+           "logprobs preserve DSpark draws");
+    const double z = std::log(std::exp(2.) + std::exp(1.) + std::exp(-1.));
+    Expect(observed.logprobs().size() == 1 &&
+               std::abs(observed.logprobs()[0].selected.logprob -
+                        (logits[token] - z)) < 1e-12,
+           "DSpark reports the raw target distribution");
+    b->observe(b->ctx, logits.data(), logits.size(), 2);
+    Expect(observed.logprobs().back().selected.token == 2,
+           "a previously drawn correction keeps its target probability");
+  }
+}
+
 int main() {
+  CheckLogprobs();
   const float nan = std::numeric_limits<float>::quiet_NaN();
   const float inf = std::numeric_limits<float>::infinity();
   const float extreme[]{-3e35F, -2e35F, -1e35F};
   const float mixed[]{nan, inf, -inf, -3e35F, -3e35F};
+  CheckGreedyAcceptance();
+  CheckSerialBackoff();
   Expect(ds4_sample_argmax(extreme, 3) == 2,
          "argmax covers finite float range");
   Expect(ds4_sample_argmax(mixed, 5) == 3,

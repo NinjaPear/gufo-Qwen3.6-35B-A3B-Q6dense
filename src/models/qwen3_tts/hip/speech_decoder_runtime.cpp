@@ -14,6 +14,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <gufo/ext/experimental/weight_upload.hpp>
+#include <gufo/ext/mapped_prefetch.hpp>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -25,7 +27,6 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/mapped_prefetch.hpp"
 #include "src/models/qwen3_tts/hip/speech_decoder_ops.hpp"
 #include "src/models/qwen3_tts/loader.hpp"
 
@@ -124,15 +125,19 @@ public:
   DeviceRegion(const DeviceRegion&) = delete;
   DeviceRegion& operator=(const DeviceRegion&) = delete;
 
-  bool Initialize(MappedRegion region, std::string* error) {
+  /// True when the GPU reads the file mapping itself (hipHostRegister
+  /// fallback): its host pages must then stay resident.
+  [[nodiscard]] bool host_mapped() const noexcept { return registered_; }
+
+  bool Initialize(MappedRegion region, const LoadResult& model,
+                  std::string* error) {
     host_ = region.data;
     size_ = region.size;
     payload_offset_ = region.payload_offset;
-    core::PrefaultMappedRange(host_, size_);
     // The supported gfx1151 APU shares physical memory with the CPU, but
     // hipMalloc uses coarse-grained pages that the GPU caches and streams
     // faster than host-registered safetensors pages.
-    if (TryCopy() || TryMap())
+    if (TryCopy(model) || TryMap())
       return true;
     SetError(error,
              "cannot make Qwen3-TTS speech-tokenizer weights GPU-visible");
@@ -150,6 +155,7 @@ public:
 
 private:
   bool TryMap() {
+    core::PrefaultMappedRange(host_, size_);
     if (hipHostRegister(const_cast<std::byte*>(host_), size_,
                         hipHostRegisterMapped | hipHostRegisterReadOnly) !=
         hipSuccess) {
@@ -166,7 +172,7 @@ private:
     return false;
   }
 
-  bool TryCopy() {
+  bool TryCopy(const LoadResult& model) {
     constexpr std::size_t kLoadAlignment = 16;
     const std::size_t shift =
         (kLoadAlignment - (payload_offset_ % kLoadAlignment)) % kLoadAlignment;
@@ -177,7 +183,16 @@ private:
     allocation_ = allocation;
     owns_device_ = true;
     device_ = static_cast<std::byte*>(allocation) + shift;
-    if (hipMemcpy(device_, host_, size_, hipMemcpyHostToDevice) == hipSuccess) {
+    // Never expose the file mapping to HIP's pageable-copy registration cache:
+    // its HMM restore work can repopulate pages after MADV_DONTNEED.
+    const bool copied = [&] {
+      std::string error;
+      auto upload =
+          gufo::hip::WeightUpload::Create(model.WeightUploadRegions(), &error);
+      return upload && upload->CopyMapped(host_, size_, device_, &error) &&
+             upload->Finish(&error);
+    }();
+    if (copied) {
       return true;
     }
     (void)hipFree(allocation_);
@@ -241,18 +256,30 @@ public:
   F32Gemm(const F32Gemm&) = delete;
   F32Gemm& operator=(const F32Gemm&) = delete;
 
+  void PrepareColumns(std::size_t columns) {
+    if (zero_beta_input_.size() < columns)
+      zero_beta_input_.Reset(columns);
+  }
+
   void Run(const float* weight, const float* input, float* output,
            std::size_t rows, std::size_t output_columns, std::size_t reduction,
            hipStream_t stream) {
     constexpr std::size_t max_int =
         static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max());
     if (rows == 0 || output_columns == 0 || reduction == 0 || rows > max_int ||
-        output_columns > max_int || reduction > max_int) {
+        output_columns > max_int || reduction > max_int ||
+        (rows == 1 && output_columns > zero_beta_input_.size())) {
       throw std::length_error("invalid Qwen3-TTS speech decoder GEMM shape");
     }
     RequireRocblas(rocblas_set_stream(handle_, stream), "rocblas_set_stream");
     constexpr float alpha = 1.0F;
     constexpr float beta = 0.0F;
+    // Keep single-frame tails on the same GEMM reduction as longer chunks.
+    // ROCm 10.1 redirects an in-place one-row GEMM to a GEMV with a different
+    // sum tree, changing audio when a stream or cached reference splits here.
+    // A separate C disables that shortcut; beta=0 leaves C unread. Reserve it
+    // with the weights so a streamed tail never allocates or synchronizes.
+    const float* accumulation = rows == 1 ? zero_beta_input_.get() : output;
     RequireRocblas(
         rocblas_gemm_ex(
             handle_, rocblas_operation_transpose, rocblas_operation_none,
@@ -260,7 +287,7 @@ public:
             static_cast<rocblas_int>(rows), static_cast<rocblas_int>(reduction),
             &alpha, weight, rocblas_datatype_f32_r,
             static_cast<rocblas_int>(reduction), input, rocblas_datatype_f32_r,
-            static_cast<rocblas_int>(reduction), &beta, output,
+            static_cast<rocblas_int>(reduction), &beta, accumulation,
             rocblas_datatype_f32_r, static_cast<rocblas_int>(output_columns),
             output, rocblas_datatype_f32_r,
             static_cast<rocblas_int>(output_columns), rocblas_datatype_f32_r,
@@ -270,6 +297,7 @@ public:
 
 private:
   rocblas_handle handle_{nullptr};
+  DeviceBuffer<float> zero_beta_input_;
 };
 
 struct LinearWeights {
@@ -462,13 +490,15 @@ struct SpeechDecoderHipRuntime::Impl {
     }
     RequireHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
                "hipStreamCreateWithFlags");
-    if (!speech_weights.Initialize(decoder_regions.front(), nullptr)) {
+    if (!speech_weights.Initialize(decoder_regions.front(), model, nullptr)) {
       throw std::runtime_error(
           "cannot initialize Qwen3-TTS speech weight mapping");
     }
     LoadWeights();
     RequireHip(hipStreamSynchronize(stream),
                "synchronize Qwen3-TTS speech weights");
+    if (!speech_weights.host_mapped())
+      model.ReleaseHostPages();
   }
 
   ~Impl() {
@@ -479,6 +509,7 @@ struct SpeechDecoderHipRuntime::Impl {
 
   LinearWeights LoadLinear(std::string_view prefix, std::size_t input_columns,
                            std::size_t output_columns, bool bias = true) {
+    gemm.PrepareColumns(output_columns);
     const TensorStore& store = *model.store;
     const std::array<std::uint64_t, 2> weight_shape{
         static_cast<std::uint64_t>(output_columns),
@@ -502,6 +533,8 @@ struct SpeechDecoderHipRuntime::Impl {
   ConvWeights LoadConv(std::string_view prefix, std::size_t input_channels,
                        std::size_t output_channels, std::size_t kernel,
                        std::size_t dilation = 1, bool depthwise = false) {
+    if (!depthwise)
+      gemm.PrepareColumns(output_channels);
     const TensorStore& store = *model.store;
     const std::array<std::uint64_t, 3> weight_shape{
         static_cast<std::uint64_t>(output_channels),
@@ -528,6 +561,7 @@ struct SpeechDecoderHipRuntime::Impl {
                                 std::size_t input_channels,
                                 std::size_t output_channels, std::size_t kernel,
                                 std::size_t stride) {
+    gemm.PrepareColumns(output_channels * kernel);
     const TensorStore& store = *model.store;
     const std::array<std::uint64_t, 3> weight_shape{
         static_cast<std::uint64_t>(input_channels),
@@ -689,6 +723,7 @@ struct SpeechDecoderHipRuntime::Impl {
   }
 
   LinearWeights LoadConvProjection(std::string_view prefix) {
+    gemm.PrepareColumns(512);
     const std::array<std::uint64_t, 3> shape{512, 256, 1};
     return {
         .weight = ResolveF32(*model.store, speech_weights,

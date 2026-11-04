@@ -21,7 +21,11 @@
 
 namespace {
 
-using gufo::tokenization::TokenId;
+using gufo::sampling::TokenId;
+
+// Scripted-executor sentinel: an id outside every scripted vocabulary,
+// mirroring the tokenizer's invalid-token marker without importing a model.
+constexpr TokenId kNoEndoftextTokenId = 0xFFFFFFFFU;
 
 void Expect(bool condition, std::string_view message) {
   if (!condition) {
@@ -32,9 +36,8 @@ void Expect(bool condition, std::string_view message) {
 class ScriptedTargetExecutor final
     : public gufo::speculative::ISpeculativeTargetExecutor {
 public:
-  ScriptedTargetExecutor(
-      std::vector<TokenId> generated_tokens, TokenId eos_id,
-      TokenId endoftext_id = gufo::tokenization::kInvalidTokenId)
+  ScriptedTargetExecutor(std::vector<TokenId> generated_tokens, TokenId eos_id,
+                         TokenId endoftext_id = kNoEndoftextTokenId)
       : generated_tokens_(std::move(generated_tokens)),
         eos_id_(eos_id),
         endoftext_id_(endoftext_id) {}
@@ -46,6 +49,7 @@ public:
     state_.clear();
     saved_state_.clear();
     restore_count_ = 0;
+    verification_active_ = false;
   }
 
   TokenId ForwardPromptBatch(std::span<const TokenId> prompt_tokens) override {
@@ -84,13 +88,17 @@ public:
     Expect(valid_context == state_.size(),
            "snapshot length must match committed target state");
     saved_state_ = state_;
+    verification_active_ = true;
   }
 
   void RestoreState() override {
     Expect(!saved_state_.empty(), "target state must be saved before restore");
     state_ = saved_state_;
+    verification_active_ = true;
     ++restore_count_;
   }
+
+  void FinishVerification() override { verification_active_ = false; }
 
   void SetPromptHiddenCapture(
       bool enabled, std::span<const std::uint32_t> target_layer_ids) override {
@@ -114,7 +122,9 @@ public:
     return "token";
   }
 
-  [[nodiscard]] const std::vector<TokenId>& State() const noexcept {
+  [[nodiscard]] const std::vector<TokenId>& State() const {
+    Expect(!verification_active_,
+           "committed target state must close its verification transaction");
     return state_;
   }
 
@@ -137,6 +147,7 @@ private:
   std::vector<TokenId> saved_state_;
   std::size_t restore_count_{0};
   bool hidden_capture_enabled_{false};
+  bool verification_active_{false};
 };
 
 class HiddenAwareDraftBackend final : public gufo::speculative::IDraftBackend {
@@ -495,8 +506,8 @@ private:
   std::uint32_t marker_{0};
 };
 
-gufo::models::GenerationOptions GenerationOptions(std::size_t max_tokens) {
-  gufo::models::GenerationOptions options;
+gufo::speculative::GenerationOptions GenerationOptions(std::size_t max_tokens) {
+  gufo::speculative::GenerationOptions options;
   options.max_new_tokens = max_tokens;
   return options;
 }
@@ -857,6 +868,51 @@ void TestGreedyPenaltiesRetainSpeculationAndHistory() {
            "greedy penalized verification consumes no random draws");
     Expect(std::ranges::equal(sampler.history(), sequence),
            "tentative history is committed only by the caller");
+  }
+}
+
+void TestGreedyReasoningBudgetForcesEndThroughVerification() {
+  // Token 2 stands for </think>. The target never predicts it and the draft
+  // never proposes it, so only the sampler's forced end can emit it.
+  for (const std::size_t reasoning_budget : {0U, 1U, 2U, 5U}) {
+    const std::vector<float> logits = {-INFINITY, 2.0F, 1.8F};
+    SampledTargetExecutor target(logits, true);
+    gufo::speculative::DraftProposal proposal{
+        .tokens = {1, 1},
+        .candidate_ids = {},
+        .candidate_probabilities = {},
+        .start_pos = 1,
+    };
+    gufo::speculative::SpeculativeOptions options;
+    options.max_draft_tokens = 2;
+    options.initial_draft_tokens = 2;
+    options.enable_adaptive_draft_length = false;
+    gufo::speculative::SpeculativeVerifier verifier(
+        target, std::make_unique<FixedSampledDraftBackend>(proposal), options);
+    const std::vector<TokenId> prompt{0};
+    const TokenId current = verifier.Prime(prompt);
+    std::vector<TokenId> sequence{0, current};
+    gufo::sampling::SamplingConfig config;
+    auto budget = std::make_shared<gufo::sampling::ReasoningBudget>();
+    budget->tokens = reasoning_budget;
+    budget->forced = {2};
+    budget->ends = {2};
+    config.reasoning_budget = budget;
+    gufo::sampling::SamplerState sampler(config);
+    auto reference = sampler;
+    const auto result =
+        verifier.VerifyStep(sequence, 1, current, 99, 3, sampler);
+    Expect(result.draft_count == 2, "a greedy reasoning budget keeps drafting");
+    Expect(!result.emitted_tokens.empty(),
+           "budgeted verification emits at least one token");
+    for (const auto token : result.emitted_tokens) {
+      Expect(token == reference.Sample(logits),
+             "every budgeted speculative token equals sequential AR");
+      reference.Accept(token);
+    }
+    const bool forced = reasoning_budget < 3;
+    Expect(forced == (result.emitted_tokens.back() == 2),
+           "the reasoning end is emitted exactly when the budget is reached");
   }
 }
 
@@ -1425,7 +1481,101 @@ void TestPersistentVerifierSnapshotRoundTrip() {
 
 }  // namespace
 
+void TestSpeculativeLogprobs() {
+  using namespace gufo::speculative;
+  bool saw_accept = false, saw_reject = false, saw_bonus = false;
+  for (const int mode : {0, 1, 2}) {
+    for (const float temperature : {0.F, 0.7F}) {
+      for (const unsigned budget : {1U, 3U}) {
+        for (const std::int64_t seed : {3, 17, 101}) {
+          const auto run = [&](bool collect) {
+            SampledTargetExecutor target({-INFINITY, 0.4F, 0.2F}, true);
+            SpeculativeOptions options;
+            options.max_draft_tokens = options.initial_draft_tokens = 2;
+            options.enable_adaptive_draft_length = false;
+            options.use_batched_verification = mode != 0;
+            SpeculativeVerifier verifier(
+                target, std::make_unique<BinarySampledDraftBackend>(0.1F, 0.9F),
+                options);
+            const std::vector<TokenId> prompt{0};
+            const auto current = verifier.Prime(prompt);
+            const std::vector<TokenId> sequence{0, current};
+            gufo::sampling::SamplingConfig config;
+            config.temperature = temperature;
+            config.seed = seed;
+            if (collect)
+              config.logprobs = 2;
+            gufo::sampling::SamplerState sampler(config, sequence);
+            SpeculativeVerifier::StepRequest request{
+                verifier, sequence, 1, current, 99, budget, sampler};
+            SpeculativeVerifier::StepResult result;
+            if (mode == 2) {
+              SampledTargetExecutor peer_target({0.F, -INFINITY, -INFINITY},
+                                                true);
+              SpeculativeVerifier peer(
+                  peer_target,
+                  std::make_unique<BinarySampledDraftBackend>(0.1F, 0.9F),
+                  options);
+              const auto peer_current = peer.Prime(prompt);
+              const std::vector<TokenId> peer_sequence{0, peer_current};
+              gufo::sampling::SamplerState peer_sampler(config, peer_sequence);
+              const std::array requests{
+                  request, SpeculativeVerifier::StepRequest{
+                               peer, peer_sequence, 1, peer_current, 99, budget,
+                               peer_sampler}};
+              auto results = SpeculativeVerifier::VerifyBatch(requests);
+              result = std::move(results.front());
+              if (collect)
+                for (const auto& values : results.back().logprobs)
+                  Expect(values.selected.token == 0 &&
+                             values.selected.logprob == 0,
+                         "concurrent target rows remain request-owned");
+              Expect(target.LastBatchSize() == 2 ||
+                         peer_target.LastBatchSize() == 2,
+                     "logprob fixture must execute concurrent verification");
+            } else {
+              result = verifier.VerifyStep(sequence, 1, current, 99, budget,
+                                           sampler);
+            }
+            if (collect) {
+              saw_accept |= result.accepted_count > 0;
+              saw_reject |= result.accepted_count < result.draft_count;
+              saw_bonus |= result.draft_count > 0 &&
+                           result.accepted_count == result.draft_count;
+              Expect(result.logprobs.size() == result.emitted_tokens.size(),
+                     "one logprob per accepted or replacement token");
+              const double z =
+                  std::log(std::exp(double(0.4F)) + std::exp(double(0.2F)));
+              for (std::size_t i = 0; i < result.logprobs.size(); ++i) {
+                const auto& value = result.logprobs[i].selected;
+                Expect(value.token == result.emitted_tokens[i],
+                       "speculative metadata follows token order");
+                const double expected =
+                    (value.token == 1 ? double(0.4F) : double(0.2F)) - z;
+                Expect(std::abs(value.logprob - expected) < 1e-12,
+                       "target raw probability, not draft or residual "
+                       "probability");
+              }
+            } else {
+              Expect(result.logprobs.empty(),
+                     "disabled speculative observation is empty");
+            }
+            return std::tuple(result.emitted_tokens, sampler.rng_state(),
+                              result.accepted_count);
+          };
+          Expect(run(false) == run(true),
+                 "logprobs preserve speculative tokens, RNG and acceptance");
+        }
+      }
+    }
+  }
+  Expect(saw_accept && saw_reject && saw_bonus,
+         "logprob fixtures must cover acceptance, rejection and target bonus "
+         "tokens");
+}
+
 int main() {
+  TestSpeculativeLogprobs();
   TestSpeculativeDraftBackendInterface();
   TestSpeculativeStats();
   TestStopTokensFollowTargetVocabulary();
@@ -1441,6 +1591,7 @@ int main() {
   TestFilteredSampledSpeculationMatchesTargetDistribution();
   TestFilteredSampledSpeculationMatchesTargetDistribution(true);
   TestGreedyPenaltiesRetainSpeculationAndHistory();
+  TestGreedyReasoningBudgetForcesEndThroughVerification();
   TestMalformedProposalDoesNotAdvanceTarget();
   TestStopAndBudgetKeepExactFrontier();
   TestConcurrentTargetOnlySteps();

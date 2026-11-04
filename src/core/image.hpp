@@ -28,8 +28,10 @@ struct Image {
     const std::filesystem::path& path);
 /// Shared across all messages of one HTTP request.
 struct ImageReadBudget {
+  /// False when the loaded model takes no image input; reading is refused
+  /// before any data URL is decoded or any URL is fetched.
+  bool accepts_images{true};
   std::size_t remaining_bytes{kMaxEncodedImageBytes};
-  std::size_t remaining_images{16};
   std::chrono::steady_clock::time_point deadline{
       std::chrono::steady_clock::now() + std::chrono::seconds(15)};
 };
@@ -42,6 +44,14 @@ struct ImageReadBudget {
 [[nodiscard]] std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
                                                      ImageReadBudget& budget);
 [[nodiscard]] std::vector<std::uint8_t> ReadImageUrl(std::string_view url);
+/// Audio uses the same bounded reader and destination checks. Supports raw
+/// base64, audio data URLs and public HTTPS. The decoder checks the bytes.
+[[nodiscard]] std::vector<std::uint8_t> ReadAudioUrl(std::string_view url,
+                                                     ImageReadBudget& budget);
+
+/// Video uses the same shared byte/deadline and public HTTPS protections.
+[[nodiscard]] std::vector<std::uint8_t> ReadVideoUrl(std::string_view url,
+                                                     ImageReadBudget& budget);
 
 }  // namespace gufo::core
 #endif

@@ -11,8 +11,9 @@
 #include <vector>
 
 #include "src/cli/serve/inference_backend.hpp"
-#include "src/models/qwen/chat_template.hpp"
+#include "src/families/qwen/text/chat_template.hpp"
 #include "src/models/qwen36_35b_a3b/engine.hpp"
+#include "src/models/qwen36_35b_a3b/runner.hpp"
 #include "tests/models/qwen27b/sampling_cases.hpp"
 
 namespace q36 = gufo::models::qwen36_35b_a3b;
@@ -644,10 +645,13 @@ void CheckServingSampling(const std::shared_ptr<q36::Model>& model) {
   using Backend = server::InferenceBackend;
   Backend ar, mtp;
   std::string error;
-  Require(ar.load(model, &error, 6145, 2), error);
+  Require(ar.load(q36::CreateQwen36TextRunner(model, 6145), &error, 2),
+          error);
   server::TextSpeculativeConfig options;
   options.backend = server::TextSpeculativeBackend::kMtp;
-  Require(mtp.load(model, &error, 6145, 2, {}, {}, options), error);
+  Require(mtp.load(q36::CreateQwen36TextRunner(model, 6145, options),
+                   &error, 2),
+          error);
   struct Reference {
     gufo::test::SamplingCase test;
     std::string prompt;

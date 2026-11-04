@@ -8,6 +8,7 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -26,8 +27,51 @@ def free_port() -> int:
 DROP_CACHES = "sync; echo 3 > /proc/sys/vm/drop_caches"
 
 
+def _purge_windows_file_cache() -> bool:
+    """Empty the Windows file cache: trim working sets, then purge standby.
+
+    Needs an elevated process (SeProfileSingleProcessPrivilege). Purging the
+    standby list alone leaves pages that are still in the system cache.
+    """
+    from ctypes import wintypes
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    kernel32 = ctypes.WinDLL("kernel32")
+    advapi.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+    class Luid(ctypes.Structure):
+        _fields_ = [("low", wintypes.DWORD), ("high", wintypes.LONG)]
+
+    class Privileges(ctypes.Structure):
+        _fields_ = [("count", wintypes.DWORD), ("luid", Luid), ("attributes", wintypes.DWORD)]
+
+    token = wintypes.HANDLE()
+    if not advapi.OpenProcessToken(kernel32.GetCurrentProcess(), 0x28, ctypes.byref(token)):
+        return False
+    privileges = Privileges(1, Luid(), 2)  # SE_PRIVILEGE_ENABLED
+    advapi.LookupPrivilegeValueW(None, "SeProfileSingleProcessPrivilege", ctypes.byref(privileges.luid))
+    advapi.AdjustTokenPrivileges(token, False, ctypes.byref(privileges), 0, None, None)
+    if ctypes.get_last_error() != 0:  # ERROR_NOT_ALL_ASSIGNED: not elevated
+        return False
+    for command in (2, 4):  # MemoryEmptyWorkingSets, MemoryPurgeStandbyList
+        value = ctypes.c_int(command)
+        if ntdll.NtSetSystemInformation(80, ctypes.byref(value), ctypes.sizeof(value)) != 0:
+            return False
+    return True
+
+
 def drop_file_cache(command: str | None = None) -> None:
     """Drop the page cache so the next launch measures a cold file cache."""
+    if command is None and sys.platform == "win32":
+        if _purge_windows_file_cache():
+            return
+        raise SystemExit(
+            "cold-file-cache loading on Windows needs an elevated shell to purge "
+            "the standby list; pass --drop-caches with a command that does it, "
+            "or skip the loading table"
+        )
     candidates = [command] if command else [
         DROP_CACHES,
         f"sudo -n sh -c '{DROP_CACHES}'",
@@ -59,7 +103,25 @@ class HipMemory:
     @classmethod
     def for_binary(cls, gufo_binary: Path) -> "HipMemory | None":
         """Resolve libamdhip64 the way the Gufo binary links it."""
-        completed = subprocess.run(["ldd", str(gufo_binary)], capture_output=True, text=True)
+        executable = gufo_binary.resolve()
+        if sys.platform == "win32":
+            # Under WDDM, hipMemGetInfo counts only the calling process's
+            # allocations: beside a server holding 35 GB it reports 0.15 GiB
+            # used. An outside sampler cannot measure the server there.
+            return None
+        # Nix's makeWrapper keeps the production ELF beside its launch script.
+        # ldd cannot inspect the script that selects Gufo's patched runtime.
+        for candidate in (executable, executable.with_name(f".{executable.name}-wrapped")):
+            try:
+                with candidate.open("rb") as binary:
+                    if binary.read(4) == b"\x7fELF":
+                        executable = candidate
+                        break
+            except OSError:
+                pass
+        else:
+            return None
+        completed = subprocess.run(["ldd", str(executable)], capture_output=True, text=True)
         for line in completed.stdout.splitlines():
             if "libamdhip64" in line and "=>" in line:
                 path = Path(line.split("=>", 1)[1].split()[0])
@@ -99,31 +161,51 @@ class Server:
         if self.env:
             env.update(self.env)
         started = time.perf_counter()
+        # Own session (POSIX) or process group (Windows), so the terminal's
+        # interrupt never reaches the server and stop() can signal it alone.
+        group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
+                 else {"start_new_session": True})
         self.process = subprocess.Popen(
-            self.command, stdout=log, stderr=subprocess.STDOUT, env=env,
-            start_new_session=True,
+            self.command, stdout=log, stderr=subprocess.STDOUT, env=env, **group,
         )
-        deadline = started + timeout
-        url = self.base_url + self.readiness
-        while time.perf_counter() < deadline:
-            if self.process.poll() is not None:
-                self.failure_exit_code = self.process.returncode
-                raise RuntimeError(
-                    f"server exited with {self.process.returncode} before readiness; see {self.log_path}"
-                )
-            try:
-                with urllib.request.urlopen(url, timeout=5) as response:
-                    if response.status == 200:
-                        self.ready_seconds = time.perf_counter() - started
-                        return self
-            except (urllib.error.URLError, urllib.error.HTTPError, ConnectionError, TimeoutError):
-                pass
-            time.sleep(0.05)
-        self.stop()
-        raise RuntimeError(f"server not ready within {timeout:.0f} s; see {self.log_path}")
+        try:
+            deadline = started + timeout
+            url = self.base_url + self.readiness
+            while time.perf_counter() < deadline:
+                if self.process.poll() is not None:
+                    self.failure_exit_code = self.process.returncode
+                    raise RuntimeError(
+                        f"server exited with {self.process.returncode} before readiness; see {self.log_path}"
+                    )
+                try:
+                    with urllib.request.urlopen(url, timeout=5) as response:
+                        if response.status == 200:
+                            self.ready_seconds = time.perf_counter() - started
+                            return self
+                except (urllib.error.URLError, urllib.error.HTTPError, ConnectionError, TimeoutError):
+                    pass
+                time.sleep(0.05)
+            self.stop()
+            raise RuntimeError(f"server not ready within {timeout:.0f} s; see {self.log_path}")
+        except BaseException:
+            # Ctrl-C included: the server runs in its own session, so the
+            # terminal's SIGINT never reaches it, and __exit__ never runs when
+            # __enter__ raises.
+            self.stop()
+            raise
 
     def stop(self) -> None:
         if self.process is None or self.process.poll() is not None:
+            return
+        if sys.platform == "win32":
+            # CTRL_BREAK reaches the new process group only; Gufo and
+            # llama-server shut down gracefully on it.
+            self.process.send_signal(signal.CTRL_BREAK_EVENT)
+            try:
+                self.process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
             return
         os.killpg(self.process.pid, signal.SIGTERM)
         try:

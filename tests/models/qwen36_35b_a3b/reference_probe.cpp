@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
-#include "src/models/qwen/tokenizer.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/qwen36_35b_a3b/reference.hpp"
 #include "src/models/qwen36_35b_a3b/weights.hpp"
 

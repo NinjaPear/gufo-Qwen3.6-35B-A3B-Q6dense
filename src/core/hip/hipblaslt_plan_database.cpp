@@ -1,12 +1,7 @@
 #include "src/core/hip/detail/hipblaslt_plan_database.hpp"
 
-#include <fcntl.h>
-#include <sys/file.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -17,23 +12,14 @@
 #include <unordered_set>
 #include <utility>
 
+#include "src/core/platform/publish.hpp"
+
 namespace gufo::hip::detail {
 namespace {
 
 struct DatabasePublication {
-  int lock{-1};
-  int file{-1};
-  std::filesystem::path temporary;
-  ~DatabasePublication() {
-    if (file >= 0)
-      ::close(file);
-    if (!temporary.empty()) {
-      std::error_code ignored;
-      std::filesystem::remove(temporary, ignored);
-    }
-    if (lock >= 0)
-      ::close(lock);
-  }
+  platform::FileLock lock;
+  platform::AtomicPublishedFile temporary;
 };
 
 constexpr std::array<char, 8> kMagic = {'S', 'T', 'R', 'I',
@@ -280,9 +266,9 @@ bool SaveHipblasLtPlanDatabase(const std::filesystem::path& path,
 
   DatabasePublication publication;
   const auto lock_path = path.string() + ".lock";
-  publication.lock =
-      ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-  if (publication.lock < 0 || ::flock(publication.lock, LOCK_EX) != 0) {
+  try {
+    publication.lock = platform::FileLock::Acquire(lock_path);
+  } catch (const std::system_error&) {
     if (error)
       *error = "failed to lock plan database";
     return false;
@@ -299,14 +285,10 @@ bool SaveHipblasLtPlanDatabase(const std::filesystem::path& path,
         merged.records.push_back(record);
     }
   }
-  std::string temporary = path.string() + ".tmp.XXXXXX";
-  publication.file = ::mkstemp(temporary.data());
-  if (publication.file < 0) {
-    if (error)
-      *error = "failed to create temporary plan database";
+  publication.temporary = platform::AtomicPublishedFile::Create(path, error);
+  if (!publication.temporary.valid()) {
     return false;
   }
-  publication.temporary = temporary;
   std::ostringstream output(std::ios::binary | std::ios::out);
 
   output.write(kMagic.data(), static_cast<std::streamsize>(kMagic.size()));
@@ -334,31 +316,16 @@ bool SaveHipblasLtPlanDatabase(const std::filesystem::path& path,
     return false;
   }
   const auto bytes = std::move(output).str();
-  std::size_t written = 0;
-  while (written < bytes.size()) {
-    const auto count = ::write(publication.file, bytes.data() + written,
-                               bytes.size() - written);
-    if (count < 0 && errno == EINTR)
-      continue;
-    if (count <= 0) {
-      if (error)
-        *error = "failed to write plan database";
-      return false;
-    }
-    written += static_cast<std::size_t>(count);
-  }
-  if (::fsync(publication.file) != 0) {
-    if (error)
-      *error = "failed to flush plan database";
+  if (!publication.temporary.Write(bytes.data(), bytes.size(), error)) {
+    if (error != nullptr)
+      *error = "failed to write plan database: " + *error;
     return false;
   }
-  std::filesystem::rename(publication.temporary, path, filesystem_error);
-  if (filesystem_error) {
-    if (error)
-      *error = "failed to replace plan database";
+  if (!publication.temporary.Commit(path, error)) {
+    if (error != nullptr)
+      *error = "failed to replace plan database: " + *error;
     return false;
   }
-  publication.temporary.clear();
   return true;
 }
 

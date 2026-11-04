@@ -3,7 +3,7 @@
 
 /* The process-wide logger lets the loading lines below honor --log-level
  * instead of writing straight to stderr. */
-#include "src/cli/serve/logging.hpp"
+#include <gufo/ext/host.hpp>
 
 /* Vendored llama.cpp quantized-matmul tier. It owns the routed IQ2 gate/up and
  * dense Q8 prefill kernels; see mmq/VENDOR.md. */
@@ -31,20 +31,17 @@ extern "C" int ds4_hip_q8_fold_take_q81(
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
-#include <fcntl.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
 
 #include "resident_api.h"
-#include "src/core/hip/weight_upload.hpp"
+#include <gufo/ext/experimental/managed_alloc.hpp>
+#include <gufo/ext/experimental/weight_upload.hpp>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846

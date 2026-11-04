@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -22,6 +23,8 @@ class VideoJobService;
 class TtsService;
 class AsrService;
 class ImageService;
+class EmbeddingService;
+struct DecisionService;
 class WebSocket;
 
 struct HttpRequest {
@@ -79,6 +82,10 @@ struct HttpResponse {
   };
   std::shared_ptr<StreamLog> stream_log{};
   std::function<void(WebSocket&)> websocket{};
+  /// Text streams commit headers when generation starts or has queued for a
+  /// bounded time, so failures before that return a real 5xx while
+  /// keepalives still cover prefill and queue waits.
+  bool defer_stream_headers{false};
 };
 
 using Handler =
@@ -87,9 +94,17 @@ using Handler =
 struct HttpServerOptions {
   std::size_t max_request_body_bytes{static_cast<std::size_t>(8) * 1024 * 1024};
   std::size_t max_connections{16};
-  std::string api_key;
   std::chrono::milliseconds sse_heartbeat_interval{std::chrono::seconds(15)};
+  /// Called once, on the listener or a request thread, when the text backend or
+  /// the embedding service reports a lost device. Health, readiness and
+  /// generation answer 503 `device_lost` from then on; the hook decides how the
+  /// process exits.
+  std::function<void()> on_device_lost{};
 };
+
+/// True for a numeric IPv4 or IPv6 literal `HttpServer` can bind. Host names
+/// are not resolved; IPv6 link-local literals may carry a `%<interface>` scope.
+bool IsListenAddress(const std::string& host);
 
 /// Minimal bounded HTTP/1.1 server for trusted-LAN model serving.
 class HttpServer {
@@ -100,7 +115,9 @@ public:
              std::shared_ptr<TtsService> tts = nullptr,
              std::shared_ptr<AsrService> asr = nullptr,
              HttpServerOptions options = {},
-             std::shared_ptr<ImageService> images = nullptr);
+             std::shared_ptr<ImageService> images = nullptr,
+             std::shared_ptr<EmbeddingService> embeddings = nullptr,
+             std::shared_ptr<DecisionService> decisions = nullptr);
   ~HttpServer();
 
   HttpServer(const HttpServer&) = delete;
@@ -125,7 +142,8 @@ private:
   struct ConnectionWorker;
 
   HttpResponse handle_request(const HttpRequest& req);
-  void handle_connection(int client_fd);
+  bool device_lost();
+  void handle_connection(int client_fd, std::atomic<bool>& response_sent);
   void reap_workers();
   void register_routes();
 
@@ -136,45 +154,69 @@ private:
   std::shared_ptr<TtsService> tts_;
   std::shared_ptr<AsrService> asr_;
   std::shared_ptr<ImageService> images_;
+  std::shared_ptr<EmbeddingService> embeddings_;
+  std::shared_ptr<DecisionService> decisions_;
   HttpServerOptions options_;
-  std::string api_key_hash_;
   int listen_fd_ = -1;
   std::atomic<bool> stopped_{false};
+  std::atomic<bool> device_lost_reported_{false};
   std::mutex workers_mutex_;
   std::vector<std::unique_ptr<ConnectionWorker>> workers_;
   std::vector<std::pair<std::pair<std::string, std::string>, Handler>> routes_;
 };
 
-/// Scheduled requests already counted tokens live. Other backends contribute
-/// at completion; both update the last-request speed gauges.
-inline void RecordServerMetrics(const TextGenerationBackend::Result& result) {
-  if (!result.token_metrics_recorded) {
-    // Older backends may only report prompt/cache totals. Infer their completed
-    // uncached prompt, but never infer work for a partially cancelled request.
-    const auto prompt_tokens =
-        result.prefill_tokens > 0 || result.cancelled
-            ? result.prefill_tokens
-            : result.prompt_tokens -
-                  std::min(result.prompt_tokens, result.cached_prompt_tokens);
-    detail::TotalPromptTokens().fetch_add(prompt_tokens,
-                                          std::memory_order_relaxed);
-    detail::TotalGenTokens().fetch_add(result.completion_tokens,
-                                       std::memory_order_relaxed);
-  }
-  const double prompt_per_second = PrefillTokensPerSecond(result);
-  const double tok_per_sec =
-      (result.decode_ms > 0.0 && result.completion_tokens > 0)
-          ? (static_cast<double>(result.completion_tokens) /
-             (result.decode_ms / 1000.0))
-          : 0.0;
+/// Holds the listen port while a model loads and answers every request with
+/// llama-server's loading reply: 503 `Loading model`, `/health` included. A
+/// poller can tell a loading server from a dead one, and a client that treats
+/// a 200 health check as readiness (llama-swap, the functional runner) keeps
+/// waiting instead of sending work to a server that cannot serve it.
+///
+/// Best effort: when the address cannot be bound, or for port 0, nothing
+/// listens and the caller proceeds exactly as without it. stop() closes the
+/// socket so `HttpServer::start` can bind the same address.
+class LoadingResponder {
+public:
+  LoadingResponder(const std::string& host, int port);
+  ~LoadingResponder();
 
-  if (prompt_per_second > 0.0) {
-    detail::LastPromptSpeed().store(prompt_per_second,
-                                    std::memory_order_relaxed);
-  }
-  if (tok_per_sec > 0.0) {
-    detail::LastGenSpeed().store(tok_per_sec, std::memory_order_relaxed);
-  }
+  LoadingResponder(const LoadingResponder&) = delete;
+  LoadingResponder& operator=(const LoadingResponder&) = delete;
+  LoadingResponder(LoadingResponder&&) = delete;
+  LoadingResponder& operator=(LoadingResponder&&) = delete;
+
+  /// True while the responder owns the listen socket.
+  [[nodiscard]] bool listening() const noexcept { return listen_fd_ >= 0; }
+
+  /// Stops answering and releases the port. Returns within one poll interval
+  /// plus the bounded waits for a request that is still arriving and for the
+  /// answered client to close.
+  void stop();
+
+private:
+  void serve();
+
+  int listen_fd_ = -1;
+  std::atomic<bool> stopped_{false};
+  std::thread thread_;
+};
+
+/// Scheduled requests are recorded by the scheduler when they finish. Other
+/// backends contribute here, at completion.
+inline void RecordServerMetrics(const TextGenerationBackend::Result& result) {
+  if (result.token_metrics_recorded)
+    return;
+  // Older backends may only report prompt/cache totals. Infer their completed
+  // uncached prompt, but never infer work for a partially cancelled request.
+  const auto prompt_tokens =
+      result.prefill_tokens > 0 || result.cancelled
+          ? result.prefill_tokens
+          : result.prompt_tokens -
+                std::min(result.prompt_tokens, result.cached_prompt_tokens);
+  detail::TotalPromptTokens().fetch_add(prompt_tokens,
+                                        std::memory_order_relaxed);
+  detail::TotalGenTokens().fetch_add(result.completion_tokens,
+                                     std::memory_order_relaxed);
+  RecordRequestMetrics(result);
 }
 
 }  // namespace gufo::server

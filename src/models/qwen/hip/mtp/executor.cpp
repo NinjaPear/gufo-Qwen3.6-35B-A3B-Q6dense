@@ -7,10 +7,10 @@
 #include <utility>
 #include <vector>
 
-#include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/families/qwen/hip_common/attention_policy.hpp"
+#include "src/families/qwen/kernels/ops.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
-#include "src/models/qwen/hip/ops.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -142,6 +142,14 @@ void QwenMtpGpuExecutor::Free() noexcept {
 void QwenMtpGpuExecutor::Reset() noexcept {
   // Attention only reads the valid prefix; new rows overwrite stale KV.
   next_position_ = 0;
+}
+
+void QwenMtpGpuExecutor::Synchronize() {
+  const auto status = hipStreamSynchronize(stream_);
+  if (status != hipSuccess) {
+    throw std::runtime_error(std::string("MTP stream synchronize failed: ") +
+                             hipGetErrorString(status));
+  }
 }
 
 void QwenMtpGpuExecutor::Rewind(std::uint32_t position) {

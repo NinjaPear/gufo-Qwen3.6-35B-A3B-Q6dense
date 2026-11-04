@@ -1,21 +1,20 @@
 #include "src/core/hip/weight_upload.hpp"
 
-#include <fcntl.h>
 #include <hip/hip_runtime.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <condition_variable>
-#include <cstring>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include "src/core/hip/host_allocations.hpp"
+#include "src/core/platform/fs.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -24,22 +23,23 @@ constexpr std::size_t kAlignment = 4096;
 constexpr std::size_t kChunkBytes = 16ULL << 20;
 constexpr std::size_t kReaders = 16;
 
-bool ReadFully(int fd, void* buffer, std::uint64_t offset, std::size_t length,
-               std::size_t required) {
+bool ReadFully(platform::PlatformFile fd, void* buffer, std::uint64_t offset,
+               std::size_t length, std::size_t required, std::error_code& ec) {
   std::size_t got = 0;
   while (got < required) {
-    const auto n = ::pread(fd, static_cast<char*>(buffer) + got, length - got,
-                           static_cast<off_t>(offset + got));
-    if (n < 0 && errno == EINTR) {
+    const auto n = platform::ReadAt(
+        fd, offset + got, static_cast<char*>(buffer) + got, length - got, ec);
+    if (n == 0 && ec == std::errc::interrupted) {
       continue;
     }
-    if (n <= 0) {
-      if (n == 0) {
-        errno = EIO;
+    if (n == 0) {
+      if (!ec) {
+        // End of file before the required bytes.
+        ec = std::make_error_code(std::errc::io_error);
       }
       return false;
     }
-    got += static_cast<std::size_t>(n);
+    got += n;
   }
   return true;
 }
@@ -48,13 +48,18 @@ bool ReadFully(int fd, void* buffer, std::uint64_t offset, std::size_t length,
 
 struct WeightUpload::State {
   struct Shard {
-    int fd{-1};
-    int direct_fd{-1};
+    platform::PlatformFile fd{platform::kInvalidFile};
     std::uint64_t size{0};
+    const void* mapping{nullptr};
   };
   struct Slot {
     void* buffer{nullptr};
     hipStream_t stream{nullptr};
+    // One unbuffered description per reader, reopened when the reader moves
+    // to another shard: independent file objects keep concurrent readers off
+    // one synchronous handle.
+    platform::PlatformFile direct{platform::kInvalidFile};
+    std::uint32_t direct_shard{0xffffffffu};
   };
   struct Task {
     std::uint32_t shard;
@@ -64,6 +69,7 @@ struct WeightUpload::State {
   };
 
   std::vector<Shard> shards;
+  HostAllocations host_allocations;
   std::array<Slot, kReaders> slots{};
   std::vector<std::jthread> readers;
   std::mutex mutex;
@@ -83,20 +89,13 @@ struct WeightUpload::State {
     // caller's destinations can be freed, even on a failed upload.
     readers.clear();
     for (auto& slot : slots) {
+      platform::CloseFile(slot.direct);
       if (slot.stream != nullptr) {
         (void)hipStreamDestroy(slot.stream);
       }
-      if (slot.buffer != nullptr) {
-        (void)hipHostFree(slot.buffer);
-      }
     }
     for (const auto& shard : shards) {
-      if (shard.fd >= 0) {
-        ::close(shard.fd);
-      }
-      if (shard.direct_fd >= 0) {
-        ::close(shard.direct_fd);
-      }
+      platform::CloseFile(shard.fd);
     }
   }
 
@@ -120,28 +119,41 @@ struct WeightUpload::State {
   std::string Transfer(const Task& task, Slot& slot) {
     const auto& shard = shards[task.shard];
     const void* payload = slot.buffer;
+    std::error_code ec;
     bool read = false;
-    if (shard.direct_fd >= 0) {
+    // Each reader keeps an unbuffered description of the shard it reads, so
+    // concurrent readers never queue on one synchronous handle: Windows
+    // serializes synchronous I/O per file object, not per process.
+    if (slot.direct_shard != task.shard) {
+      platform::CloseFile(slot.direct);
+      slot.direct = platform::kInvalidFile;
+      slot.direct_shard = task.shard;
+    }
+    if (!platform::FileValid(slot.direct)) {
+      slot.direct = platform::ReopenUnbuffered(shard.fd);
+    }
+    if (platform::FileValid(slot.direct)) {
       const auto begin = task.offset & ~(kAlignment - 1);
       const auto skip = static_cast<std::size_t>(task.offset - begin);
       const auto length =
           (skip + task.size + kAlignment - 1) & ~(kAlignment - 1);
-      read = ReadFully(shard.direct_fd, slot.buffer, begin, length,
-                       skip + task.size);
+      read = ReadFully(slot.direct, slot.buffer, begin, length,
+                       skip + task.size, ec);
       payload = static_cast<const char*>(slot.buffer) + skip;
-      if (!read && errno != EINVAL && errno != EOPNOTSUPP) {
-        return "shard read failed: " + std::string(std::strerror(errno));
-      }
     }
     if (!read) {
-      // Some filesystems accept O_DIRECT at open but reject aligned reads.
-      if (!ReadFully(shard.fd, slot.buffer, task.offset, task.size,
-                     task.size)) {
-        return "shard read failed: " + std::string(std::strerror(errno));
+      // A failed unbuffered read retries through the buffered descriptor,
+      // which reports its own error. Some filesystems accept unbuffered opens
+      // but reject aligned reads, and Windows refuses an unbuffered read with
+      // ERROR_NO_SYSTEM_RESOURCES when it cannot lock the pages in memory.
+      ec = {};
+      if (!ReadFully(shard.fd, slot.buffer, task.offset, task.size, task.size,
+                     ec)) {
+        return "shard read failed: " + ec.message();
       }
       payload = slot.buffer;
-      (void)::posix_fadvise(shard.fd, static_cast<off_t>(task.offset),
-                            static_cast<off_t>(task.size), POSIX_FADV_DONTNEED);
+      platform::Advise(shard.fd, platform::AdviseHint::kDontNeed, task.offset,
+                       task.size);
     }
     auto status = hipMemcpyAsync(task.destination, payload, task.size,
                                  hipMemcpyHostToDevice, slot.stream);
@@ -189,22 +201,22 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
   auto& s = *uploader->state_;
   for (const auto& region : regions) {
     auto& shard = s.shards.emplace_back();
-    shard.fd = ::fcntl(region.file_descriptor, F_DUPFD_CLOEXEC, 0);
-    struct stat info{};
-    if (shard.fd < 0 || ::fstat(shard.fd, &info) != 0 || info.st_size <= 0 ||
-        static_cast<std::uint64_t>(info.st_size) != region.size) {
+    shard.fd = platform::DuplicateFile(region.file_descriptor);
+    std::error_code ec;
+    platform::FileInfo info{};
+    if (!platform::FileValid(shard.fd) ||
+        !platform::Stat(shard.fd, &info, ec) || info.size == 0 ||
+        info.size != region.size) {
       s.Fail("cannot read the mapped GGUF shard");
       s.Status(error);
       return nullptr;
     }
-    shard.size = static_cast<std::uint64_t>(info.st_size);
-    // Reopening the retained descriptor creates an independent O_DIRECT file
-    // description without resolving the original, replaceable pathname.
-    const auto path = "/proc/self/fd/" + std::to_string(shard.fd);
-    shard.direct_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+    shard.size = info.size;
+    shard.mapping = region.data;
   }
   for (auto& slot : s.slots) {
-    if (hipHostMalloc(&slot.buffer, kChunkBytes + kAlignment) != hipSuccess ||
+    if (s.host_allocations.Allocate(&slot.buffer, kChunkBytes + kAlignment) !=
+            hipSuccess ||
         hipStreamCreateWithFlags(&slot.stream, hipStreamNonBlocking) !=
             hipSuccess) {
       s.Fail("weight upload staging allocation failed");
@@ -249,6 +261,23 @@ bool WeightUpload::Copy(std::uint32_t shard, std::uint64_t offset,
     s.changed.notify_all();
   }
   return s.Status(error);
+}
+
+bool WeightUpload::CopyMapped(const void* source, std::size_t size,
+                              void* device, std::string* error) {
+  const auto address = reinterpret_cast<std::uintptr_t>(source);
+  for (std::size_t i = 0; i < state_->shards.size(); ++i) {
+    const auto& shard = state_->shards[i];
+    const auto base = reinterpret_cast<std::uintptr_t>(shard.mapping);
+    if (shard.mapping != nullptr && address >= base &&
+        address - base < shard.size) {
+      return Copy(static_cast<std::uint32_t>(i), address - base, size, device,
+                  error);
+    }
+  }
+  if (error)
+    *error = "weight upload source is outside its mappings";
+  return false;
 }
 
 bool WeightUpload::Finish(std::string* error) {

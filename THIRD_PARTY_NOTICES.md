@@ -26,9 +26,13 @@ Non-Nix builds must retain the notices of the versions they actually distribute.
 | libpng | Linked; image decoding | `libpng-2.0` | 1.6.58; flake.lock | [pnggroup/libpng](https://github.com/pnggroup/libpng) |
 | libjpeg-turbo | Linked; JPEG decoding | `IJG AND BSD-3-Clause AND Zlib` | 3.1.4.1; flake.lock | [libjpeg-turbo](https://github.com/libjpeg-turbo/libjpeg-turbo) |
 | libwebp | Linked; WebP decoding | `BSD-3-Clause` | 1.6.0; flake.lock | [webmproject/libwebp](https://chromium.googlesource.com/webm/libwebp) |
-| FFmpeg | Separate ffmpeg/ffprobe executables for media | `GPL-3.0-or-later` (Nix build with GPL/version3 components) | 8.1.2; flake.lock | [FFmpeg](https://github.com/FFmpeg/FFmpeg) |
+| libsndfile | Linked; audio decoding | `LGPL-2.1-or-later` | 1.2.2; flake.lock | [libsndfile](https://github.com/libsndfile/libsndfile) |
+| libsoxr | Linked; audio resampling | `LGPL-2.1-or-later` | 0.1.3; flake.lock | [SoX Resampler](https://sourceforge.net/projects/soxr/) |
+| FFmpeg | Linked libavformat/libavcodec/libavutil/libswscale for video embeddings; ffmpeg/ffprobe executables for media | `GPL-3.0-or-later` (Nix build with GPL/version3 components) | 9.0.2; flake.lock | [FFmpeg](https://github.com/FFmpeg/FFmpeg) |
+| LLVM OpenMP | Windows runtime built from upstream source; Microsoft-compatible DLL naming | `Apache-2.0 WITH LLVM-exception` | 18.1.8 (`3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff`) | [LLVM](https://github.com/llvm/llvm-project/tree/llvmorg-18.1.8/openmp); [license](licenses/llvm-openmp.txt) |
 | GNU C/C++/OpenMP runtimes | System runtime libraries; no Gufo source import | `LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)` | glibc/GCC packages in flake.lock | [GNU](https://www.gnu.org/software/) |
 | llama.cpp / ggml | Adapted quantization, attention and model-private HIP kernels | `MIT` | `5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a`; attention `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0` | [llama.cpp](https://github.com/ggml-org/llama.cpp) |
+| mikealanni/gufo | Adapted Flash-Next GDN row reuse and SSM stride optimization | `MIT` | `f450218743bcaf77e3e1f8fab78f4cd4e4aafae3` | [gufo fork](https://github.com/mikealanni/gufo/tree/f450218743bcaf77e3e1f8fab78f4cd4e4aafae3) |
 | Qwen chat templates | Reference Jinja and adapted renderer behavior | `Apache-2.0` | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` (27B), `de4b8e4d43b917e7706784d8bb445c9af86a3540` (Flash-Next), `995ad96eacd98c81ed38be0c5b274b04031597b0` (Qwen3.6-35B-A3B) | [Qwen](https://huggingface.co/Qwen/Qwen3.8-27B) |
 | DS4 | Adapted loader, tokenizer, sessions and HIP kernels | `MIT` | `84cc882352757baf628a1776badf7cc54d584e28` | [antirez/ds4](https://github.com/antirez/ds4) |
 | DS4 GB10/GX10 fork | Adapted paired MoE launch code, now HIP | `MIT` | `910501e` | [xangel82/DS4](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA) |
@@ -48,8 +52,12 @@ and [H3 quality record](docs/models/minimax-h3/QUALITY.md).
 
 This software is based in part on the work of the Independent JPEG Group.
 
-FFmpeg is invoked as a separate process, not linked into Gufo. The pinned Nix
-build enables GPL/version3 components; a system FFmpeg build can have different
+The mikealanni/gufo fork retains the same Copyright (c) 2026 gufo contributors
+notice and MIT text as Gufo's root `LICENSE`.
+
+Gufo loads FFmpeg libraries on demand for video embeddings and invokes
+ffmpeg/ffprobe as separate processes for media tools. The pinned Nix build
+enables GPL/version3 components; a system FFmpeg build can have different
 terms. Redistributors bundling FFmpeg or other copyleft dependencies must also
 provide their applicable license texts and corresponding source/build materials,
 not just this MIT license. The pinned Nixpkgs expressions and `flake.lock`
@@ -68,9 +76,10 @@ The following projects informed Gufo's Strix Halo optimization work:
 - [LaurentZuijdwijk/llama.cpp](https://github.com/LaurentZuijdwijk/llama.cpp) — [MIT license](https://github.com/LaurentZuijdwijk/llama.cpp/blob/11bfe8a633fa02bac251db6cf21bd5ddab282a64/LICENSE).
 - [Nathanw1014/strix-halo-llamacpp](https://github.com/Nathanw1014/strix-halo-llamacpp) — [MIT license](https://github.com/Nathanw1014/strix-halo-llamacpp/blob/ce15ecca66e5e5a9aefa1ebc82357cb901330c86/LICENSE).
 - [gaetan-puleo/llama-cpp-strix-halo](https://github.com/gaetan-puleo/llama-cpp-strix-halo) — [MIT license](https://github.com/gaetan-puleo/llama-cpp-strix-halo/blob/860c828363988d3e4b3d5c2b701dcba3d7b9f26c/LICENSE).
+- [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp) — [MIT license](https://github.com/halo-box/strix-llama.cpp/blob/5081bc747b2d433964d66c37b80f350b248fb2fe/LICENSE).
 
 License links pin the notices reviewed for these inspiration credits.
-The two llama.cpp forks share the
+The three llama.cpp forks share the
 ggml authors' notice in [licenses/llama.cpp.txt](licenses/llama.cpp.txt);
 Nathan Wilson's notice is retained in
 [licenses/strix-halo-llamacpp.txt](licenses/strix-halo-llamacpp.txt).
@@ -108,6 +117,12 @@ loaded module hash and library versions, and requires locally available weights.
 Model checkpoints are not part of the gufo source or binary
 distribution. Operators obtain them directly from their publisher and remain
 responsible for the terms governing their location and use.
+
+### EmbeddingGemma 2
+
+- **Artifact**: [google/embeddinggemma-2](https://huggingface.co/google/embeddinggemma-2) at revision `914f7f89142e33e77833254d9c9b90c3cef7303b`, with BF16 safetensors, a tokenizer, and a model configuration.  Gufo reads the text backbone only.
+- **License**: Apache-2.0 as declared in the model card metadata.  Gufo neither ships nor automatically downloads these weights.
+- **Reference implementation**: Transformers and sentence-transformers, both Apache-2.0.  The Python reference dependencies are development-only.
 
 ### Qwen-Image-2.1
 

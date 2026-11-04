@@ -45,7 +45,17 @@ public:
   Value(long long v) : type_(Type::kNumber), num_(static_cast<double>(v)) {}
   Value(unsigned long long v)
       : type_(Type::kNumber), num_(static_cast<double>(v)) {}
-  Value(std::size_t v) : type_(Type::kNumber), num_(static_cast<double>(v)) {}
+  // Integral constructor for the widths the explicit overloads above do not
+  // cover (size_t, plus narrower types such as char and short, which
+  // previously converted through int). The constraints keep it from
+  // duplicating those overloads on platforms where the widths coincide.
+  template<
+      typename T,
+      typename = std::enable_if_t<
+          std::is_integral_v<T> && !std::is_same_v<T, int> &&
+          !std::is_same_v<T, unsigned int> && !std::is_same_v<T, long long> &&
+          !std::is_same_v<T, unsigned long long> && !std::is_same_v<T, bool>>>
+  Value(T v) : type_(Type::kNumber), num_(static_cast<double>(v)) {}
   Value(const char* v) : type_(Type::kString), str_(v) {}
   Value(const std::string& v) : type_(Type::kString), str_(v) {}
   Value(std::string&& v) : type_(Type::kString), str_(std::move(v)) {}
@@ -174,13 +184,22 @@ public:
 
   std::string dump() const {
     std::ostringstream o;
-    dump_to(o);
+    dump_to(o, false);
+    return o.str();
+  }
+
+  /// Jinja's `tojson` spelling, as Python's json.dumps(ensure_ascii=False)
+  /// writes it: ", " between items and ": " after keys. Chat templates render
+  /// non-string tool arguments this way, so models generate it.
+  std::string tojson() const {
+    std::ostringstream o;
+    dump_to(o, true);
     return o.str();
   }
 
 private:
   // NOLINTNEXTLINE(misc-no-recursion)
-  void dump_to(std::ostream& os) const {
+  void dump_to(std::ostream& os, bool spaced) const {
     switch (type_) {
       case Type::kNull:
         os << "null";
@@ -192,9 +211,19 @@ private:
         if (!std::isfinite(num_)) {
           throw std::invalid_argument("JSON numbers must be finite");
         }
+        // Integers keep their decimal spelling, as Python's json.dumps and
+        // chat templates write them. The shortest round-trip form would spell
+        // 100000 as 1e+05: clients that declared an integer get a float, and
+        // replayed tool calls no longer match the tokens the model generated.
+        constexpr double kExactIntegers = 9007199254740992.0;  // 2^53
+        const bool integral = std::trunc(num_) == num_ &&
+                              std::fabs(num_) <= kExactIntegers &&
+                              !(num_ == 0.0 && std::signbit(num_));
         char buffer[64];
         const auto [end, error] =
-            std::to_chars(buffer, buffer + sizeof(buffer), num_);
+            integral ? std::to_chars(buffer, buffer + sizeof(buffer),
+                                     static_cast<std::int64_t>(num_))
+                     : std::to_chars(buffer, buffer + sizeof(buffer), num_);
         if (error != std::errc{}) {
           throw std::runtime_error("JSON number serialization failed");
         }
@@ -208,8 +237,8 @@ private:
         os << '[';
         for (std::size_t i = 0; i < arr_.size(); ++i) {
           if (i)
-            os << ',';
-          arr_[i].dump_to(os);
+            os << (spaced ? ", " : ",");
+          arr_[i].dump_to(os, spaced);
         }
         os << ']';
         break;
@@ -218,9 +247,9 @@ private:
         os << '{';
         for (std::size_t i = 0; i < obj_.size(); ++i) {
           if (i)
-            os << ',';
-          os << '"' << escape(obj_[i].first) << "\":";
-          obj_[i].second.dump_to(os);
+            os << (spaced ? ", " : ",");
+          os << '"' << escape(obj_[i].first) << (spaced ? "\": " : "\":");
+          obj_[i].second.dump_to(os, spaced);
         }
         os << '}';
         break;

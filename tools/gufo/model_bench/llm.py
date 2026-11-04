@@ -750,7 +750,8 @@ def run_memory(session: Session, table: TableSpec) -> None:
         return
     hip = HipMemory.for_binary(session.gufo_binary)
     if hip is None:
-        raise SystemExit("memory table needs libamdhip64 (resolved through `ldd` of the Gufo binary)")
+        raise SystemExit("memory table needs a device-global hipMemGetInfo: libamdhip64 resolved through "
+                         "`ldd` of the Gufo binary on Linux (on Windows it only counts the calling process)")
     idle = hip.used_gib()
     mode = spec.get("mode", "ar")
     server = session.server(table, mode=mode, context=int(spec["context"]), sessions=1, tag="memory")

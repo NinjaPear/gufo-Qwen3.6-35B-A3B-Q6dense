@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "name": "qwen36_35b_a3b",
+  "version": "0.1.0",
+  "api_version": ">= 0.1.0",
+  "entry": "qwen36_35b_a3b_register",
+  "registration_target": "gufo_qwen36_35b_a3b",
+  "depends": [],
+  "platforms": [
+    "linux"
+  ],
+  "providers": [
+    {
+      "id": "qwen36-35b-a3b",
+      "capability": "text_generation",
+      "keys": [
+        "gguf:qwen35moe"
+      ],
+      "model_ids": [
+        "qwen36-35b-a3b"
+      ],
+      "speculative": [
+        "mtp"
+      ],
+      "target": "gufo_qwen36_35b_a3b_hip",
+      "entry": "qwen36_35b_a3b_provider_register"
+    }
+  ],
+  "targets": {
+    "gufo_qwen36_35b_a3b": {
+      "requires": []
+    },
+    "gufo_qwen36_35b_a3b_hip": {
+      "requires": [
+        "hip"
+      ]
+    }
+  },
+  "production_paths": {
+    "include": [
+      "**/*.cpp",
+      "**/*.h",
+      "**/*.hpp",
+      "**/*.hip",
+      "extension.*"
+    ],
+    "exclude": [
+      "tests/",
+      "functional/",
+      "tools/",
+      "fixtures/"
+    ]
+  },
+  "vendored_paths": [
+    "src/models/qwen36_35b_a3b/kernels/rocm/mmq/"
+  ],
+  "docs": {
+    "title": "Qwen3.6 35B-A3B",
+    "inputs": "Q6dense GGUF with native MTP; text",
+    "guide": "docs/models/qwen3.6-35b-a3b/README.md"
+  },
+  "tests": [
+    {
+      "target": "qwen36_35b_a3b_config_test",
+      "ctest": "qwen36_35b_a3b\\.config",
+      "check_pr": true,
+      "windows_build": false
+    }
+  ],
+  "test_labels": [
+    "qwen36_35b_a3b"
+  ]
+}

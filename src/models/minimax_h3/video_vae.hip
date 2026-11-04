@@ -1,10 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 
-#include <fcntl.h>
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
-#include <sys/resource.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -20,6 +17,8 @@
 #include <utility>
 #include <vector>
 
+#include <gufo/ext/platform/mapped_file.hpp>
+#include <gufo/ext/platform/os_info.hpp>
 #include "src/models/minimax_h3/json.hpp"
 #include "src/models/minimax_h3/video_vae.hpp"
 #include "src/models/minimax_h3/video_vae_ops.hip.hpp"
@@ -93,18 +92,9 @@ bool ValidateTarget(int* device, std::string* error) {
   return true;
 }
 
-struct Faults {
-  std::uint64_t minor{0};
-  std::uint64_t major{0};
-};
-
+using Faults = platform::PageFaults;
 Faults ReadFaults() {
-  struct rusage usage{};
-  if (getrusage(RUSAGE_SELF, &usage) != 0) {
-    return {};
-  }
-  return {static_cast<std::uint64_t>(usage.ru_minflt),
-          static_cast<std::uint64_t>(usage.ru_majflt)};
+  return platform::ReadPageFaults();
 }
 
 std::uint64_t ReadSwapBytes() {
@@ -214,9 +204,11 @@ bool LoadTensor(const ModelInventory& inventory,
     return false;
   }
   const std::filesystem::path path = inventory.model_root() / descriptor.shard;
-  const int file = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (file < 0) {
-    SetError(error, "cannot open MiniMax H3 VisualVAE shard " + path.string());
+  std::string open_error;
+  const platform::PlatformFile file = platform::OpenReadFile(path, &open_error);
+  if (!platform::FileValid(file)) {
+    SetError(error, "cannot open MiniMax H3 VisualVAE shard " + path.string() +
+                        ": " + open_error);
     output->Reset();
     return false;
   }
@@ -231,11 +223,10 @@ bool LoadTensor(const ModelInventory& inventory,
     const std::size_t chunk = std::min(staging_bytes, output->bytes() - copied);
     std::size_t read_bytes = 0;
     while (read_bytes < chunk) {
-      const ssize_t result = pread(
+      const std::size_t result = platform::ReadFileAt(
           file, static_cast<std::byte*>(staging) + read_bytes,
-          chunk - read_bytes,
-          static_cast<off_t>(descriptor.file_offset + copied + read_bytes));
-      if (result <= 0) {
+          chunk - read_bytes, descriptor.file_offset + copied + read_bytes);
+      if (result == 0) {
         SetError(error, "short read loading MiniMax H3 VisualVAE tensor " +
                             descriptor.name);
         success = false;
@@ -261,7 +252,7 @@ bool LoadTensor(const ModelInventory& inventory,
     }
     copied += chunk;
   }
-  (void)close(file);
+  platform::CloseFile(file);
   if (!success) {
     output->Reset();
   }
@@ -301,20 +292,31 @@ public:
     }
     constexpr float alpha = 1.0F;
     constexpr float beta = 0.0F;
-    const rocblas_int solution =
+    const rocblas_int pinned =
         (rows == kFeedForward * 2U && columns == kHidden) ||
                 (rows == kHidden && columns == kFeedForward)
             ? kGfx1151RocblasF32WideSolution
             : kGfx1151RocblasF32CompactSolution;
-    const rocblas_status status = rocblas_gemm_ex(
-        handle_, rocblas_operation_transpose, rocblas_operation_none,
-        static_cast<rocblas_int>(rows), static_cast<rocblas_int>(batch),
-        static_cast<rocblas_int>(columns), &alpha, weight,
-        rocblas_datatype_f32_r, static_cast<rocblas_int>(columns), input,
-        rocblas_datatype_f32_r, static_cast<rocblas_int>(columns), &beta,
-        output, rocblas_datatype_f32_r, static_cast<rocblas_int>(rows), output,
-        rocblas_datatype_f32_r, static_cast<rocblas_int>(rows),
-        rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index, solution, 0);
+    const auto gemm = [&](rocblas_int solution) {
+      return rocblas_gemm_ex(
+          handle_, rocblas_operation_transpose, rocblas_operation_none,
+          static_cast<rocblas_int>(rows), static_cast<rocblas_int>(batch),
+          static_cast<rocblas_int>(columns), &alpha, weight,
+          rocblas_datatype_f32_r, static_cast<rocblas_int>(columns), input,
+          rocblas_datatype_f32_r, static_cast<rocblas_int>(columns), &beta,
+          output, rocblas_datatype_f32_r, static_cast<rocblas_int>(rows),
+          output, rocblas_datatype_f32_r, static_cast<rocblas_int>(rows),
+          rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index, solution,
+          0);
+    };
+    rocblas_status status =
+        gemm(pinned_unavailable_ ? 0 : pinned);
+    if (status != rocblas_status_success && !pinned_unavailable_) {
+      // The pinned indices come from one rocBLAS database (ROCm 10.1); a
+      // library without them takes its default solution instead.
+      pinned_unavailable_ = true;
+      status = gemm(0);
+    }
     if (status != rocblas_status_success) {
       SetError(error, "MiniMax H3 VisualVAE F32 GEMM failed: " +
                           std::to_string(static_cast<int>(status)));
@@ -325,6 +327,7 @@ public:
 
 private:
   rocblas_handle handle_{nullptr};
+  bool pinned_unavailable_{false};
 };
 
 class AttentionGemm {

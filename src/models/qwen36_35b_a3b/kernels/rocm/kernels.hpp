@@ -8,7 +8,7 @@
 #include <cstdint>
 
 #include "src/core/sampling.hpp"
-#include "src/models/qwen/vision/rope.hpp"
+#include "src/families/qwen/hip_common/rope.hpp"
 
 /// Model-private HIP launchers for everything outside the quantized GEMM
 /// tier. Activations are row-major float32 [tokens][dim] unless noted; every

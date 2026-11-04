@@ -9,6 +9,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include "src/core/sampling_logit_row.hpp"
+
 namespace gufo::sampling {
 namespace {
 
@@ -23,14 +25,6 @@ struct Candidate {
     return left.token < right.token;
   }
   return left.logit > right.logit;
-}
-
-[[nodiscard]] bool IsBetterProbability(const Probability& left,
-                                       const Probability& right) noexcept {
-  if (left.value == right.value) {
-    return left.token < right.token;
-  }
-  return left.value > right.value;
 }
 
 [[nodiscard]] std::size_t MinimumKept(const SamplingConfig& config,
@@ -63,19 +57,6 @@ void SortCandidates(std::vector<Candidate>* candidates) {
     weight /= sum;
   }
   return weights;
-}
-
-double Penalize(double logit, const SamplingConfig& config,
-                const TokenPenalty& penalty) {
-  if (penalty.repeated && config.repeat_penalty != 1.0F) {
-    logit = logit <= 0 ? logit * config.repeat_penalty
-                       : logit / config.repeat_penalty;
-  }
-  logit -=
-      static_cast<double>(config.frequency_penalty) * penalty.generated_count;
-  if (penalty.generated_count != 0)
-    logit -= config.presence_penalty;
-  return logit;
 }
 
 void ApplyPenalties(std::vector<Candidate>* candidates,
@@ -157,12 +138,165 @@ void ApplyMinP(std::vector<Candidate>* candidates,
          static_cast<std::uint64_t>(random_device());
 }
 
+/// Leading candidates whose softmax mass first reaches `target`, at least
+/// `minimum`; all of them when it never does.
+[[nodiscard]] std::size_t TopPKeep(std::span<const Probability> sorted,
+                                   double temperature, std::size_t minimum,
+                                   double target) {
+  const double maximum = sorted.front().value;
+  double cumulative = 0.0;
+  std::size_t keep = 0;
+  while (keep < sorted.size()) {
+    cumulative += std::exp((sorted[keep].value - maximum) / temperature);
+    ++keep;
+    if (keep >= minimum && cumulative >= target)
+      break;
+  }
+  return keep;
+}
+
+// Returns how many leading candidates the top-p filter keeps: the shortest
+// prefix whose softmax mass reaches top_p times the full-vocabulary sum. On
+// return the first `keep` entries of `scratch` are those candidates in order.
+// The full-vocabulary sum is first bracketed by a cheap approximation; the
+// exact sequential sum is computed only when the bracket cannot decide the
+// keep count.
+[[nodiscard]] std::size_t SelectTopP(const LogitRow& row,
+                                     const SamplingConfig& config,
+                                     std::vector<Probability>* scratch) {
+  const double top_p = static_cast<double>(config.top_p);
+  const double temperature = config.temperature;
+  const std::size_t vocabulary = row.size();
+  const auto keep_for = [&](double low,
+                            double high) -> std::optional<std::size_t> {
+    constexpr std::size_t kInitialCandidates = 64;
+    std::size_t limit = std::min(
+        vocabulary, std::max(kInitialCandidates,
+                             std::max<std::size_t>(config.min_keep, 1)));
+    for (;;) {
+      row.Collect(limit, scratch, /*sorted=*/false);
+      auto& candidates = *scratch;
+      if (candidates.size() <= 1)
+        return candidates.size();
+      const std::size_t minimum = MinimumKept(config, candidates.size());
+      double maximum = 0.0;
+      double cumulative = 0.0;
+      double last = 1.0;
+      std::size_t keep_low = 0;
+      std::size_t keep_high = 0;
+      // Sort only as far as the scan needs, in chunks that double: the keep
+      // count is usually far below the candidate count.
+      std::size_t sorted = 0;
+      while (sorted < candidates.size() && keep_high == 0) {
+        const std::size_t chunk_end =
+            std::min(candidates.size(), std::max<std::size_t>(sorted * 2, 64));
+        const auto first = candidates.begin();
+        if (chunk_end < candidates.size())
+          std::nth_element(first + static_cast<std::ptrdiff_t>(sorted),
+                           first + static_cast<std::ptrdiff_t>(chunk_end),
+                           candidates.end(), IsBetterProbability);
+        std::sort(first + static_cast<std::ptrdiff_t>(sorted),
+                  first + static_cast<std::ptrdiff_t>(chunk_end),
+                  IsBetterProbability);
+        if (sorted == 0)
+          maximum = candidates.front().value;
+        for (std::size_t i = sorted; i < chunk_end && keep_high == 0; ++i) {
+          last = std::exp((candidates[i].value - maximum) / temperature);
+          cumulative += last;
+          if (i + 1 < minimum)
+            continue;
+          if (keep_low == 0 && cumulative >= top_p * low)
+            keep_low = i + 1;
+          if (cumulative >= top_p * high)
+            keep_high = i + 1;
+        }
+        sorted = chunk_end;
+      }
+      if (keep_high != 0)
+        return keep_low == keep_high ? std::optional(keep_high) : std::nullopt;
+      if (candidates.size() < limit || limit >= vocabulary)
+        return keep_low == 0 ? std::optional(candidates.size()) : std::nullopt;
+      // Every further candidate adds at most `last`, which bounds how many
+      // more are needed.
+      const double more = (top_p * high - cumulative) / last;
+      limit = std::min(
+          vocabulary,
+          std::max(limit * 8,
+                   limit + static_cast<std::size_t>(std::min(
+                               more, static_cast<double>(vocabulary)))));
+    }
+  };
+  if (const auto approximate = row.ApproxSoftmaxSum()) {
+    if (const auto keep = keep_for(approximate->low, approximate->high))
+      return *keep;
+  }
+  const double sum = row.ExactSoftmaxSum();
+  return *keep_for(sum, sum);
+}
+
 }  // namespace
 
+std::optional<TokenLogprobs> CollectLogprobs(
+    std::span<const float> logits, TokenId selected,
+    std::optional<std::uint32_t> count) {
+  if (!count)
+    return std::nullopt;
+  if (*count > 20 || selected >= logits.size())
+    throw std::invalid_argument("invalid logprob selection");
+  double maximum = -std::numeric_limits<double>::infinity();
+  for (const float value : logits) {
+    if (std::isnan(value) || value == INFINITY)
+      throw std::runtime_error("non-finite target logits");
+    maximum = std::max(maximum, static_cast<double>(value));
+  }
+  if (!std::isfinite(maximum))
+    throw std::runtime_error("target logits contain no finite values");
+  double sum = 0;
+  for (const float value : logits)
+    sum += std::exp(static_cast<double>(value) - maximum);
+  const double log_sum = std::log(sum);
+  const auto entry = [&](TokenId token) {
+    return TokenLogprob{
+        token, (static_cast<double>(logits[token]) - maximum) - log_sum};
+  };
+  TokenLogprobs result{.selected = entry(selected)};
+  if (*count) {
+    std::vector<TokenId> ids(logits.size());
+    for (std::size_t i = 0; i < ids.size(); ++i)
+      ids[i] = static_cast<TokenId>(i);
+    const auto size = std::min<std::size_t>(*count, ids.size());
+    std::partial_sort(
+        ids.begin(), ids.begin() + size, ids.end(), [&](TokenId a, TokenId b) {
+          return logits[a] == logits[b] ? a < b : logits[a] > logits[b];
+        });
+    result.top.reserve(size);
+    for (std::size_t i = 0; i < size; ++i)
+      result.top.push_back(entry(ids[i]));
+  }
+  return result;
+}
+
+double Penalize(double logit, const SamplingConfig& config,
+                const TokenPenalty& penalty) {
+  if (penalty.repeated && config.repeat_penalty != 1.0F) {
+    logit = logit <= 0 ? logit * config.repeat_penalty
+                       : logit / config.repeat_penalty;
+  }
+  logit -=
+      static_cast<double>(config.frequency_penalty) * penalty.generated_count;
+  if (penalty.generated_count != 0)
+    logit -= config.presence_penalty;
+  return logit;
+}
+
 void SamplingConfig::Validate() const {
+  if (logprobs && *logprobs > 20)
+    throw std::invalid_argument("logprobs must be between 0 and 20");
   if (constraint && (!constraint->grammar || !constraint->vocabulary ||
                      constraint->vocabulary->size() == 0))
     throw std::invalid_argument("sampling constraint is incomplete");
+  if (reasoning_budget && reasoning_budget->forced.empty())
+    throw std::invalid_argument("reasoning budget has no forced end");
   if (!std::isfinite(temperature) || temperature < 0.0F) {
     throw std::invalid_argument(
         "sampling temperature must be finite and nonnegative");
@@ -201,11 +335,14 @@ bool SamplingConfig::uses_random_sampling() const noexcept {
 }
 
 bool SamplingConfig::can_use_unmodified_argmax() const noexcept {
-  return !constraint && temperature == 0.0F && !penalties_enabled();
+  return !constraint && !reasoning_budget && temperature == 0.0F &&
+         !penalties_enabled();
 }
 
 bool SamplerState::CanSelectArgmax(TokenId token,
                                    bool penalties_applied) const {
+  if (const auto forced = ForcedToken())
+    return !pending_sample_ && token == *forced;
   if (pending_sample_ || config_.temperature != 0.0F ||
       (!penalties_applied && config_.penalties_enabled()))
     return false;
@@ -385,7 +522,7 @@ SamplingDistribution BuildDistribution(
     std::span<const float> logits, const SamplingConfig& config,
     std::span<const TokenId> prompt_tokens,
     std::span<const TokenId> generated_tokens) {
-  if (config.constraint) {
+  if (config.constraint || config.reasoning_budget) {
     SamplerState sampler(config, prompt_tokens);
     sampler.Accept(generated_tokens);
     return sampler.Distribution(logits);
@@ -426,6 +563,7 @@ SamplerState::SamplerState(SamplingConfig config,
   config_.Validate();
   if (config_.constraint)
     constraint_state_ = config_.constraint->grammar->Start();
+  StartReasoning();
   TrimHistory();
   RebuildPenaltyCounts();
 }
@@ -438,7 +576,10 @@ SamplerState::SamplerState(const SamplerState& other)
       history_(other.history_),
       penalty_counts_(other.penalty_counts_),
       rng_state_(other.rng_state_),
-      pending_sample_(other.pending_sample_) {}
+      pending_sample_(other.pending_sample_),
+      reasoning_phase_(other.reasoning_phase_),
+      reasoning_remaining_(other.reasoning_remaining_),
+      reasoning_forced_(other.reasoning_forced_) {}
 
 SamplerState& SamplerState::operator=(const SamplerState& other) {
   if (this == &other) {
@@ -453,6 +594,9 @@ SamplerState& SamplerState::operator=(const SamplerState& other) {
   candidate_scratch_.clear();
   rng_state_ = other.rng_state_;
   pending_sample_ = other.pending_sample_;
+  reasoning_phase_ = other.reasoning_phase_;
+  reasoning_remaining_ = other.reasoning_remaining_;
+  reasoning_forced_ = other.reasoning_forced_;
   return *this;
 }
 
@@ -465,6 +609,10 @@ SamplerState SamplerState::WithoutConstraint() const {
 }
 
 bool SamplerState::NeedsConstraintMask() const {
+  // Executors that sample on the GPU fall back to Sample/Distribution here,
+  // which return the forced reasoning end.
+  if (ForcedToken())
+    return true;
   if (!config_.constraint)
     return false;
   if (!constraint_mask_) {
@@ -524,6 +672,7 @@ void SamplerState::ResetHistory(std::span<const TokenId> tokens) {
     constraint_state_ = config_.constraint->grammar->Start();
   constraint_mask_.reset();
   pending_sample_.reset();
+  StartReasoning();
   penalty_counts_.clear();
   history_.assign(tokens.begin(), tokens.end());
   TrimHistory();
@@ -534,7 +683,63 @@ void SamplerState::Accept(TokenId token) {
   Accept(std::span<const TokenId>(&token, 1));
 }
 
+std::optional<TokenId> SamplerState::ForcedToken() const noexcept {
+  if (reasoning_phase_ == ReasoningPhase::kForcing)
+    return config_.reasoning_budget->forced[reasoning_forced_];
+  return std::nullopt;
+}
+
+void SamplerState::StartReasoning() {
+  reasoning_phase_ = ReasoningPhase::kOff;
+  const auto& budget = config_.reasoning_budget;
+  if (!budget)
+    return;
+  reasoning_remaining_ = budget->tokens;
+  reasoning_forced_ = 0;
+  reasoning_phase_ = budget->tokens == 0 ? ReasoningPhase::kForcing
+                                         : ReasoningPhase::kCounting;
+  for (const auto token : budget->prompt)
+    AdvanceReasoning(token);
+}
+
+// Mirrors llama.cpp common_reasoning_budget_accept: the forcing phase advances
+// one forced token per accepted token, and a spent budget waits for a token
+// that completes its UTF-8 character.
+void SamplerState::AdvanceReasoning(TokenId token) {
+  const auto& budget = *config_.reasoning_budget;
+  switch (reasoning_phase_) {
+    case ReasoningPhase::kOff:
+      return;
+    case ReasoningPhase::kForcing:
+      if (++reasoning_forced_ >= budget.forced.size())
+        reasoning_phase_ = ReasoningPhase::kOff;
+      return;
+    case ReasoningPhase::kCounting:
+    case ReasoningPhase::kWaitingUtf8:
+      break;
+  }
+  if (std::ranges::find(budget.ends, token) != budget.ends.end()) {
+    reasoning_phase_ = ReasoningPhase::kOff;
+    return;
+  }
+  const bool complete = !budget.partial_utf8 ||
+                        token >= budget.partial_utf8->size() ||
+                        !(*budget.partial_utf8)[token];
+  if (reasoning_phase_ == ReasoningPhase::kCounting &&
+      --reasoning_remaining_ != 0)
+    return;
+  if (complete) {
+    reasoning_phase_ = ReasoningPhase::kForcing;
+    reasoning_forced_ = 0;
+  } else {
+    reasoning_phase_ = ReasoningPhase::kWaitingUtf8;
+  }
+}
+
 void SamplerState::Accept(std::span<const TokenId> tokens) {
+  if (reasoning_phase_ != ReasoningPhase::kOff)
+    for (const auto token : tokens)
+      AdvanceReasoning(token);
   if (config_.constraint) {
     auto next = constraint_state_;
     for (const auto token : tokens)
@@ -565,6 +770,11 @@ void SamplerState::Accept(std::span<const TokenId> tokens) {
 
 SamplingDistribution SamplerState::Distribution(
     std::span<const float> logits) const {
+  if (const auto forced = ForcedToken()) {
+    if (*forced >= logits.size())
+      throw std::invalid_argument("forced token exceeds vocabulary");
+    return SamplingDistribution({{*forced, 1.0}}, 1.0);
+  }
   if (NeedsConstraintMask()) {
     if (config_.temperature == 0) {
       config_.Validate();
@@ -584,7 +794,11 @@ SamplingDistribution SamplerState::Distribution(
     return LinearDistribution(logits);
   auto working = *this;
   working.PrepareSelected(logits);
-  auto& candidates = working.candidate_scratch_;
+  return working.SelectedDistribution();
+}
+
+SamplingDistribution SamplerState::SelectedDistribution() {
+  auto& candidates = candidate_scratch_;
   const double maximum = candidates.front().value;
   double total = 0;
   for (auto& candidate : candidates) {
@@ -595,8 +809,50 @@ SamplingDistribution SamplerState::Distribution(
   return SamplingDistribution(std::move(candidates), total);
 }
 
+SamplingDistribution SamplerState::DistributionFromCandidates(
+    std::span<const LogitCandidate> logits) const {
+  config_.Validate();
+  if (config_.temperature <= 0 || config_.top_k <= 0 || NeedsConstraintMask())
+    throw std::invalid_argument("compact target requires unconstrained top-k");
+  auto working = *this;
+  auto& candidates = working.candidate_scratch_;
+  candidates.reserve(logits.size());
+  for (const auto& candidate : logits) {
+    if (!std::isfinite(candidate.value))
+      continue;
+    const double adjusted = AdjustedLogit(candidate.token, candidate.value);
+    if (!std::isfinite(adjusted))
+      throw std::runtime_error(
+          "sampling penalties produced a non-finite logit");
+    candidates.push_back({candidate.token, adjusted});
+  }
+  if (candidates.empty())
+    throw std::runtime_error("logit distribution contains no finite values");
+  const auto keep =
+      std::min(candidates.size(),
+               std::max<std::size_t>(
+                   config_.top_k, std::max<std::size_t>(config_.min_keep, 1)));
+  std::partial_sort(candidates.begin(), candidates.begin() + keep,
+                    candidates.end(), IsBetterProbability);
+  candidates.resize(keep);
+  working.FilterSelected();
+  return working.SelectedDistribution();
+}
+
 SamplingDistribution SamplerState::Distribution(
     std::span<const float> logits, std::span<const TokenId> token_ids) const {
+  if (const auto forced = ForcedToken()) {
+    const auto found = std::ranges::find(token_ids, *forced);
+    if (found != token_ids.end())
+      return SamplingDistribution(
+          {{static_cast<TokenId>(found - token_ids.begin()), 1.0}}, 1.0);
+    // An MTP draft shortlist may miss the forced end. The proposal then
+    // follows the shortlist, and the target's forced distribution rejects it
+    // and emits the end as its correction.
+    auto unforced = *this;
+    unforced.reasoning_phase_ = ReasoningPhase::kOff;
+    return unforced.Distribution(logits, token_ids);
+  }
   if (NeedsConstraintMask()) {
     const auto masked = ConstrainedLogits(logits, token_ids);
     return WithoutConstraint().Distribution(masked, token_ids);
@@ -632,6 +888,12 @@ TokenId SamplerState::Sample(std::span<const float> logits) {
   if (logits.size() >
       static_cast<std::size_t>(std::numeric_limits<TokenId>::max())) {
     throw std::invalid_argument("logit distribution exceeds token ID range");
+  }
+  if (const auto forced = ForcedToken()) {
+    if (*forced >= logits.size())
+      throw std::invalid_argument("forced token exceeds vocabulary");
+    pending_sample_.reset();
+    return *forced;
   }
   if (pending_sample_) {
     if (*pending_sample_ >= logits.size()) {
@@ -707,48 +969,41 @@ double SamplerState::AdjustedLogit(TokenId token, float logit) const noexcept {
 }
 
 TokenId SamplerState::SampleGreedy(std::span<const float> logits) const {
-  if (penalty_counts_.empty()) {
-    float best_logit = -std::numeric_limits<float>::infinity();
-    TokenId best_token = 0;
-    bool found = false;
-    for (std::size_t index = 0; index < logits.size(); ++index) {
-      const float logit = logits[index];
-      if (logit > best_logit && std::isfinite(logit)) {
-        best_logit = logit;
-        best_token = static_cast<TokenId>(index);
-        found = true;
-      }
-    }
-    if (!found) {
-      throw std::runtime_error("logit distribution contains no finite values");
-    }
-    return best_token;
-  }
-
   double best_logit = -std::numeric_limits<double>::infinity();
   TokenId best_token = 0;
   bool found = false;
   auto penalty = penalty_counts_.begin();
-  for (std::size_t index = 0; index < logits.size(); ++index) {
-    if (!std::isfinite(logits[index])) {
-      continue;
-    }
-    // Both vocab IDs and sparse penalties are sorted. Walk them together
-    // instead of binary-searching the history for every vocabulary entry.
-    while (penalty != penalty_counts_.end() && penalty->token < index)
+  for (std::size_t begin = 0; begin < logits.size(); begin += kSkipBlock) {
+    const std::size_t end = std::min(begin + kSkipBlock, logits.size());
+    while (penalty != penalty_counts_.end() && penalty->token < begin)
       ++penalty;
-    const double adjusted =
-        penalty != penalty_counts_.end() && penalty->token == index
-            ? Penalize(logits[index], config_, *penalty)
-            : static_cast<double>(logits[index]);
-    if (!std::isfinite(adjusted)) {
-      throw std::runtime_error(
-          "sampling penalties produced a non-finite logit");
-    }
-    if (!found || adjusted > best_logit) {
-      best_logit = adjusted;
-      best_token = static_cast<TokenId>(index);
-      found = true;
+    // An unpenalized block that cannot exceed the best value is skipped; an
+    // equal later value never replaces the earlier token.
+    if (found && (penalty == penalty_counts_.end() || penalty->token >= end) &&
+        static_cast<double>(BlockMaximum(logits.subspan(begin, end - begin))) <=
+            best_logit)
+      continue;
+    for (std::size_t index = begin; index < end; ++index) {
+      if (!std::isfinite(logits[index])) {
+        continue;
+      }
+      // Both vocab IDs and sparse penalties are sorted. Walk them together
+      // instead of binary-searching the history for every vocabulary entry.
+      while (penalty != penalty_counts_.end() && penalty->token < index)
+        ++penalty;
+      const double adjusted =
+          penalty != penalty_counts_.end() && penalty->token == index
+              ? Penalize(logits[index], config_, *penalty)
+              : static_cast<double>(logits[index]);
+      if (!std::isfinite(adjusted)) {
+        throw std::runtime_error(
+            "sampling penalties produced a non-finite logit");
+      }
+      if (!found || adjusted > best_logit) {
+        best_logit = adjusted;
+        best_token = static_cast<TokenId>(index);
+        found = true;
+      }
     }
   }
   if (!found) {
@@ -825,132 +1080,36 @@ SamplingDistribution SamplerState::LinearDistribution(
 }
 
 void SamplerState::PrepareSelected(std::span<const float> logits) {
-  candidate_scratch_.clear();
-  const auto read_adjusted = [&](std::size_t index) {
-    const double adjusted =
-        AdjustedLogit(static_cast<TokenId>(index), logits[index]);
-    if (!std::isfinite(adjusted)) {
-      throw std::runtime_error(
-          "sampling penalties produced a non-finite logit");
-    }
-    return adjusted;
-  };
-  const auto select_best = [&](std::size_t limit) {
-    candidate_scratch_.clear();
-    candidate_scratch_.reserve(limit);
-    for (std::size_t index = 0; index < logits.size(); ++index) {
-      if (!std::isfinite(logits[index])) {
-        continue;
-      }
-      const Probability candidate{
-          .token = static_cast<TokenId>(index),
-          .value = read_adjusted(index),
-      };
-      if (candidate_scratch_.size() < limit) {
-        candidate_scratch_.push_back(candidate);
-        std::push_heap(candidate_scratch_.begin(), candidate_scratch_.end(),
-                       IsBetterProbability);
-      } else if (IsBetterProbability(candidate, candidate_scratch_.front())) {
-        std::pop_heap(candidate_scratch_.begin(), candidate_scratch_.end(),
-                      IsBetterProbability);
-        candidate_scratch_.back() = candidate;
-        std::push_heap(candidate_scratch_.begin(), candidate_scratch_.end(),
-                       IsBetterProbability);
-      }
-    }
-    std::ranges::sort(candidate_scratch_, IsBetterProbability);
-  };
-  const auto select_all = [&]() {
-    candidate_scratch_.clear();
-    candidate_scratch_.reserve(logits.size());
-    for (std::size_t index = 0; index < logits.size(); ++index) {
-      if (!std::isfinite(logits[index])) {
-        continue;
-      }
-      candidate_scratch_.push_back({
-          .token = static_cast<TokenId>(index),
-          .value = read_adjusted(index),
-      });
-    }
-    std::ranges::sort(candidate_scratch_, IsBetterProbability);
-  };
-
-  double full_softmax_sum = 0.0;
-  bool has_full_softmax_sum = false;
+  const LogitRow row(logits, config_, penalty_counts_, &row_scratch_);
+  const std::size_t minimum_keep = std::max<std::size_t>(config_.min_keep, 1);
+  std::optional<std::size_t> top_p_keep;
   if (config_.top_k > 0) {
-    const std::size_t keep = std::min(
-        logits.size(),
-        std::max<std::size_t>(static_cast<std::size_t>(config_.top_k),
-                              std::max<std::size_t>(config_.min_keep, 1)));
-    select_best(keep);
+    row.Collect(
+        std::min(logits.size(),
+                 std::max<std::size_t>(static_cast<std::size_t>(config_.top_k),
+                                       minimum_keep)),
+        &candidate_scratch_);
   } else if (config_.top_p < 1.0F && logits.size() > 1024) {
-    double maximum = -std::numeric_limits<double>::infinity();
-    bool found = false;
-    for (std::size_t index = 0; index < logits.size(); ++index) {
-      if (!std::isfinite(logits[index])) {
-        continue;
-      }
-      maximum = std::max(maximum, read_adjusted(index));
-      found = true;
-    }
-    if (!found) {
-      throw std::runtime_error("logit distribution contains no finite values");
-    }
-    for (std::size_t index = 0; index < logits.size(); ++index) {
-      if (std::isfinite(logits[index])) {
-        full_softmax_sum +=
-            std::exp((read_adjusted(index) - maximum) / config_.temperature);
-      }
-    }
-    if (!(full_softmax_sum > 0.0) || !std::isfinite(full_softmax_sum)) {
-      throw std::runtime_error("logit softmax normalization failed");
-    }
-    has_full_softmax_sum = true;
-
-    constexpr std::size_t initial_top_p_candidates = 256;
-    const std::size_t initial_keep = std::min(
-        logits.size(), std::max(initial_top_p_candidates,
-                                std::max<std::size_t>(config_.min_keep, 1)));
-    select_best(initial_keep);
-
-    double selected_mass = 0.0;
-    for (const auto& candidate : candidate_scratch_) {
-      selected_mass +=
-          std::exp((candidate.value - maximum) / config_.temperature);
-    }
-    if (selected_mass < static_cast<double>(config_.top_p) * full_softmax_sum) {
-      select_all();
-    }
+    top_p_keep = SelectTopP(row, config_, &candidate_scratch_);
   } else {
-    select_all();
+    row.Collect(logits.size(), &candidate_scratch_);
   }
-  if (candidate_scratch_.empty()) {
-    throw std::runtime_error("logit distribution contains no finite values");
-  }
+  FilterSelected(top_p_keep);
+}
 
+void SamplerState::FilterSelected(std::optional<std::size_t> top_p_keep) {
   std::size_t keep = candidate_scratch_.size();
   const std::size_t minimum = MinimumKept(config_, candidate_scratch_.size());
   if (config_.top_p < 1.0F && keep > 1) {
-    const double maximum = candidate_scratch_.front().value;
-    double sum = full_softmax_sum;
-    if (!has_full_softmax_sum) {
-      sum = 0.0;
-      for (const auto& candidate : candidate_scratch_) {
+    if (!top_p_keep) {
+      const double maximum = candidate_scratch_.front().value;
+      double sum = 0.0;
+      for (const auto& candidate : candidate_scratch_)
         sum += std::exp((candidate.value - maximum) / config_.temperature);
-      }
+      top_p_keep = TopPKeep(candidate_scratch_, config_.temperature, minimum,
+                            static_cast<double>(config_.top_p) * sum);
     }
-    const double target = static_cast<double>(config_.top_p) * sum;
-    double cumulative = 0.0;
-    std::size_t top_p_keep = 0;
-    while (top_p_keep < keep) {
-      cumulative += std::exp((candidate_scratch_[top_p_keep].value - maximum) /
-                             config_.temperature);
-      ++top_p_keep;
-      if (top_p_keep >= minimum && cumulative >= target) {
-        break;
-      }
-    }
-    keep = top_p_keep;
+    keep = *top_p_keep;
   }
   if (config_.min_p > 0.0F && keep > 1) {
     const double threshold = candidate_scratch_.front().value +

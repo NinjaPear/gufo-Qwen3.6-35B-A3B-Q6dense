@@ -1,16 +1,19 @@
 // PLE n-gram hashing and disk row reads, checked without the model.
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
-
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
+#include <system_error>
 #include <vector>
+
+#include "src/core/platform/fs.hpp"
+#include "tests/support/temporary_directory.hpp"
 
 namespace q = gufo::models::qwen38_flash_next;
 
@@ -20,10 +23,9 @@ std::unique_ptr<q::NgramTable> OpenTable(const std::filesystem::path& path,
                                          std::uint64_t rows, std::uint32_t dim,
                                          gufo::core::GgmlType type,
                                          std::string* error) {
-  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  auto table = q::NgramTable::Open(fd, offset, rows, dim, type, error);
-  if (fd >= 0)
-    ::close(fd);
+  const auto file = gufo::platform::OpenReadFile(path);
+  auto table = q::NgramTable::Open(file, offset, rows, dim, type, error);
+  gufo::platform::CloseFile(file);
   return table;
 }
 
@@ -108,7 +110,7 @@ void TestHash() {
 }
 
 // A BF16 table where row r holds r + i/1000 in column i; reads through the
-// direct-I/O path must return exactly those values, duplicates included.
+// platform read path must return exactly those values, duplicates included.
 void TestTable() {
   const std::filesystem::path path =
       std::filesystem::temp_directory_path() / "qwen38_ngram_test.bin";
@@ -130,10 +132,13 @@ void TestTable() {
     }
   }
   std::string error;
-  auto table =
-      OpenTable(path, offset, rows, dim, gufo::core::GgmlType::kBF16, &error);
+  auto mapped = gufo::platform::ReadOnlyMappedFile::Open(path, &error);
+  Check(mapped.valid(), "table file remains mapped during row reads");
+  auto table = q::NgramTable::Open(mapped.PlatformHandle(), offset, rows, dim,
+                                   gufo::core::GgmlType::kBF16, &error);
   Check(table != nullptr, error.c_str());
   if (table) {
+    table->ReserveGather(32769);
     const std::vector<std::uint32_t> ids{7, rows - 1, 7, 0, 128, rows - 1};
     std::vector<float> out(ids.size() * dim);
     Check(table->Read(ids, out), "table read");
@@ -155,6 +160,13 @@ void TestTable() {
     std::fill(out.begin(), out.end(), -1.0F);
     Check(table->StartRead(ids, out), "asynchronous gather starts");
     Check(!table->StartRead(ids, out), "overlapping gather rejected");
+    bool reserve_rejected = false;
+    try {
+      table->ReserveGather(65536);
+    } catch (const std::logic_error&) {
+      reserve_rejected = true;
+    }
+    Check(reserve_rejected, "scratch reservation rejects an active gather");
     Check(table->WaitRead(), "asynchronous gather completes");
     Check(out == expected, "asynchronous rows and duplicates match");
     Check(!table->WaitRead(), "completed gather cannot be consumed twice");
@@ -188,6 +200,33 @@ void TestTable() {
     for (std::size_t i = wide_size; i < wide.size(); ++i) {
       Check(wide[i] == -123.0F, "batched output guard");
     }
+    // Reuse deduplication scratch across wide repetitive gathers, a tiny
+    // decode, and a larger gather. Old first-occurrence indices must never
+    // survive a change in input order or active table size.
+    for (const std::size_t count : {32768U, 3U, 32769U}) {
+      std::vector<std::uint32_t> repeated(count);
+      for (std::size_t i = 0; i < count; ++i)
+        repeated[i] = static_cast<std::uint32_t>((i * 197 + count) % 17);
+      std::vector<float> gathered(count * dim + guard, -123.0F);
+      Check(table->Read(repeated, std::span(gathered).first(count * dim)),
+            "reused gather scratch completes");
+      for (std::size_t j = 0; j < count; ++j) {
+        for (std::uint32_t i = 0; i < dim; i += 31) {
+          const float value =
+              static_cast<float>(repeated[j]) + static_cast<float>(i) / 1000.0F;
+          std::uint32_t bits = 0;
+          std::memcpy(&bits, &value, sizeof(bits));
+          bits &= 0xFFFF0000U;
+          float expected_value = 0;
+          std::memcpy(&expected_value, &bits, sizeof(expected_value));
+          Check(gathered[j * dim + i] == expected_value,
+                "reused scratch preserves duplicate output slots");
+        }
+      }
+      Check(std::all_of(gathered.end() - guard, gathered.end(),
+                        [](float value) { return value == -123.0F; }),
+            "reused scratch preserves output guard");
+    }
     std::fill(out.begin(), out.end(), -1.0F);
     Check(table->StartRead(ids, out), "final gather starts");
     table.reset();
@@ -210,6 +249,7 @@ void TestTable() {
       Check(out == expected, "batched failure preserves subsequent reads");
     }
   }
+  mapped.Close();
   std::filesystem::remove(path);
 }
 
@@ -277,6 +317,60 @@ void TestQuantizedRows() {
   std::filesystem::remove(path);
 }
 
+// A Q8_0 table (the source converter's format) decodes exactly through the
+// same cold, cached and mixed gathers.
+void TestQ8Rows() {
+  const auto path =
+      std::filesystem::temp_directory_path() / "qwen38_ngram_q8.bin";
+  constexpr std::uint32_t dim = 160;
+  constexpr std::uint32_t rows = 129;
+  constexpr std::uint64_t offset = 4096 + 90;
+  const auto quant = [](std::uint32_t row, std::uint32_t col) {
+    return static_cast<int>((row * 7 + col * 3) % 255) - 127;
+  };
+  {
+    std::ofstream file(path, std::ios::binary);
+    file.seekp(offset);
+    for (std::uint32_t row = 0; row < rows; ++row) {
+      for (std::uint32_t block = 0; block < dim / 32; ++block) {
+        // Exactly representable half scales: 0.5 and -2.
+        const std::uint16_t scale = row % 2 == 0 ? 0x3800 : 0xC000;
+        file.write(reinterpret_cast<const char*>(&scale), sizeof(scale));
+        for (std::uint32_t col = 0; col < 32; ++col)
+          file.put(static_cast<char>(
+              static_cast<std::int8_t>(quant(row, block * 32 + col))));
+      }
+    }
+    Check(file.good(), "Q8_0 fixture written");
+  }
+  std::string error;
+  auto table =
+      OpenTable(path, offset, rows, dim, gufo::core::GgmlType::kQ8_0, &error);
+  Check(table != nullptr, error.c_str());
+  if (table) {
+    const auto gather = [&](std::span<const std::uint32_t> ids) {
+      std::vector<float> out(ids.size() * dim + 16, -123.0F);
+      Check(table->Read(ids, std::span(out).first(ids.size() * dim)),
+            "Q8_0 gather completes");
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        const float scale = ids[i] % 2 == 0 ? 0.5F : -2.0F;
+        for (std::uint32_t col = 0; col < dim; ++col)
+          Check(out[i * dim + col] == scale * quant(ids[i], col),
+                "Q8_0 exact decoded value");
+      }
+      for (std::size_t i = ids.size() * dim; i < out.size(); ++i)
+        Check(out[i] == -123.0F, "Q8_0 output guard");
+    };
+    const std::array<std::uint32_t, 6> warm{0, 7, 128, 7, 0, 32};
+    gather(warm);
+    gather(warm);
+    const std::array<std::uint32_t, 7> mixed{128, 3, 7, 64, 3, 32, 1};
+    gather(mixed);
+  }
+  table.reset();
+  std::filesystem::remove(path);
+}
+
 // Widely spaced rows exercise cache eviction, including simultaneous readers
 // whose compressed rows map to the same bounded-cache slot.
 void TestDistantRows() {
@@ -334,32 +428,111 @@ void TestDistantRows() {
 }
 
 void TestReplacedPath() {
-  char name[] = "/tmp/qwen-ngram-bound-XXXXXX";
-  const int fd = ::mkstemp(name);
-  Check(fd >= 0, "create bound table");
-  if (fd < 0)
-    return;
-  const std::uint16_t value = 0x3f80;  // BF16 1.0
-  Check(::write(fd, &value, sizeof(value)) == sizeof(value), "write bound row");
-  ::unlink(name);
+  TemporaryDirectory temp("qwen-ngram-bound");
+  const auto bound = temp.path() / "bound";
+  const auto next = temp.path() / "next";
   {
-    std::ofstream replacement(name, std::ios::binary);
+    std::ofstream initial(bound, std::ios::binary);
+    const std::uint16_t value = 0x3f80;  // BF16 1.0
+    initial.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    Check(initial.good(), "write bound row");
+  }
+  const auto file = gufo::platform::OpenReadFile(bound);
+  Check(gufo::platform::FileValid(file), "open bound table");
+  if (!gufo::platform::FileValid(file))
+    return;
+  {
+    std::ofstream replacement(next, std::ios::binary);
     const std::uint16_t other = 0x4000;
     replacement.write(reinterpret_cast<const char*>(&other), sizeof(other));
   }
+  std::error_code ec;
+  gufo::platform::Directory dir;
+  Check(dir.Open(temp.path(), ec) &&
+            gufo::platform::Rename(dir, "bound", dir, "retired", ec) &&
+            gufo::platform::Rename(dir, "next", dir, "bound", ec),
+        "replace bound path while descriptor stays open");
   std::string error;
   auto table =
-      q::NgramTable::Open(fd, 0, 1, 1, gufo::core::GgmlType::kBF16, &error);
-  ::close(fd);
+      q::NgramTable::Open(file, 0, 1, 1, gufo::core::GgmlType::kBF16, &error);
+  gufo::platform::CloseFile(file);
   Check(table != nullptr, "open original descriptor after path replacement");
   std::array<std::uint32_t, 1> ids{0};
   std::array<float, 1> output{};
   if (table)
     Check(table->Read(ids, output) && output[0] == 1.0F,
           "PLE reads original weights after replacement and descriptor close");
-  std::filesystem::remove(name);
 }
 
+// Gathers attribute every row to the sequence that requested it: copied from
+// a duplicate in the same gather, a row-cache hit or a disk read.
+void TestCounters() {
+  const std::filesystem::path path =
+      std::filesystem::temp_directory_path() / "qwen38_ngram_counters.bin";
+  const std::uint32_t dim = 4;
+  const std::uint64_t rows = 4096;
+  {
+    std::ofstream out(path, std::ios::binary);
+    const std::vector<char> zeros(rows * dim * 2, 0);
+    out.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+  }
+  std::string error;
+  auto table =
+      OpenTable(path, 0, rows, dim, gufo::core::GgmlType::kBF16, &error);
+  Check(table != nullptr, error.c_str());
+  if (table) {
+    const auto balanced = [](const q::NgramTotals& t) {
+      return t.rows == t.dedup_rows + t.cache_hits + t.disk_reads;
+    };
+    q::NgramCounters first, second;
+    const std::vector<std::uint32_t> ids{5, 6, 5, 9, 6, 9, 10};
+    std::vector<float> out(ids.size() * dim);
+    const std::array owners{q::NgramGatherOwner{4, &first},
+                            q::NgramGatherOwner{3, &second}};
+    Check(table->StartRead(ids, out, owners) && table->WaitRead(),
+          "owned gather completes");
+    const auto a = first.Load(), b = second.Load();
+    Check(a.rows == 4 && a.dedup_rows == 1 && a.cache_hits == 0 &&
+              a.disk_reads == 3,
+          "first owner pays its own reads");
+    Check(b.rows == 3 && b.dedup_rows == 2 && b.cache_hits == 0 &&
+              b.disk_reads == 1,
+          "second owner copies rows the first one read");
+
+    const std::array whole{q::NgramGatherOwner{ids.size(), &first}};
+    Check(table->Read(ids, out) && table->StartRead(ids, out, whole) &&
+              table->WaitRead(),
+          "repeated gather completes");
+    const auto repeated = first.Load();
+    Check(repeated.rows == 11 && repeated.dedup_rows == 4 &&
+              repeated.cache_hits + repeated.disk_reads == 7 &&
+              repeated.disk_reads >= 3,
+          "repeated rows hit the row cache");
+    Check(balanced(repeated) && second.Load().rows == 3,
+          "unowned gathers are not counted");
+
+    // Large gathers read on the worker pool.
+    std::vector<std::uint32_t> wide(3000);
+    for (std::size_t i = 0; i < wide.size(); ++i)
+      wide[i] = static_cast<std::uint32_t>((i * 7) % 2048 + 1024);
+    std::vector<float> wide_out(wide.size() * dim);
+    q::NgramCounters pooled;
+    const std::array pooled_owner{q::NgramGatherOwner{wide.size(), &pooled}};
+    Check(table->StartRead(wide, wide_out, pooled_owner) && table->WaitRead(),
+          "pooled gather completes");
+    const auto p = pooled.Load();
+    Check(p.rows == wide.size() && p.dedup_rows == wide.size() - 2048 &&
+              balanced(p),
+          "pooled gather balances");
+
+    const std::array short_owner{q::NgramGatherOwner{ids.size() - 1, &first}};
+    Check(!table->StartRead(ids, out, short_owner),
+          "owners must cover the gather");
+    Check(first.Load().rows == repeated.rows, "rejected gather is uncounted");
+  }
+  table.reset();
+  std::filesystem::remove(path);
+}
 }  // namespace
 
 int main() {
@@ -367,7 +540,9 @@ int main() {
   TestHash();
   TestTable();
   TestQuantizedRows();
+  TestQ8Rows();
   TestDistantRows();
+  TestCounters();
   if (failures != 0) {
     std::fprintf(stderr, "%d failures\n", failures);
     return 1;

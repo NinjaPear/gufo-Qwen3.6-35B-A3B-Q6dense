@@ -12,6 +12,8 @@ agents and contributors are in [AGENTS.md](../AGENTS.md).
 | --- | --- |
 | `src/cli` | Executable commands, terminal interfaces and HTTP adapters |
 | `src/core` | Shared runtime: GGUF loading, sampling, quantization, HIP helpers, diagnostics |
+| `src/cache` | Continuation cache: tiers, ledger and the neutral capture/backing contract |
+| `src/ext` | Extension runtime: registry, options, neutral continuation and host-service contracts |
 | `src/models/<model>` | One model package: config, weights, engine, kernels, CPU reference |
 | `src/eval` | HTTP capability evaluation |
 | `src/testing` | Test-only comparison helpers |
@@ -28,6 +30,13 @@ A model package builds as its own static library and is attached in the root
 `CMakeLists.txt` with `add_subdirectory`; heavy CPU oracles are declared
 `EXCLUDE_FROM_ALL` so routine builds stay cheap.
 
+`gufo_serving` (`src/cli/serve`: scheduler, model runner, cache facade, model
+selection) and `gufo_http` are the top of the graph. Nothing under
+`gufo_ext_runtime` includes `src/cli/**` or links either library, which
+`extension_serving_boundary_gate` and `extension_link_graph_gate` enforce; see
+[testing](TESTING.md#boundary-and-link-graph-gates) and
+[target ownership](model-extensions/target-ownership.md).
+
 ## Build
 
 Nix builds the production package and the hosted checks. Stage new files in
@@ -36,17 +45,26 @@ Git first: flakes only see tracked files.
 ```sh
 nix build                              # production package, no tests or tools
 ./result/bin/gufo diagnose
-nix build .#checks.x86_64-linux.pr     # hosted CPU/repository checks
+nix flake check     # hosted CPU/repository checks
 nix develop                            # GPU development, profilers, reference tools
 ```
 
 The same CMake commands work without Nix once the documented dependencies are
 installed; `nix develop -c <command>` runs them inside the pinned environment.
 
+Alongside the pinned compiler, `nix develop` carries the tools the loop needs:
+`gdb` for the assertion-enabled test presets, `git` and `jj` for the repository,
+`ripgrep` for searching, `radeontop` for live GPU load, and `ccache` for rebuilds.
+
 ```sh
 cmake --preset release
 cmake --build --preset release --parallel 4
 ```
+
+CMake compiles C and C++ through `ccache` when it is on `PATH`, so reconfigured
+builds and header changes reuse cached objects; the configure log reports either
+`gufo: compiling C and CXX through ...` or `gufo: ccache not found`. HIP kernels
+are not launched through the cache.
 
 ### Presets
 
@@ -149,7 +167,7 @@ compiler and dependency versions fixed across compared runs. Follow
 
 ## Submitting changes
 
-Hosted CI runs `nix build .#checks.x86_64-linux.pr` on Ubuntu with a 25-minute
+Hosted CI runs `nix flake check` on Ubuntu with a 25-minute
 limit: formatting, documentation, dependency inventory, server-command checks
 and the CPU contract suite. It does not build ROCm, download weights or run
 model oracles, so run the GPU checks that cover the change locally; the exact

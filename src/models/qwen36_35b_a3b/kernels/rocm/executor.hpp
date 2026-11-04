@@ -16,8 +16,8 @@
 #include <vector>
 
 #include "src/core/session_mode.hpp"
-#include "src/models/qwen/hip/ops/token.hpp"
-#include "src/models/qwen/vision/device_input.hpp"
+#include "src/families/qwen/kernels/ops/token.hpp"
+#include "src/families/qwen/vision/device_input.hpp"
 #include "src/models/qwen36_35b_a3b/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen36_35b_a3b/kernels/rocm/device_model.hpp"
 #include "src/models/qwen36_35b_a3b/kernels/rocm/kernels.hpp"

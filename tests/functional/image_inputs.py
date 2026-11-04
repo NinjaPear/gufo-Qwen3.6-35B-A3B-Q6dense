@@ -2,7 +2,9 @@
 
 import base64
 import re
+import struct
 import sys
+import zlib
 
 
 # Solid red, 128x128. Fixed fixtures keep this suite independent of image tools.
@@ -49,6 +51,25 @@ def invalid_image_cases(image_content):
     )
 
 
+def gradient_png(width, height):
+    """Return an opaque RGB gradient PNG of the given size."""
+    def chunk(kind, payload):
+        return (struct.pack(">I", len(payload)) + kind + payload
+                + struct.pack(">I", zlib.crc32(kind + payload)))
+
+    rows = bytearray()
+    for y in range(height):
+        row = bytearray(3 * width)
+        row[0::3] = bytes(x * 255 // width for x in range(width))
+        row[1::3] = bytes([y * 255 // height]) * width
+        row[2::3] = b"\x80" * width
+        rows += b"\0" + row
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows))
+            + chunk(b"IEND", b""))
+
+
 def assert_color(result, color):
     assert re.fullmatch(color + r"[.!]?", result["text"].strip().lower()), result
     assert not result["reasoning"] and result["finish"] == "stop", result
@@ -58,6 +79,24 @@ def assert_color(result, color):
     assert tokens > 0 and details["cached_tokens"] == 0, usage
     if "gufo" in usage:  # Responses exposes these counters outside usage.
         assert usage["gufo"]["prefill_tokens"] == tokens, usage
+
+
+def messages_color_requests(png):
+    """Anthropic Messages image blocks: in the user turn and in a tool result."""
+    source = {"type": "base64", "media_type": "image/png", "data": png.split(",", 1)[1]}
+    question = "Name the dominant color in the image. Reply with one lowercase English color name only."
+    common = {"max_tokens": 16, "temperature": 0, "thinking": {"type": "disabled"}}
+    user_turn = {**common, "messages": [{"role": "user", "content": [
+        {"type": "image", "source": source}, {"type": "text", "text": question}]}]}
+    tool_result = {**common, "messages": [
+        {"role": "user", "content": "Read swatch.png."},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_swatch",
+                                           "name": "read_file", "input": {"path": "swatch.png"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_swatch", "content": [
+                {"type": "text", "text": "swatch.png"}, {"type": "image", "source": source}]},
+            {"type": "text", "text": question}]}]}
+    return (("user", user_turn), ("tool_result", tool_result))
 
 
 def check_image_inputs(client, model, checks, image_content, chat_result, response_result):
@@ -104,3 +143,150 @@ def check_image_inputs(client, model, checks, image_content, chat_result, respon
         result = request(endpoint, image_content("blue")["image_url"]["url"], True)
         assert_color(result, "blue")
         record(f"image_inputs_{endpoint}_recovery", result)
+    check_messages_images(client, model, checks, image_content)
+
+
+def check_image_detail(client, model, checks, chat_result):
+    """Check that the server caches a large image separately for `auto` and `low`."""
+    url = "data:image/png;base64," + base64.b64encode(gradient_png(1536, 1024)).decode()
+    results = {}
+    for detail in ("auto", "low"):
+        results[detail] = chat_result(client, dict(
+            model=model, temperature=0, extra_body={"seed": 41},
+            messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": url, "detail": detail}},
+                {"type": "text", "text": "Describe this image in a few words."}]}],
+            max_completion_tokens=16, reasoning_effort="none"), False)
+        assert results[detail]["finish"] in ("stop", "length"), results[detail]
+        checks[f"image_detail_chat_{detail}"] = results[detail]
+        print(f"CHECK image_detail_chat_{detail}", file=sys.stderr, flush=True)
+    auto, low = results["auto"]["usage"], results["low"]["usage"]
+    # Under low this image is 512 x 320, which is 160 tokens, and under auto it
+    # is 1536 tokens. The requests differ only in the image. A low image has at
+    # least 64 tokens, so fewer than 64 cached tokens means the server reused
+    # only the template text before the image.
+    assert auto["prompt_tokens"] - low["prompt_tokens"] == 1536 - 160, (auto, low)
+    assert low["prompt_tokens_details"]["cached_tokens"] < 64, (auto, low)
+
+
+def check_messages_images(client, model, checks, image_content):
+    from messages_tools import messages_tool_result
+
+    for color in ("red", "blue"):
+        png = image_content(color)["image_url"]["url"]
+        for place, body in messages_color_requests(png):
+            result = messages_tool_result(client, {"model": model, **body})
+            assert re.fullmatch(color + r"[.!]?", result["text"].strip().lower()), result
+            assert not result["reasoning"] and result["finish"] == "end_turn", result
+            assert result["usage"]["prompt_tokens"] > 0, result
+            checks[f"image_inputs_messages_{place}_{color}"] = result
+            print(f"CHECK image_inputs_messages_{place}_{color}", file=sys.stderr, flush=True)
+
+
+def check_image_count(client, model, checks, image_content, chat_result, response_result,
+                      context, concurrency):
+    """Image count is bounded by actual prompt size, including replayed history."""
+    from concurrent.futures import ThreadPoolExecutor
+    from openai import BadRequestError
+
+    question = ("Name the dominant color of the LAST image. "
+                "Reply with one lowercase English color name only.")
+
+    def request(endpoint, count, color, split=False):
+        parts = [image_content("red") for _ in range(count - 1)] + [image_content(color)]
+        if endpoint == "responses":
+            parts = [{"type": "input_image", "image_url": part["image_url"]["url"]}
+                     for part in parts]
+        text = {"type": "text" if endpoint == "chat" else "input_text", "text": question}
+        messages = ([{"role": "user", "content": [part]} for part in parts]
+                    if split else [{"role": "user", "content": parts}])
+        messages[-1]["content"].append(text)
+        common = dict(model=model, temperature=0,
+                      extra_body={"seed": 354, "presence_penalty": 0, "frequency_penalty": 0})
+        if endpoint == "chat":
+            return dict(**common, messages=messages, reasoning_effort="none",
+                        max_completion_tokens=16)
+        return dict(**common, input=messages, reasoning={"effort": "none"},
+                    max_output_tokens=16, store=False)
+
+    def save(name, result, color):
+        checks[name] = result
+        print(f"CHECK {name}", file=sys.stderr, flush=True)
+        assert re.fullmatch(color + r"[.!]?", result["text"].strip().lower()), result
+        assert not result["tools"] and result["finish"] == "stop", result
+        return result
+
+    def counts(result):
+        usage = result["usage"]
+        total = usage.get("prompt_tokens", usage.get("input_tokens"))
+        details = usage.get("prompt_tokens_details", usage.get("input_tokens_details"))
+        return total, details["cached_tokens"]
+
+    # Stable main/PR controls precede the newly supported cases, so timing
+    # comparisons can stop here without asking main to accept >16 images.
+    for count in (1, 16):
+        body = request("chat", count, "red")
+        for streaming in (False, True):
+            result = save(f"image_count_control_{count}_{streaming}",
+                          chat_result(client, body, streaming), "red")
+            if streaming:
+                total, cached = counts(result)
+                assert cached == total, result
+
+    for endpoint, call in (("chat", chat_result), ("responses", response_result)):
+        body = request(endpoint, 17, "blue", split=endpoint == "responses")
+        first = save(f"image_count_{endpoint}_17", call(client, body, False), "blue")
+        retry = save(f"image_count_{endpoint}_17_retry", call(client, body, True), "blue")
+        assert retry["text"] == first["text"] and counts(retry)[0] == counts(retry)[1], retry
+        key = "messages" if endpoint == "chat" else "input"
+        next_body = request(endpoint, 1, "red")
+        next_body[key] = [*body[key], {"role": "assistant", "content": retry["text"]},
+                          *next_body[key]]
+        continued = save(f"image_count_{endpoint}_18",
+                          call(client, next_body, True), "red")
+        assert counts(continued)[1] >= counts(first)[0], (first, continued)
+
+    body = request("chat", 17, "blue")
+    schema = {"type": "object", "properties": {
+        "color": {"type": "string", "enum": ["red", "blue"]}},
+        "required": ["color"], "additionalProperties": False}
+    sampled = {**body, "temperature": 0.7, "top_p": 0.95,
+               "reasoning_effort": "low", "max_completion_tokens": 256,
+               "response_format": {"type": "json_schema", "json_schema": {
+                   "name": "color", "strict": True, "schema": schema}}}
+    import json
+    for streaming in (False, True):
+        result = chat_result(client, sampled, streaming)
+        name = f"image_count_sampled_thinking_{streaming}"
+        checks[name] = result
+        print(f"CHECK {name}", file=sys.stderr, flush=True)
+        assert json.loads(result["text"]) == {"color": "blue"} and result["reasoning"], result
+        assert result["finish"] == "stop", result
+        if streaming:
+            assert counts(result)[0] == counts(result)[1], result
+
+    if concurrency > 1:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pending = [(color, pool.submit(chat_result, client,
+                                          request("chat", 17, color), True))
+                       for color in ("red", "blue")]
+            results = {}
+            for color, future in pending:
+                result = future.result()
+                assert re.fullmatch(color + r"[.!]?", result["text"].strip().lower()), result
+                assert not result["tools"] and result["finish"] == "stop", result
+                results[color] = result
+            checks["image_count_parallel"] = results
+            print("CHECK image_count_parallel", file=sys.stderr, flush=True)
+
+    # Every 128px fixture expands to at least 64 image tokens. Admission
+    # must reject the expanded prompt before running the vision encoder.
+    try:
+        chat_result(client, request("chat", context // 64 + 1, "red"), False)
+    except BadRequestError as error:
+        assert error.code == "context_length_exceeded", error
+        checks["image_count_context_limit"] = {"status": 400, "code": error.code}
+        print("CHECK image_count_context_limit", file=sys.stderr, flush=True)
+    else:
+        raise AssertionError("Accepted images exceeding the model context")
+    save("image_count_recovery", chat_result(client, body, True), "blue")

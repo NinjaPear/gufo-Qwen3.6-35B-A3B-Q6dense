@@ -8,14 +8,18 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <numbers>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
 
+#include "src/models/qwen38_flash_next/cpu_ops.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
+namespace qfn = gufo::models::qwen38_flash_next;
 namespace {
 
 // The model's full-attention geometry: 24 query heads over 2 KV heads,
@@ -102,7 +106,7 @@ std::vector<float> Download(HipBuffer<float>* source, std::size_t count) {
 }
 
 void CheckPreparation(std::uint32_t n, std::uint32_t start,
-                      std::uint32_t rotary) {
+                      std::uint32_t rotary, const qfn::YarnRope& yarn = {}) {
   constexpr std::uint32_t stride = 2 * (kQWidth + kKvWidth);
   const std::size_t count = static_cast<std::size_t>(n) * kQWidth;
   const std::size_t cache_rows = start + n + 2;
@@ -172,8 +176,10 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
                    1e-6F, nullptr);
     q::RmsNormRows(k.get(), k_gamma.get(), k.get(), n * kKvHeads, kDim, 1,
                    1e-6F, nullptr);
-    q::Rope(q_ref.get(), n, kHeads, kDim, rotary, pos.get(), 1e7F, nullptr);
-    q::Rope(k.get(), n, kKvHeads, kDim, rotary, pos.get(), 1e7F, nullptr);
+    q::Rope(q_ref.get(), n, kHeads, kDim, rotary, pos.get(), 1e7F, nullptr,
+            nullptr, yarn);
+    q::Rope(k.get(), n, kKvHeads, kDim, rotary, pos.get(), 1e7F, nullptr,
+            nullptr, yarn);
     q::StoreKv(k.get(), k_ref.get(), n, kKvWidth, pos.get(), nullptr);
     q::StoreKv(v.get(), v_ref.get(), n, kKvWidth, pos.get(), nullptr);
     CheckHip(hipDeviceSynchronize(), "preparation reference ready");
@@ -184,7 +190,7 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
       const bool supported = q::PrepareAttention(
           packed.get(), stride, q_gamma.get(), k_gamma.get(), q_out.get(),
           gate_out.get(), k_out.get(), v_out.get(), n, kHeads, kKvHeads, kDim,
-          rotary, pos.get(), 1e7F, 1e-6F, capture.stream);
+          rotary, pos.get(), 1e7F, 1e-6F, capture.stream, nullptr, false, yarn);
       CheckHip(hipStreamEndCapture(capture.stream, &capture.graph),
                "preparation capture end");
       if (!supported)
@@ -217,7 +223,7 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
                 k_gamma.get(), q_out.get() + std::size_t(off) * kQWidth,
                 gate_out.get() + std::size_t(off) * kQWidth, k_out.get(),
                 v_out.get(), std::min(chunk, n - off), kHeads, kKvHeads, kDim,
-                rotary, pos.get(), 1e7F, 1e-6F, nullptr, nullptr, true))
+                rotary, pos.get(), 1e7F, 1e-6F, nullptr, nullptr, true, yarn))
           throw std::runtime_error("prefill preparation rejected a short tail");
       }
       CheckHip(hipDeviceSynchronize(), "short prefill preparation");
@@ -230,7 +236,126 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
     }
   }
   std::cout << "attention preparation n=" << n << " start=" << start
-            << " rotary=" << rotary << ": exact, including graph positions\n";
+            << " rotary=" << rotary << " yarn=" << yarn.enabled
+            << ": exact, including graph positions\n";
+}
+
+qfn::YarnRope Yarn(float factor) {
+  return qfn::MakeYarnRope({.factor = factor, .original_context = 262144}, 64,
+                           1e7F);
+}
+
+// HF frequency of pair i in double (same ramp, 1/factor blend).
+double HfFrequency(float factor, std::uint32_t i) {
+  const double extrapolation = std::pow(1e7, -2.0 * i / 64.0);
+  if (factor == 1.0F)
+    return extrapolation;
+  const double ramp = std::clamp((double(i) - 14.0) / 8.0, 0.0, 1.0);
+  return extrapolation * (1.0 - ramp + ramp / factor);
+}
+
+// Unit input per pair: the Rope kernel's output is mscale * (cos, sin) of
+// the angle, so angle and scale are checked directly against HF.
+void CheckPhase(const std::vector<float>& out, const std::vector<double>& pos,
+                float factor, const char* label) {
+  const double mscale = factor == 1.0F ? 1.0 : 0.1 * std::log(factor) + 1.0;
+  for (std::uint32_t i = 0; i < 32; ++i) {
+    const double angle = pos[i] * HfFrequency(factor, i);
+    const double got = std::atan2(out[i + 32], out[i]);
+    const double diff = std::remainder(got - angle, 2.0 * std::numbers::pi);
+    const double magnitude = std::hypot(out[i], out[i + 32]);
+    if (std::abs(diff) > 1e-6 * angle + 1e-4 ||
+        std::abs(magnitude - mscale) > 1e-5 * mscale) {
+      throw std::runtime_error(
+          std::string(label) + ": pair " + std::to_string(i) + " angle error " +
+          std::to_string(diff) + " magnitude " + std::to_string(magnitude));
+    }
+  }
+  for (std::uint32_t i = 64; i < kDim; ++i)
+    if (out[i] != 0.25F)
+      throw std::runtime_error(std::string(label) + ": tail changed");
+}
+
+std::vector<float> UnitPairs() {
+  std::vector<float> host(kDim, 0.0F);
+  std::fill_n(host.begin(), 32, 1.0F);
+  std::fill(host.begin() + 64, host.end(), 0.25F);
+  return host;
+}
+
+void CheckYarnPhase(float factor, std::uint32_t position) {
+  HipBuffer<float> x(kDim);
+  HipBuffer<std::uint32_t> pos(1);
+  Upload(&x, UnitPairs());
+  Upload(&pos, std::vector<std::uint32_t>{position});
+  q::Rope(x.get(), 1, 1, kDim, 64, pos.get(), 1e7F, nullptr, nullptr,
+          factor == 1.0F ? qfn::YarnRope{} : Yarn(factor));
+  CheckHip(hipDeviceSynchronize(), "phase rope");
+  CheckPhase(Download(&x, kDim), std::vector<double>(32, position), factor,
+             "rope phase");
+  std::cout << "rope phase factor=" << factor << " pos=" << position
+            << ": HF angle and mscale\n";
+}
+
+// mRoPE: pair i reads T, H or W exactly as qwen::vision::RopePosition does.
+void CheckYarnVisionPhase(float factor) {
+  const std::vector<std::int32_t> thw{300000, 200000, 250000};
+  HipBuffer<std::int32_t> positions(3);
+  CheckHip(hipMemcpy(positions.get(), thw.data(), 12, hipMemcpyHostToDevice),
+           "vision positions");
+  const gufo::models::qwen::vision::DeviceRope host_rope{positions.get(), 1, 0};
+  HipBuffer<gufo::models::qwen::vision::DeviceRope> rope(1);
+  CheckHip(hipMemcpy(rope.get(), &host_rope, sizeof(host_rope),
+                     hipMemcpyHostToDevice),
+           "vision rope");
+  HipBuffer<float> x(kDim);
+  HipBuffer<std::uint32_t> pos(1);
+  Upload(&x, UnitPairs());
+  Upload(&pos, std::vector<std::uint32_t>{0});
+  q::Rope(x.get(), 1, 1, kDim, 64, pos.get(), 1e7F, nullptr, rope.get(),
+          Yarn(factor));
+  CheckHip(hipDeviceSynchronize(), "vision phase rope");
+  std::vector<double> coordinate(32);
+  for (std::uint32_t i = 0; i < 32; ++i) {
+    const int axis = i % 3 == 1 && i < 33 ? 1 : i % 3 == 2 && i < 30 ? 2 : 0;
+    coordinate[i] = thw[axis];
+  }
+  CheckPhase(Download(&x, kDim), coordinate, factor, "vision rope phase");
+  std::cout << "vision rope phase factor=" << factor << ": per-axis YaRN\n";
+}
+
+// Relative RMS of the rotated dims, GPU Rope kernel versus cpu::Rope.
+double OracleRms(float factor, std::uint32_t position) {
+  const auto yarn = factor == 1.0F ? qfn::YarnRope{} : Yarn(factor);
+  const auto input = MakeValues(std::size_t(kHeads) * kDim, 0x5EED, 1.0F);
+  HipBuffer<float> x(input.size());
+  HipBuffer<std::uint32_t> pos(1);
+  Upload(&x, input);
+  Upload(&pos, std::vector<std::uint32_t>{position});
+  q::Rope(x.get(), 1, kHeads, kDim, 64, pos.get(), 1e7F, nullptr, nullptr,
+          yarn);
+  const auto gpu = Download(&x, input.size());
+  auto cpu = input;
+  qfn::cpu::Rope(cpu.data(), kHeads, kDim, 64, position, 1e7F, yarn);
+  double num = 0.0, den = 0.0;
+  for (std::uint32_t h = 0; h < kHeads; ++h)
+    for (std::uint32_t i = 0; i < 64; ++i) {
+      const auto k = std::size_t(h) * kDim + i;
+      num += (double(gpu[k]) - cpu[k]) * (double(gpu[k]) - cpu[k]);
+      den += double(cpu[k]) * cpu[k];
+    }
+  return std::sqrt(num / den);
+}
+
+void CheckOracleRms() {
+  for (const std::uint32_t position : {1000U, 300000U, 650000U}) {
+    const double off = OracleRms(1.0F, position);
+    const double on = OracleRms(2.5F, position);
+    std::cout << "rope vs CPU oracle pos=" << position << ": relative RMS off "
+              << off << " on " << on << '\n';
+    if ((position == 1000 && on > 1e-4) || on > 2.0 * off + 1e-5)
+      throw std::runtime_error("YaRN rope drifts from the CPU oracle");
+  }
 }
 
 /// FP64 gated attention over the keys each row can see: every key below
@@ -296,10 +421,12 @@ std::vector<double> Fp64Attention(
 /// Runs the per-token reference and the fused WMMA route over the same
 /// cache and reports the worst absolute error of the gated context.
 double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
-               std::uint32_t seed, bool sparse = false, bool bounded = false) {
+               std::uint32_t seed, bool sparse = false, bool bounded = false,
+               std::uint32_t mask_words_override = 0) {
   const std::uint32_t n_kv = start_pos + n_tokens;
   const std::uint32_t max_blocks = (n_kv + kRatio - 1) / kRatio;
-  const std::uint32_t mask_words = (max_blocks + 31) / 32;
+  const std::uint32_t mask_words =
+      mask_words_override != 0 ? mask_words_override : (max_blocks + 31) / 32;
   const std::size_t q_count = static_cast<std::size_t>(n_tokens) * kQWidth;
   const std::size_t kv_count = static_cast<std::size_t>(n_kv) * kKvWidth;
 
@@ -498,6 +625,7 @@ void CheckStructured(const char* name, std::uint32_t n_tokens,
                                   mask_words);
   std::vector<std::uint32_t> blocks;
   std::size_t selected = 0;
+  std::size_t most = 1;
   for (std::uint32_t t = 0; t < n_tokens; ++t) {
     const std::uint32_t complete = (start_pos + t + 1) / ratio;
     blocks.clear();
@@ -509,9 +637,18 @@ void CheckStructured(const char* name, std::uint32_t n_tokens,
       mask[static_cast<std::size_t>(t) * mask_words + b / 32] |= 1U << (b % 32);
     }
     selected += blocks.size();
+    most = std::max(most, blocks.size());
   }
   const auto exact = Fp64Attention(qv, gate, kh, vh, mask.data(), mask_words,
                                    n_tokens, start_pos, ratio);
+  // The list path (ratio 4 only) is compared bitwise with the mask walk. The
+  // adversarial patterns select more than the indexer's 512-block budget, so
+  // the lists get room for the largest row: that keeps every carry and window
+  // edge in play, and the capacity guard is not what is being tested here.
+  const std::uint32_t list_capacity = static_cast<std::uint32_t>(most);
+  HipBuffer<std::uint32_t> d_lists(static_cast<std::size_t>(n_tokens) *
+                                   list_capacity);
+  HipBuffer<std::uint32_t> d_counts(n_tokens);
 
   HipBuffer<float> d_q(q_count);
   HipBuffer<float> d_gate(q_count);
@@ -539,6 +676,19 @@ void CheckStructured(const char* name, std::uint32_t n_tokens,
     q::SigmoidMul(d_out.get(), d_gate.get(), q_count, nullptr);
     CheckHip(hipDeviceSynchronize(), "structured attention");
     const auto out = Download(&d_out, q_count);
+    if (ratio == kRatio) {
+      HipBuffer<float> d_list(q_count);
+      q::Attention(d_q.get(), d_k.get(), d_v.get(), d_mask.get(), mask_words,
+                   d_list.get(), splits == 0 ? nullptr : d_partials.get(),
+                   splits, n_tokens, d_pos.get(), kHeads, kKvHeads, kDim, ratio,
+                   nullptr, d_lists.get(), d_counts.get(), list_capacity);
+      q::SigmoidMul(d_list.get(), d_gate.get(), q_count, nullptr);
+      CheckHip(hipDeviceSynchronize(), "structured list attention");
+      const auto list = Download(&d_list, q_count);
+      if (std::memcmp(out.data(), list.data(), q_count * sizeof(float)) != 0) {
+        throw std::runtime_error("structured list attention differs from walk");
+      }
+    }
     double error = 0.0;
     for (std::size_t i = 0; i < q_count; ++i) {
       if (!std::isfinite(out[i])) {
@@ -555,6 +705,283 @@ void CheckStructured(const char* name, std::uint32_t n_tokens,
   if (worst > kFp64Limit) {
     throw std::runtime_error("structured attention exceeds its FP64 limit");
   }
+}
+
+/// The compacted-selection route against the mask walk. Random masks of at
+/// most the 512-block budget per row (a short context selects every block):
+/// the outputs must match bit for bit, single-block and split eight ways, and
+/// stay within the FP64 limit.
+void CheckLists(std::uint32_t n_tokens, std::uint32_t start_pos,
+                std::uint32_t seed) {
+  constexpr std::uint32_t kBudget = 512;
+  const std::uint32_t n_kv = start_pos + n_tokens;
+  const std::uint32_t max_blocks = (n_kv + kRatio - 1) / kRatio;
+  const std::uint32_t mask_words = (max_blocks + 31) / 32;
+  const std::size_t q_count = static_cast<std::size_t>(n_tokens) * kQWidth;
+  const std::size_t kv_count = static_cast<std::size_t>(n_kv) * kKvWidth;
+  const auto qv = MakeValues(q_count, seed, 4.0F);
+  const auto gate = MakeValues(q_count, seed ^ 0x5555U, 3.0F);
+  std::vector<__half> kh(kv_count);
+  std::vector<__half> vh(kv_count);
+  {
+    const auto kf = MakeValues(kv_count, seed ^ 0xAAAAU, 1.0F);
+    const auto vf = MakeValues(kv_count, seed ^ 0x3333U, 1.0F);
+    for (std::size_t i = 0; i < kv_count; ++i) {
+      kh[i] = __float2half(kf[i]);
+      vh[i] = __float2half(vf[i]);
+    }
+  }
+  std::vector<std::uint32_t> mask(static_cast<std::size_t>(n_tokens) *
+                                  mask_words);
+  std::uint32_t state = seed ^ 0x77777777U;
+  for (std::uint32_t t = 0; t < n_tokens; ++t) {
+    const std::uint32_t complete = (start_pos + t + 1) / kRatio;
+    std::uint32_t* row = mask.data() + static_cast<std::size_t>(t) * mask_words;
+    if (complete <= kBudget) {
+      // The selector marks every word of a row that fits its budget.
+      std::fill(row, row + mask_words, 0xFFFFFFFFU);
+      continue;
+    }
+    // Rows alternate between the full budget and a random smaller count.
+    const std::uint32_t want =
+        t % 2 == 0 ? kBudget : 1 + NextRandom(&state) % kBudget;
+    for (std::uint32_t selected = 0; selected < want;) {
+      const auto block = NextRandom(&state) % complete;
+      if ((row[block / 32] & (1U << (block % 32))) == 0) {
+        row[block / 32] |= 1U << (block % 32);
+        ++selected;
+      }
+    }
+  }
+  const auto exact = Fp64Attention(qv, gate, kh, vh, mask.data(), mask_words,
+                                   n_tokens, start_pos);
+
+  HipBuffer<float> d_q(q_count);
+  HipBuffer<float> d_gate(q_count);
+  HipBuffer<__half> d_k(kv_count);
+  HipBuffer<__half> d_v(kv_count);
+  HipBuffer<std::uint32_t> d_mask(mask.size());
+  HipBuffer<std::uint32_t> d_pos(1);
+  HipBuffer<std::uint32_t> d_lists(static_cast<std::size_t>(n_tokens) *
+                                   kBudget);
+  HipBuffer<std::uint32_t> d_counts(n_tokens);
+  Upload(&d_q, qv);
+  Upload(&d_gate, gate);
+  Upload(&d_k, kh);
+  Upload(&d_v, vh);
+  Upload(&d_mask, mask);
+  Upload(&d_pos, std::vector<std::uint32_t>{start_pos});
+  std::cout << "lists n=" << n_tokens << " start=" << start_pos;
+  for (const std::uint32_t splits : {0U, 8U}) {
+    const std::uint32_t z = std::max(splits, 1U);
+    HipBuffer<float> d_partials(static_cast<std::size_t>(n_tokens) * kHeads *
+                                z * (kDim + 2));
+    HipBuffer<float> d_walk(q_count);
+    HipBuffer<float> d_list(q_count);
+    float* partials = splits == 0 ? nullptr : d_partials.get();
+    q::Attention(d_q.get(), d_k.get(), d_v.get(), d_mask.get(), mask_words,
+                 d_walk.get(), partials, splits, n_tokens, d_pos.get(), kHeads,
+                 kKvHeads, kDim, kRatio, nullptr);
+    q::Attention(d_q.get(), d_k.get(), d_v.get(), d_mask.get(), mask_words,
+                 d_list.get(), partials, splits, n_tokens, d_pos.get(), kHeads,
+                 kKvHeads, kDim, kRatio, nullptr, d_lists.get(), d_counts.get(),
+                 kBudget);
+    q::SigmoidMul(d_walk.get(), d_gate.get(), q_count, nullptr);
+    q::SigmoidMul(d_list.get(), d_gate.get(), q_count, nullptr);
+    CheckHip(hipDeviceSynchronize(), "list attention");
+    const auto walk = Download(&d_walk, q_count);
+    const auto list = Download(&d_list, q_count);
+    if (std::memcmp(walk.data(), list.data(), q_count * sizeof(float)) != 0) {
+      throw std::runtime_error("list attention differs from the mask walk");
+    }
+    double error = 0.0;
+    for (std::size_t i = 0; i < q_count; ++i) {
+      if (!std::isfinite(list[i])) {
+        throw std::runtime_error("list attention output is not finite");
+      }
+      error = std::max(error, std::abs(list[i] - exact[i]));
+    }
+    std::cout << (splits == 0 ? " single " : " split8 ") << error;
+    if (error > kFp64Limit) {
+      throw std::runtime_error("list attention exceeds its FP64 limit");
+    }
+  }
+  std::cout << " bitwise-equal\n";
+}
+
+// The position is a device value while the host sizes the mask rows. A
+// position past a row must attend as if the blocks after it were not
+// selected, without reading the words that follow the row.
+void CheckPositionPastMask() {
+  constexpr std::uint32_t kBudget = 512;
+  constexpr std::uint32_t mask_words = 20, start_pos = 4 * 32 * 26 + 2;
+  constexpr std::uint32_t wide_words = 32, guard = 64;
+  constexpr std::uint32_t n_kv = start_pos + 1;
+  const std::size_t kv_count = static_cast<std::size_t>(n_kv) * kKvWidth;
+  const auto qv = MakeValues(kQWidth, 0x9A5C0DE5U, 4.0F);
+  std::vector<__half> kh(kv_count);
+  std::vector<__half> vh(kv_count);
+  {
+    const auto kf = MakeValues(kv_count, 0x6B1D7A11U, 1.0F);
+    const auto vf = MakeValues(kv_count, 0x1F00D5EDU, 1.0F);
+    for (std::size_t i = 0; i < kv_count; ++i) {
+      kh[i] = __float2half(kf[i]);
+      vh[i] = __float2half(vf[i]);
+    }
+  }
+  // Every fourth block of the row is selected. Past the row, the narrow
+  // mask is followed by guard words that would select every block; the
+  // wide mask selects none of them.
+  std::vector<std::uint32_t> narrow(mask_words + guard, 0xFFFFFFFFU);
+  std::vector<std::uint32_t> wide(wide_words, 0U);
+  for (std::uint32_t w = 0; w < mask_words; ++w)
+    narrow[w] = wide[w] = 0x11111111U;
+  HipBuffer<float> d_q(kQWidth);
+  HipBuffer<__half> d_k(kv_count);
+  HipBuffer<__half> d_v(kv_count);
+  HipBuffer<std::uint32_t> d_narrow(narrow.size());
+  HipBuffer<std::uint32_t> d_wide(wide.size());
+  HipBuffer<std::uint32_t> d_pos(1);
+  HipBuffer<std::uint32_t> d_lists(kBudget);
+  HipBuffer<std::uint32_t> d_counts(1);
+  Upload(&d_q, qv);
+  Upload(&d_k, kh);
+  Upload(&d_v, vh);
+  Upload(&d_narrow, narrow);
+  Upload(&d_wide, wide);
+  Upload(&d_pos, std::vector<std::uint32_t>{start_pos});
+  for (const std::uint32_t splits : {0U, 8U}) {
+    HipBuffer<float> d_partials(static_cast<std::size_t>(kHeads) *
+                                std::max(splits, 1U) * (kDim + 2));
+    float* partials = splits == 0 ? nullptr : d_partials.get();
+    const auto attend = [&](HipBuffer<std::uint32_t>& mask, std::uint32_t words,
+                            bool lists) {
+      HipBuffer<float> d_out(kQWidth);
+      q::Attention(d_q.get(), d_k.get(), d_v.get(), mask.get(), words,
+                   d_out.get(), partials, splits, 1, d_pos.get(), kHeads,
+                   kKvHeads, kDim, kRatio, nullptr,
+                   lists ? d_lists.get() : nullptr,
+                   lists ? d_counts.get() : nullptr, lists ? kBudget : 0);
+      CheckHip(hipDeviceSynchronize(), "attention past the mask row");
+      return Download(&d_out, kQWidth);
+    };
+    const auto reference = attend(d_wide, wide_words, false);
+    for (const bool lists : {false, true}) {
+      const auto out = attend(d_narrow, mask_words, lists);
+      if (std::memcmp(out.data(), reference.data(), kQWidth * sizeof(float)) !=
+          0)
+        throw std::runtime_error(std::string("attention read past its mask "
+                                             "row: ") +
+                                 (lists ? "lists" : "walk") +
+                                 " splits=" + std::to_string(splits));
+    }
+  }
+  std::cout << "attention past " << mask_words * 32
+            << " mask bits: walk and lists ignore the following words\n";
+}
+
+/// A decode or verification row's context must not depend on the chain it
+/// is computed in. A query before the 2048-token budget sweeps its keys
+/// densely when decoded alone (no mask); a chain that crosses the budget
+/// passes the selector's mask, which marks every block of such rows. The
+/// mask walk attends the incomplete tail block in a tile of its own, so the
+/// launcher must keep those rows on the dense sweep. Compares every row of
+/// chains starting at 2040..2047 (one launch, eight splits, compact lists)
+/// bit for bit against the same row launched alone, and checks that the
+/// mask walk would have differed.
+void CheckBudgetRows(std::uint32_t seed) {
+  constexpr std::uint32_t kBudget = 512;
+  constexpr std::uint32_t kTopK = kBudget * kRatio;
+  constexpr std::uint32_t kSplits = 8;
+  constexpr std::uint32_t kChain = 8;
+  constexpr std::uint32_t kFirst = kTopK - 8;
+  const std::uint32_t n_kv = kFirst + 7 + kChain;
+  const std::uint32_t mask_words = ((n_kv + kRatio - 1) / kRatio + 31) / 32;
+  const std::size_t kv_count = static_cast<std::size_t>(n_kv) * kKvWidth;
+  std::vector<__half> kh(kv_count);
+  std::vector<__half> vh(kv_count);
+  {
+    const auto kf = MakeValues(kv_count, seed ^ 0xAAAAU, 1.0F);
+    const auto vf = MakeValues(kv_count, seed ^ 0x3333U, 1.0F);
+    for (std::size_t i = 0; i < kv_count; ++i) {
+      kh[i] = __float2half(kf[i]);
+      vh[i] = __float2half(vf[i]);
+    }
+  }
+  HipBuffer<__half> d_k(kv_count);
+  HipBuffer<__half> d_v(kv_count);
+  Upload(&d_k, kh);
+  Upload(&d_v, vh);
+  const std::size_t q_count = std::size_t{kChain} * kQWidth;
+  HipBuffer<float> d_q(q_count);
+  HipBuffer<std::uint32_t> d_mask(std::size_t{kChain} * mask_words);
+  HipBuffer<std::uint32_t> d_pos(1);
+  HipBuffer<std::uint32_t> d_lists(std::size_t{kChain} * kBudget);
+  HipBuffer<std::uint32_t> d_counts(kChain);
+  HipBuffer<float> d_partials(std::size_t{kChain} * kHeads * kSplits *
+                              (kDim + 2));
+  HipBuffer<float> d_out(q_count);
+  std::uint32_t state = seed ^ 0x77777777U;
+  std::uint32_t walk_differs = 0;
+  for (std::uint32_t first = kFirst; first < kTopK; ++first) {
+    const auto qv = MakeValues(q_count, seed + first, 4.0F);
+    // The selector's mask: every word of a row within the budget, else a
+    // random full budget of complete blocks.
+    std::vector<std::uint32_t> mask(std::size_t{kChain} * mask_words);
+    for (std::uint32_t t = 0; t < kChain; ++t) {
+      const std::uint32_t complete = (first + t + 1) / kRatio;
+      std::uint32_t* row = mask.data() + std::size_t{t} * mask_words;
+      if (complete <= kBudget) {
+        std::fill(row, row + mask_words, 0xFFFFFFFFU);
+        continue;
+      }
+      for (std::uint32_t selected = 0; selected < kBudget;) {
+        const auto block = NextRandom(&state) % complete;
+        if ((row[block / 32] & (1U << (block % 32))) == 0) {
+          row[block / 32] |= 1U << (block % 32);
+          ++selected;
+        }
+      }
+    }
+    Upload(&d_q, qv);
+    Upload(&d_mask, mask);
+    const auto launch = [&](std::uint32_t row, std::uint32_t rows, bool masked,
+                            std::uint32_t dense_extent) {
+      Upload(&d_pos, std::vector<std::uint32_t>{first + row});
+      q::Attention(
+          d_q.get() + std::size_t{row} * kQWidth, d_k.get(), d_v.get(),
+          masked ? d_mask.get() + std::size_t{row} * mask_words : nullptr,
+          mask_words, d_out.get() + std::size_t{row} * kQWidth,
+          d_partials.get(), kSplits, rows, d_pos.get(), kHeads, kKvHeads, kDim,
+          kRatio, nullptr, d_lists.get(), d_counts.get(), kBudget,
+          dense_extent);
+      CheckHip(hipDeviceSynchronize(), "budget attention");
+    };
+    for (std::uint32_t t = 0; t < kChain; ++t)
+      launch(t, 1, first + t >= kTopK, kTopK);
+    const auto alone = Download(&d_out, q_count);
+    launch(0, kChain, true, kTopK);
+    const auto chained = Download(&d_out, q_count);
+    launch(0, kChain, true, 0);
+    const auto walk = Download(&d_out, q_count);
+    for (std::uint32_t t = 0; t < kChain; ++t) {
+      const auto at = std::size_t{t} * kQWidth;
+      if (std::memcmp(alone.data() + at, chained.data() + at,
+                      kQWidth * sizeof(float)) != 0)
+        throw std::runtime_error(
+            "attention row " + std::to_string(first + t) +
+            " differs between a budget-crossing chain and decoding alone");
+      walk_differs += std::memcmp(alone.data() + at, walk.data() + at,
+                                  kQWidth * sizeof(float)) != 0;
+    }
+  }
+  // Rows with an incomplete tail block before the budget take another tile
+  // partition on the mask walk; the check must be able to see that.
+  if (walk_differs == 0)
+    throw std::runtime_error("the budget check cannot tell the routes apart");
+  std::cout << "budget-crossing chains from " << kFirst << " to " << kTopK - 1
+            << ": rows bitwise-equal to decoding alone (" << walk_differs
+            << " rows differ on the mask walk)\n";
 }
 
 void CheckChunks(std::uint32_t n, std::uint32_t split) {
@@ -602,16 +1029,52 @@ void CheckChunks(std::uint32_t n, std::uint32_t split) {
     throw std::runtime_error("attention depends on prefill chunk boundary");
 }
 
+void CheckWmmaLiveExtent() {
+  HipBuffer<float> qv(kQWidth), gate(kQWidth), out(kQWidth);
+  HipBuffer<__half> k(kKvWidth), v(kKvWidth);
+  HipBuffer<std::uint32_t> mask(3200);
+  // Both cases are refused before any launch, so the small buffers are safe.
+  const auto accepts = [&](std::uint32_t n, std::uint32_t start,
+                           std::uint32_t words) {
+    return q::WmmaCausalAttention(qv.get(), gate.get(), k.get(), v.get(),
+                                  mask.get(), words, out.get(), n, start,
+                                  kHeads, kKvHeads, kDim, kRatio, nullptr);
+  };
+  // A row stride narrower than the live extent is a caller error.
+  if (accepts(4, 131069, 1024))
+    throw std::runtime_error("WMMA accepted a stride below the live extent");
+  // Compact entries hold 28-bit block indices: 2^30 visible tokens at most.
+  const std::uint32_t limit =
+      q::WmmaCausalAttentionContextLimit(kHeads, kKvHeads, kDim, kRatio);
+  if (limit != (1U << 30))
+    throw std::runtime_error("WMMA context limit is not 2^30 tokens");
+  if (accepts(4, limit - 3, (1U << 23) + 1))
+    throw std::runtime_error("WMMA accepted an extent past 2^28 blocks");
+  std::cout << "WMMA live extent: limit " << limit
+            << " tokens, narrow stride refused\n";
+}
+
 }  // namespace
 
 int main() {
   try {
     CheckChunks(136, 94);
     CheckChunks(2048, 1025);
+    CheckBudgetRows(0xB0D6E7U);
+    CheckWmmaLiveExtent();
+    CheckPositionPastMask();
     CheckPreparation(1, 0, 64);
     CheckPreparation(8, 4096, 64);
     CheckPreparation(65, 131069, 64);
     CheckPreparation(7, 131069, 256);
+    CheckPreparation(8, 4096, 64, Yarn(1.5625F));
+    CheckPreparation(65, 300000, 64, Yarn(2.5F));
+    CheckYarnPhase(1.0F, 262143);  // off: sincosf accuracy at native depth
+    for (const float factor : {1.5625F, 2.5F, 4.0F})
+      for (const std::uint32_t position : {1000U, 300000U, 650000U})
+        CheckYarnPhase(factor, position);
+    CheckYarnVisionPhase(2.5F);
+    CheckOracleRms();
     // Structured selections against the sparse path's 1024-block compaction
     // windows and 64-block key tiles. At 131069 the last 512 blocks sit in
     // the final window; 262141 spans all 64 windows of the native context,
@@ -664,7 +1127,18 @@ int main() {
         {"64-in-one-window", 131069, one_window},
         {"513-total", 131069, spread(513)},
         {"576-total", 131069, spread(576)},
+        // A YaRN-scaled capacity (409600 at factor 1.5625, 3200 mask words):
+        // chunks past the native 262144 tokens take this same kernel.
+        {"63-per-window-past-native", 409597, per_window(63)},
     };
+    // Compacted selections: a short context that selects every block, then
+    // the budgeted rows at increasing depth, up to the 160K decode target.
+    std::uint32_t list_seed = 0x115700U;
+    for (const std::uint32_t depth : {1500U, 8192U, 32768U, 163840U}) {
+      for (const std::uint32_t n : {1U, 3U, 8U}) {
+        CheckLists(n, depth, list_seed++);
+      }
+    }
     std::uint32_t structured_seed = 0x5EED0000U;
     for (const Structured& c : structured) {
       for (const std::uint32_t n : {1U, 3U}) {
@@ -713,6 +1187,29 @@ int main() {
       // The reference accumulates FP32 probabilities; the WMMA route rounds
       // Q and P to FP16, so the contract is a small absolute envelope on
       // values of order one.
+      ok = ok && worst < 2e-2;
+    }
+    // A capacity wider than 262,144 (3,200 words at 409,600). Up to 2,048
+    // live words the union mask is built in one pass; past it (2,049 words
+    // at 262,141 + 4, then up to 3,200 at 409,600) in several. Budgeted rows
+    // compact their union; one-in-sixteen random rows overflow the list and
+    // walk the union words, in LDS up to 2,052 words and recomputed from
+    // the rows' masks beyond.
+    struct Wide {
+      std::uint32_t n_tokens;
+      std::uint32_t start_pos;
+      bool bounded;
+    };
+    for (const Wide& c :
+         {Wide{5, 131069, true}, Wide{4, 262140, true}, Wide{4, 262141, true},
+          Wide{4, 262141, false}, Wide{7, 262141, true}, Wide{4, 397688, true},
+          Wide{7, 397688, true}, Wide{5, 409595, true},
+          Wide{5, 409595, false}}) {
+      const double worst =
+          Compare(c.n_tokens, c.start_pos, true, seed++, true, c.bounded, 3200);
+      std::cout << "WMMA attention n=" << c.n_tokens << " start=" << c.start_pos
+                << " stride=3200 " << (c.bounded ? "budgeted" : "sparse")
+                << " worst absolute error " << worst << '\n';
       ok = ok && worst < 2e-2;
     }
     return ok ? 0 : 1;

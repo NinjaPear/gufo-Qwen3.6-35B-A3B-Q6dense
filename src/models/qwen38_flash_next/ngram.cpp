@@ -1,25 +1,27 @@
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <bit>
 #include <cerrno>
 #include <cstring>
-#include <unordered_map>
-
-#include "src/core/quant/ggml_dequant.hpp"
+#include <gufo/ext/experimental/ggml_dequant.hpp>
+#include <gufo/ext/platform/fs.hpp>
+#include <gufo/ext/platform/mapped_file.hpp>
+#include <limits>
+#include <stdexcept>
+#include <system_error>
 
 namespace gufo::models::qwen38_flash_next {
 namespace {
 
 constexpr std::size_t kPage = 4096;
-// Keep enough direct reads outstanding while layer 0 runs.
-constexpr std::size_t kWorkers = 32;
+// Next-chunk prefetch hides later gathers behind the current transformer
+// pass, but a prefill's first chunk waits for its own gather. Readers block
+// in `pread`, so the pool sets that gather's queue depth.
+constexpr std::size_t kWorkers = 128;
 constexpr std::size_t kReadBatch = 8;
 constexpr std::size_t kBatchJobs = 1024;
-constexpr std::size_t kCacheBytes = 8 * 1024 * 1024;
+constexpr std::size_t kCacheBytes = 128 * 1024 * 1024;
 
 }  // namespace
 
@@ -68,19 +70,23 @@ NgramTable::~NgramTable() {
   for (auto& w : workers_) {
     w.join();
   }
-  if (fd_ >= 0) {
-    ::close(fd_);
+  if (file_ != platform::kInvalidFile) {
+    platform::CloseFile(file_);
   }
 }
 
 std::unique_ptr<NgramTable> NgramTable::Open(
-    int file_descriptor, std::uint64_t file_offset, std::uint64_t rows,
+    platform::PlatformFile file, std::uint64_t file_offset, std::uint64_t rows,
     std::uint32_t row_dim, core::GgmlType type, std::string* error_msg) {
   std::unique_ptr<NgramTable> t(new NgramTable());
-  const std::size_t block = type == core::GgmlType::kIQ4_NL ? 32 : 1;
-  const std::size_t block_bytes = type == core::GgmlType::kIQ4_NL ? 18 : 2;
-  if ((type != core::GgmlType::kIQ4_NL && type != core::GgmlType::kBF16) ||
-      row_dim == 0 || row_dim % block != 0) {
+  const bool blocked =
+      type == core::GgmlType::kIQ4_NL || type == core::GgmlType::kQ8_0;
+  const std::size_t block = blocked ? 32 : 1;
+  const std::size_t block_bytes = type == core::GgmlType::kIQ4_NL ? 18
+                                  : type == core::GgmlType::kQ8_0 ? 34
+                                                                  : 2;
+  if ((!blocked && type != core::GgmlType::kBF16) || row_dim == 0 ||
+      row_dim % block != 0) {
     if (error_msg != nullptr) {
       *error_msg = "unsupported n-gram table format";
     }
@@ -94,24 +100,21 @@ std::unique_ptr<NgramTable> NgramTable::Open(
   t->cache_rows_.resize(t->cache_count_ * t->row_bytes_);
   t->rows_ = rows;
   t->base_offset_ = file_offset;
-  // Direct I/O bypasses the page cache; the mapping used for the rest of the
-  // model must not be used here or every touched row would stay resident.
-  const auto path = "/proc/self/fd/" + std::to_string(file_descriptor);
-  t->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-  t->direct_ = t->fd_ >= 0;
-  if (t->fd_ < 0) {
-    t->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  // Linux direct I/O avoids retaining every touched row in the page cache;
+  // Windows uses cached concurrent reads of the otherwise mapped model.
+  // When the platform cannot provide it, rows read buffered through a
+  // duplicate: the table always owns the handle it closes.
+  t->file_ = platform::ReopenRandomReadFile(file, t->direct_);
+  if (!platform::FileValid(t->file_)) {
+    t->file_ = platform::DuplicateFile(file);
   }
-  if (t->fd_ < 0) {
+  if (t->file_ == platform::kInvalidFile) {
     if (error_msg != nullptr) {
-      *error_msg = std::string("cannot open bound n-gram table: ") +
-                   std::strerror(errno);
+      *error_msg = "cannot open bound n-gram table";
     }
     return nullptr;
   }
-  const std::size_t workers = std::min(
-      kWorkers, static_cast<std::size_t>(std::thread::hardware_concurrency()));
-  for (std::size_t i = 0; i < std::max<std::size_t>(1, workers); ++i) {
+  for (std::size_t i = 0; i < kWorkers; ++i) {
     t->workers_.emplace_back([raw = t.get()] { raw->Worker(); });
   }
   return t;
@@ -120,6 +123,8 @@ std::unique_ptr<NgramTable> NgramTable::Open(
 void NgramTable::DecodeRow(const std::uint8_t* src, float* dst) const {
   if (type_ == core::GgmlType::kIQ4_NL) {
     gufo::quant::DequantizeIQ4_NL(src, dst, row_dim_);
+  } else if (type_ == core::GgmlType::kQ8_0) {
+    gufo::quant::DequantizeQ8_0(src, dst, row_dim_);
   } else {
     for (std::uint32_t i = 0; i < row_dim_; ++i) {
       std::uint16_t bits = 0;
@@ -148,11 +153,13 @@ bool NgramTable::ReadCached(std::uint32_t row, float* dst) {
 }
 
 bool NgramTable::ReadOne(std::uint32_t row, float* dst,
-                         std::vector<std::uint8_t>& buf) {
+                         std::vector<std::uint8_t>& buf, NgramCounters* owner) {
   if (row >= rows_) {
     return false;
   }
   if (ReadCached(row, dst)) {
+    if (owner != nullptr)
+      owner->cache_hits_.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
   const std::uint64_t offset = base_offset_ + row * row_bytes_;
@@ -179,16 +186,20 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
   std::uint8_t* cached =
       entry != nullptr ? cache_rows_.data() + slot * row_bytes_ : nullptr;
   std::size_t got = 0;
+  std::error_code ec;
   while (got < needed) {
-    const ssize_t n = ::pread(fd_, base + got, length - got, begin + got);
-    if (n <= 0) {
-      if (n < 0 && errno == EINTR) {
-        continue;
-      }
+    const std::size_t n =
+        platform::ReadAt(file_, begin + got, base + got, length - got, ec);
+    if (n == 0 && ec == std::errc::interrupted) {
+      continue;
+    }
+    if (n == 0) {
       return false;
     }
-    got += static_cast<std::size_t>(n);
+    got += n;
   }
+  if (owner != nullptr)
+    owner->disk_reads_.fetch_add(1, std::memory_order_relaxed);
   // Cache only a complete row, still in its original quantized format.
   // A busy slot is skipped; readers never wait for another row's I/O.
   if (entry != nullptr &&
@@ -221,7 +232,7 @@ void NgramTable::Worker() {
     lock.unlock();
     bool ok = true;
     for (std::size_t i = 0; i < count; ++i) {
-      ok = ReadOne(batch[i].row, batch[i].dst, buf) && ok;
+      ok = ReadOne(batch[i].row, batch[i].dst, buf, batch[i].owner) && ok;
     }
     lock.lock();
     failed_ = failed_ || !ok;
@@ -237,27 +248,77 @@ bool NgramTable::Read(std::span<const std::uint32_t> rows,
   return StartRead(rows, out) && WaitRead();
 }
 
+void NgramTable::ReserveGather(std::size_t rows) {
+  const std::lock_guard lock(mutex_);
+  if (active_)
+    throw std::logic_error("cannot reserve an outstanding n-gram gather");
+  if (rows > std::numeric_limits<std::size_t>::max() / 4)
+    throw std::length_error("n-gram gather is too large");
+  const auto capacity = std::bit_ceil(std::max<std::size_t>(2, rows * 2));
+  if (first_rows_.size() < capacity)
+    first_rows_.resize(capacity);
+  // Touch the reserved pages too: later, larger prefills should not fault
+  // their scratch while cache backing is being populated.
+  jobs_.resize(rows);
+  jobs_.clear();
+  copies_.resize(rows);
+  copies_.clear();
+}
+
 bool NgramTable::StartRead(std::span<const std::uint32_t> rows,
-                           std::span<float> out) {
+                           std::span<float> out,
+                           std::span<const NgramGatherOwner> owners) {
   std::lock_guard<std::mutex> lock(mutex_);
+  std::size_t owned = 0;
+  for (const auto& owner : owners)
+    owned += owner.rows;
   if (active_ || rows.size() > out.size() / row_dim_ ||
+      rows.size() > std::numeric_limits<std::size_t>::max() / 4 ||
+      (!owners.empty() && owned != rows.size()) ||
       std::any_of(rows.begin(), rows.end(),
                   [this](std::uint32_t row) { return row >= rows_; })) {
     return false;
   }
-  // Read each distinct row once, then copy it to its other slots.
-  std::unordered_map<std::uint32_t, std::size_t> first;
-  first.reserve(rows.size());
+  for (const auto& owner : owners) {
+    if (owner.counters != nullptr)
+      owner.counters->rows_.fetch_add(owner.rows, std::memory_order_relaxed);
+  }
+  // A node-based map allocates on every gather. Those allocations can wait
+  // behind background cache page registration before any GPU work is queued.
+  // Keep a flat table at most half full and clear only this gather's size;
+  // decode after a large prefill must not scan the whole retained capacity.
+  constexpr auto empty = std::numeric_limits<std::size_t>::max();
+  const auto capacity =
+      std::bit_ceil(std::max<std::size_t>(2, rows.size() * 2));
+  if (first_rows_.size() < capacity)
+    first_rows_.resize(capacity);
+  auto first = std::span(first_rows_).first(capacity);
+  std::ranges::fill(first, empty);
   jobs_.clear();
   copies_.clear();
   jobs_.reserve(rows.size());
+  copies_.reserve(rows.size());
+  auto owner = owners.begin();
+  std::size_t owner_end = owner != owners.end() ? owner->rows : rows.size();
   for (std::size_t i = 0; i < rows.size(); ++i) {
-    const auto [it, inserted] = first.emplace(rows[i], i);
-    if (inserted) {
-      jobs_.push_back({rows[i], out.data() + i * row_dim_});
+    while (i == owner_end) {
+      ++owner;
+      owner_end += owner->rows;
+    }
+    NgramCounters* const counters =
+        owner != owners.end() ? owner->counters : nullptr;
+    const auto hash = std::uint64_t{rows[i]} * 0x9e3779b97f4a7c15ULL;
+    auto slot = static_cast<std::size_t>(hash ^ (hash >> 32)) & (capacity - 1);
+    while (first[slot] != empty && rows[first[slot]] != rows[i])
+      slot = (slot + 1) & (capacity - 1);
+    if (first[slot] == empty) {
+      first[slot] = i;
+      jobs_.push_back({rows[i], out.data() + i * row_dim_, counters});
     } else {
       copies_.push_back(
-          {out.data() + it->second * row_dim_, out.data() + i * row_dim_});
+          {out.data() + first[slot] * row_dim_, out.data() + i * row_dim_});
+      if (counters != nullptr)
+        counters->dedup_rows_.fetch_add(1, std::memory_order_relaxed);
     }
   }
   if (jobs_.size() >= kBatchJobs) {
@@ -266,15 +327,25 @@ bool NgramTable::StartRead(std::span<const std::uint32_t> rows,
   } else {
     // Small cached gathers avoid waking the I/O pool for every decode
     // token. Large prefills still parallelize their row conversions.
-    std::erase_if(
-        jobs_, [this](const Job& job) { return ReadCached(job.row, job.dst); });
+    std::erase_if(jobs_, [this](const Job& job) {
+      if (!ReadCached(job.row, job.dst))
+        return false;
+      if (job.owner != nullptr)
+        job.owner->cache_hits_.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    });
   }
   next_job_ = 0;
   pending_ = jobs_.size();
   failed_ = false;
   active_ = true;
-  if (pending_ != 0) {
+  // A decode gather has a handful of reads: wake one reader per read, not
+  // the whole pool. Readers keep taking jobs until the queue is empty.
+  if (pending_ >= workers_.size()) {
     wake_.notify_all();
+  } else {
+    for (std::size_t i = 0; i < pending_; ++i)
+      wake_.notify_one();
   }
   return true;
 }

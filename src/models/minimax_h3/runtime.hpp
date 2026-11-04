@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <gufo/ext/platform/mapped_file.hpp>
 #include <memory>
 #include <optional>
 #include <span>
@@ -247,6 +248,7 @@ public:
 private:
   struct Mapping {
     std::filesystem::path shard;
+    platform::RawMappedFile mapping_file;
     void* host{nullptr};
     void* device_alias{nullptr};
     std::size_t bytes{0};

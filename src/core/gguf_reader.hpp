@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "src/core/model_config.hpp"
+#include "src/core/platform/mapped_file.hpp"
 
 namespace gufo::core {
 
@@ -35,10 +36,15 @@ enum class GgmlType : std::uint16_t {
   kQ6_K = 14,
   kQ8_K = 15,
   kIQ2_XXS = 16,
+  kIQ2_XS = 17,
+  kIQ3_XXS = 18,
+  kIQ1_S = 19,
   kIQ4_NL = 20,
   kIQ3_S = 21,
+  kIQ2_S = 22,
   kIQ4_XS = 23,
   kI32 = 26,
+  kIQ1_M = 29,
   kBF16 = 30,
 };
 
@@ -74,14 +80,24 @@ enum class GgmlType : std::uint16_t {
       return "Q8_K";
     case GgmlType::kIQ2_XXS:
       return "IQ2_XXS";
+    case GgmlType::kIQ2_XS:
+      return "IQ2_XS";
+    case GgmlType::kIQ3_XXS:
+      return "IQ3_XXS";
+    case GgmlType::kIQ1_S:
+      return "IQ1_S";
     case GgmlType::kIQ4_NL:
       return "IQ4_NL";
     case GgmlType::kIQ3_S:
       return "IQ3_S";
+    case GgmlType::kIQ2_S:
+      return "IQ2_S";
     case GgmlType::kIQ4_XS:
       return "IQ4_XS";
     case GgmlType::kI32:
       return "I32";
+    case GgmlType::kIQ1_M:
+      return "IQ1_M";
     case GgmlType::kBF16:
       return "BF16";
   }
@@ -144,8 +160,11 @@ struct GgufTensorInfo {
 struct GgufMappedRegion {
   const void* data{nullptr};
   std::size_t size{0};
-  /// Borrowed descriptor, valid for the reader lifetime; -1 for memory images.
-  int file_descriptor{-1};
+  /// Borrowed platform handle of the mapping, valid for the reader lifetime;
+  /// invalid for memory images. Weight-upload readers duplicate or reopen it
+  /// instead of resolving `source_path` again.
+  platform::PlatformFile file_descriptor{platform::kInvalidFile};
+  std::filesystem::path source_path{};
 };
 
 /// Zero-copy, lightweight GGUF binary reader and tensor indexer.
@@ -207,11 +226,6 @@ public:
     return tensors_;
   }
 
-  /// Extracts and validates model configuration from embedded config or
-  /// standard keys.
-  [[nodiscard]] std::optional<ModelConfig> ExtractModelConfig(
-      std::string* error_msg = nullptr) const;
-
   /// Names the weight format this file was produced in, for benchmark and
   /// diagnostic output. Prefers the `general.file_type` the quantizer recorded
   /// (llama.cpp's ftype, so the label matches `llama-bench` on the same
@@ -237,10 +251,9 @@ private:
   bool ParseHeaders(std::string* error_msg);
 
   const std::uint8_t* data_{nullptr};
-  void* mmap_addr_{nullptr};
   std::size_t size_{0};
-  int fd_{-1};
-  bool owns_mmap_{false};
+  std::filesystem::path source_path_;
+  platform::ReadOnlyMappedFile mapping_;
 
   std::uint32_t version_{0};
   std::uint64_t alignment_{32};

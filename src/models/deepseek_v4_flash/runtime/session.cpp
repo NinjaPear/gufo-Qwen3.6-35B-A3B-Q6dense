@@ -239,9 +239,13 @@ static int session_dspark_anchor(ds4_session* session,
   if (sampler == nullptr) {
     return ds4_sample_argmax(session->logits.get(), (uint32_t)vocabulary_size);
   }
-  const int pending = session->dspark_state.pending_anchor;
+  const int pending = sampler->unmodified_argmax
+                          ? -1
+                          : session->dspark_state.pending_anchor;
   session->dspark_state.pending_anchor = -1;
   if (pending >= 0) {
+    if (sampler->observe)
+      sampler->observe(sampler->ctx, session->logits.get(), vocabulary_size, pending);
     if (sampler->accept) sampler->accept(sampler->ctx, pending);
     return pending;
   }
@@ -369,16 +373,10 @@ int ds4_session_sample(const ds4_session *session,
       temperature, top_k, top_p, min_p, rng_state);
 }
 
-int ds4_session_copy_logits(const ds4_session *session,
-                            float *out,
-                            int capacity) {
-  if (!session || !session->checkpoint_valid || !out)
-    return 0;
-  const int vocabulary_size = ds4_engine_vocab_size(session->engine);
-  if (capacity < vocabulary_size)
-    return 0;
-  memcpy(out, session->logits.get(), (size_t)vocabulary_size * sizeof(out[0]));
-  return vocabulary_size;
+const float* ds4_session_logits(const ds4_session* session) {
+  if (!session || !session->checkpoint_valid)
+    return nullptr;
+  return session->logits.get();
 }
 
 int ds4_session_eval(ds4_session *session,
@@ -541,36 +539,25 @@ void ds4_session_snapshot_free(ds4_session_snapshot *snapshot) {
     memset(snapshot, 0, sizeof(*snapshot));
 }
 
-/* C1 retains the established four-probe/64-token acceptance policy. Concurrent
- * requests use a separate recent-cost window after their batched cycle. */
+// Judge recent completed-token cost, including the guaranteed target anchor.
+// Accepted/drafted alone over-penalizes short blocks and retains a poor start
+// across every retry. Concurrent cohorts keep their separate calibration.
 static void session_dspark_note_cycle(ds4_session* session,
                                       bool concurrent_batch) {
-  if (concurrent_batch) {
+  if (concurrent_batch)
     return;
-  }
-  constexpr uint64_t kEarlyCycles = 4u;
-  constexpr double kEarlyRejectRate = 0.25;
-  constexpr uint64_t kWarmupCycles = 8u;
-  constexpr double kBreakEvenAcceptance = 0.48;
-  constexpr uint32_t kSerialLowAcceptanceBackoff = DS4_DSPARK_RETRY_TOKENS;
-
-  const auto& state = session->dspark_state;
-  const uint64_t drafted = state.support_drafted - state.policy_start_drafted;
-  const uint64_t accepted =
-      state.support_accepted - state.policy_start_accepted;
+  auto& state = session->dspark_state;
   const uint64_t steps = state.steps - state.policy_start_steps;
-  if (drafted == 0u || steps < kEarlyCycles)
-    return;
-  const double acceptance =
-      static_cast<double>(accepted) / static_cast<double>(drafted);
-  if (steps < kWarmupCycles && acceptance >= kEarlyRejectRate) {
-    return;
+  const uint64_t drafted = state.support_drafted - state.policy_start_drafted;
+  const uint64_t accepted = state.support_accepted - state.policy_start_accepted;
+  const bool backoff = ds4_dspark_serial_backoff(steps, drafted, accepted);
+  if (backoff)
+    state.skip_remaining = DS4_DSPARK_RETRY_TOKENS;
+  if (backoff || steps >= 8u) {
+    state.policy_start_steps = state.steps;
+    state.policy_start_drafted = state.support_drafted;
+    state.policy_start_accepted = state.support_accepted;
   }
-  if (acceptance >= kBreakEvenAcceptance) {
-    session->dspark_state.skip_remaining = 0u;
-    return;
-  }
-  session->dspark_state.skip_remaining = kSerialLowAcceptanceBackoff;
 }
 
 // Cost units are hundredths of one ordinary batch decode step, calibrated
@@ -706,13 +693,9 @@ static uint32_t session_dspark_accept_prefix(
   uint32_t accepted = 1;
   *frontier_read = false;
   if (sampler == nullptr) {
-    while (accepted < drafted && row_tops[accepted - 1] == drafts[accepted]) {
-      if (stop_at_eos && ds4_token_is_stop(session->engine, drafts[accepted])) {
-        return accepted;
-      }
-      accepted++;
-    }
-    return accepted;
+    return ds4_dspark_greedy_accept(
+        row_tops, drafts, drafted,
+        stop_at_eos ? ds4_token_eos(session->engine) : -1);
   }
   while (accepted < drafted) {
     int drawn = row_tops[accepted - 1u];
@@ -743,7 +726,8 @@ static uint32_t session_dspark_accept_prefix(
         (stop_at_eos && ds4_token_is_stop(session->engine, drawn))) {
       // EOS is a completed draw, but must not enter the reusable checkpoint.
       // Emit it as the next anchor without drawing again.
-      session->dspark_state.pending_anchor = drawn;
+      if (!sampler->unmodified_argmax)
+        session->dspark_state.pending_anchor = drawn;
       return accepted;
     }
     accepted++;
@@ -767,7 +751,7 @@ static int session_dspark_finish_verified(
     session->checkpoint_valid = false;
     return 1;
   }
-  const bool sampled = sampler != nullptr;
+  const bool sampled = sampler != nullptr && !sampler->unmodified_argmax;
   uint32_t positional_accepted = 0;
   for (uint32_t i = 1; i < drafted; ++i) {
     if (row_tops[i - 1u] == drafts[i])
@@ -1328,6 +1312,8 @@ int ds4_sessions_dspark_step_batch(const ds4_session_dspark_batch_item* items,
         .row_tops = row_tops[index].data(),
         .frontier_logits = session->logits.get(),
         .row_logits = row_logits[index],
+        .stop_token =
+            items[index].stop_at_eos ? ds4_token_eos(session->engine) : -1,
     };
   }
 

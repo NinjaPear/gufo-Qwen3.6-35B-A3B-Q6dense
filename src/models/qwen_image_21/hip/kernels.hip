@@ -3,12 +3,16 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <tuple>
 #include <utility>
 
+#include <gufo/ext/experimental/weight_upload.hpp>
 #include "src/models/qwen_image_21/hip/bf16.hpp"
 #include "src/models/qwen_image_21/hip/runtime.hpp"
 
@@ -724,6 +728,12 @@ Runtime::Runtime(const Weights& weights)
 
 Runtime::~Runtime() {
   (void)hipStreamSynchronize(stream_);
+  for (std::size_t i = 0; i < staging_.size(); ++i) {
+    if (staging_[i])
+      (void)hipHostFree(staging_[i]);
+    if (staging_done_[i])
+      (void)hipEventDestroy(staging_done_[i]);
+  }
   device_weights_.clear();
   packed_source_ = {};
   packed_input_ = {};
@@ -732,6 +742,32 @@ Runtime::~Runtime() {
     (void)hipblasDestroy(blas_);
   if (stream_)
     (void)hipStreamDestroy(stream_);
+}
+
+// Copy mapped weights through runtime-owned pinned buffers. A direct
+// hipMemcpyAsync from the file mapping lets HIP pin the mapped page-cache
+// pages for the transfer; when the host reclaims them, every invalidation
+// evicts this process's GPU queues, and a 64 GB host stalls indefinitely.
+void Runtime::UploadMapped(void* device, const void* host, std::size_t bytes) {
+  constexpr std::size_t kStagingBytes = 64ULL << 20;
+  for (std::size_t i = 0; i < staging_.size(); ++i) {
+    if (!staging_[i])
+      Check(hipHostMalloc(&staging_[i], kStagingBytes, hipHostMallocDefault));
+    if (!staging_done_[i])
+      Check(hipEventCreateWithFlags(&staging_done_[i], hipEventDisableTiming));
+  }
+  auto* target = static_cast<std::byte*>(device);
+  const auto* source = static_cast<const std::byte*>(host);
+  for (std::size_t offset = 0, slot = 0; offset < bytes;
+       offset += kStagingBytes, slot ^= 1U) {
+    const auto chunk = std::min(kStagingBytes, bytes - offset);
+    // The buffer is reused only after its previous copy has completed.
+    Check(hipEventSynchronize(staging_done_[slot]));
+    std::memcpy(staging_[slot], source + offset, chunk);
+    Check(hipMemcpyAsync(target + offset, staging_[slot], chunk,
+                         hipMemcpyHostToDevice, stream_));
+    Check(hipEventRecord(staging_done_[slot], stream_));
+  }
 }
 
 Matrix Runtime::Raw(std::size_t bytes) {
@@ -779,35 +815,99 @@ Matrix Runtime::UploadFloat(std::span<const float> values, int rows, int cols) {
 Matrix Runtime::Weight(std::string_view name) {
   if (auto it = device_weights_.find(name); it != device_weights_.end())
     return it->second;
-  // Fault complete active components in parallel instead of serial faults
-  // during each HIP upload. Text-to-image never needs the visual encoder.
+  // Load complete active components at once. Text-to-image never needs the
+  // visual encoder.
   for (const std::string_view prefix :
        {"transformer.", "text_encoder.model.language_model.",
         "text_encoder.model.visual.", "vae.encoder.", "vae.decoder."}) {
     if (name.starts_with(prefix) &&
         std::ranges::find(prefetched_groups_, prefix) ==
             prefetched_groups_.end()) {
-      weights_.Prefetch(prefix);
+      // Without a readable file, fault the component in parallel instead of
+      // serial faults during each HIP upload.
+      if (!UploadGroup(prefix))
+        weights_.Prefetch(prefix);
       prefetched_groups_.push_back(prefix);
       break;
     }
   }
+  if (auto it = device_weights_.find(name); it != device_weights_.end())
+    return it->second;
   const auto& w = weights_.Get(name);
+  auto target = Stage(w);
+  UploadMapped(target.raw.data ? target.raw.data : target.m.data, w.data,
+               w.bytes);
+  return Store(name, w, std::move(target));
+}
+
+Runtime::StagedWeight Runtime::Stage(const qwen_image_21::Weight& w) {
   const int rows = w.shape.empty() ? 1 : w.shape[0];
   const auto count = w.bytes / (w.bf16 ? 2 : 4);
   if (count / rows > static_cast<std::size_t>(std::numeric_limits<int>::max()))
     throw std::runtime_error("Qwen-Image weight exceeds matrix dimensions");
-  const int cols = static_cast<int>(count / rows);
-  Matrix m = New(rows, cols);
-  if (w.bf16)
-    Check(hipMemcpyAsync(m.data, w.data, w.bytes, hipMemcpyHostToDevice,
-                         stream_));
-  else {
-    auto raw = Raw(w.bytes);
-    Check(hipMemcpyAsync(raw.data, w.data, w.bytes, hipMemcpyHostToDevice,
-                         stream_));
+  StagedWeight target{.m = New(rows, static_cast<int>(count / rows))};
+  if (!w.bf16)
+    target.raw = Raw(w.bytes);
+  return target;
+}
+
+// Streams a component from its safetensors files through WeightUpload's
+// bounded pinned buffers. Copying through the mapping faults every page into
+// the process working set first; on Windows those pages stay resident, so a
+// 31 GB model exhausts a 32 GB host beside the GPU carve-out.
+bool Runtime::UploadGroup(std::string_view prefix) {
+  // Bound temporary device storage as well as pinned host storage. Keeping
+  // an entire F32 component staged needs three times its final BF16 size.
+  constexpr std::size_t kBatchBytes = 256ULL << 20;
+  std::vector<
+      std::tuple<std::string_view, const qwen_image_21::Weight*, StagedWeight>>
+      staged;
+  std::string error;
+  // Destroy the uploader before staged on every exit, including allocation
+  // failures, so no worker can write to a destination returned to the pool.
+  auto uploader = gufo::hip::WeightUpload::Create(weights_.Files(), &error);
+  if (!uploader)
+    return false;
+  // Pool blocks handed out below may still be read by queued kernels, and the
+  // uploader copies on its own streams.
+  Synchronize();
+  std::size_t staged_bytes = 0;
+  const auto flush = [&] {
+    if (!uploader->Finish(&error))
+      throw std::runtime_error("Qwen-Image weight upload failed: " + error);
+    for (auto& [name, w, target] : staged)
+      Store(name, *w, std::move(target));
+    staged.clear();
+    staged_bytes = 0;
+  };
+  for (const auto& [name, w] : weights_.Group(prefix)) {
+    if (device_weights_.contains(name))
+      continue;
+    const auto bytes = w->bf16 ? w->bytes : w->bytes + w->bytes / 2;
+    // A tensor larger than the budget is uploaded alone.
+    if (!staged.empty() &&
+        bytes > kBatchBytes - std::min(staged_bytes, kBatchBytes))
+      flush();
+    auto target = Stage(*w);
+    void* destination = target.raw.data ? target.raw.data : target.m.data;
+    staged.emplace_back(name, w, std::move(target));
+    staged_bytes += bytes;
+    if (!uploader->Copy(w->file, w->offset, w->bytes, destination, &error))
+      break;
+  }
+  flush();
+  return true;
+}
+
+Matrix Runtime::Store(std::string_view name, const qwen_image_21::Weight& w,
+                      StagedWeight target) {
+  Matrix m = std::move(target.m);
+  const int rows = m.rows, cols = m.cols;
+  const auto count = static_cast<std::size_t>(rows) * cols;
+  if (target.raw.data) {
     FloatToBf16<<<Blocks(count), 256, 0, stream_>>>(
-        reinterpret_cast<const float*>(raw.data), Ptr(m), count);
+        reinterpret_cast<const float*>(target.raw.data), Ptr(m), count);
+    target.raw = {};
   }
   const bool packed_convolution = w.shape.size() == 4 && w.shape[2] == 3 &&
                                   w.shape[3] == 3 &&

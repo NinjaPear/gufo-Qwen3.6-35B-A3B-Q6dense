@@ -82,7 +82,7 @@ test-results/
 # source control. Keep the root anchored so similarly named fixture paths are
 # unaffected.
 /artifacts/
-/models/
+/models
 *.safetensors
 *.gguf
 *.ckpt
@@ -109,6 +109,8 @@ __pycache__/
 # Agent helpers
 .codegraph
 context.md
+# graphify: knowledge graph, report and converted sidecars live here
+graphify-out/
 
 # Uncommitted opt-in capability suites
 tests/quality/compsec.json

@@ -1,19 +1,14 @@
 #include "src/models/qwen_image_21/weights.hpp"
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <gufo/ext/mapped_prefetch.hpp>
+#include <gufo/ext/platform/mapped_file.hpp>
 #include <limits>
 #include <set>
 #include <stdexcept>
-
-#include "src/core/mapped_prefetch.hpp"
 
 namespace gufo::models::qwen_image_21 {
 namespace {
@@ -55,6 +50,53 @@ void ArrayEqual(const json::Value& object, std::string_view key,
 }
 
 }  // namespace
+
+SamplingConfig ReadSamplingConfig(const json::Value& index,
+                                  const json::Value& scheduler) {
+  SamplingConfig result;
+  if (const auto* values = index.find("sample_sigmas");
+      values && !values->is_null()) {
+    if (!values->is_array() || values->size() != 8)
+      throw std::runtime_error("Qwen-Image Turbo requires eight sample_sigmas");
+    for (const auto& value : values->items()) {
+      if (!value.is_number() || !std::isfinite(value.as_double()) ||
+          value.as_double() <= 0 || value.as_double() > 1)
+        throw std::runtime_error("invalid Qwen-Image Turbo sample_sigmas");
+      const float sigma = static_cast<float>(value.as_double());
+      if (sigma <= 0 ||
+          (!result.sample_sigmas.empty() &&
+           sigma >= result.sample_sigmas.back()) ||
+          (result.sample_sigmas.empty() && sigma != 1))
+        throw std::runtime_error(
+            "Qwen-Image Turbo sample_sigmas must decrease from one");
+      result.sample_sigmas.push_back(sigma);
+    }
+  }
+  if (scheduler.member_str("_class_name") != "FlowMatchEulerDiscreteScheduler")
+    throw std::runtime_error("unsupported Qwen-Image scheduler");
+  for (auto [key, value] : {std::pair{"base_image_seq_len", 256.0},
+                            {"max_image_seq_len", 8192.0},
+                            {"base_shift", 0.5},
+                            {"max_shift", 0.9},
+                            {"num_train_timesteps", 1000.0}})
+    Equal(scheduler, key, value);
+  if (scheduler.member_str("time_shift_type") != "exponential")
+    throw std::runtime_error("unsupported Qwen-Image flow schedule");
+  Boolean(scheduler, "use_dynamic_shifting", !result.IsTurbo());
+  if (result.IsTurbo()) {
+    const auto* terminal = scheduler.find("shift_terminal");
+    if (!terminal || !terminal->is_null())
+      throw std::runtime_error("Qwen-Image Turbo requires null shift_terminal");
+    Equal(scheduler, "shift", 1);
+  } else {
+    Equal(scheduler, "shift_terminal", 0.02);
+  }
+  for (const char* key :
+       {"invert_sigmas", "stochastic_sampling", "use_beta_sigmas",
+        "use_exponential_sigmas", "use_karras_sigmas"})
+    Boolean(scheduler, key, false);
+  return result;
+}
 
 json::Value ReadJson(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary | std::ios::ate);
@@ -157,22 +199,19 @@ Weights::Weights(const std::filesystem::path& root) {
         throw std::runtime_error("invalid VAE latent normalization");
   }
   const auto scheduler = ReadJson(root / "scheduler/scheduler_config.json");
-  for (auto [key, value] : {std::pair{"base_image_seq_len", 256.0},
-                            {"max_image_seq_len", 8192.0},
-                            {"base_shift", 0.5},
-                            {"max_shift", 0.9},
-                            {"shift_terminal", 0.02},
-                            {"num_train_timesteps", 1000.0}})
-    Equal(scheduler, key, value);
-  if (scheduler.member_str("time_shift_type") != "exponential" ||
-      !scheduler.find("use_dynamic_shifting") ||
-      !scheduler.find("use_dynamic_shifting")->as_bool())
-    throw std::runtime_error("unsupported Qwen-Image flow schedule");
-  for (const char* key :
-       {"invert_sigmas", "stochastic_sampling", "use_beta_sigmas",
-        "use_exponential_sigmas", "use_karras_sigmas"})
-    Boolean(scheduler, key, false);
-  const auto processor = ReadJson(root / "processor/preprocessor_config.json");
+  sampling_ = ReadSamplingConfig(index, scheduler);
+  json::Value processor;
+  const auto legacy_processor = root / "processor/preprocessor_config.json";
+  if (std::filesystem::exists(legacy_processor)) {
+    processor = ReadJson(legacy_processor);
+  } else {
+    const auto combined = ReadJson(root / "processor/processor_config.json");
+    const auto* image_processor = combined.find("image_processor");
+    if (!image_processor || !image_processor->is_object())
+      throw std::runtime_error(
+          "missing Qwen-Image image processor configuration");
+    processor = *image_processor;
+  }
   for (auto [key, value] : {std::pair{"patch_size", 16},
                             {"temporal_patch_size", 2},
                             {"merge_size", 2}})
@@ -190,9 +229,15 @@ Weights::Weights(const std::filesystem::path& root) {
         throw std::runtime_error("unsupported vision normalization");
   }
   for (const auto& [component, filename] :
-       {std::pair{"text_encoder", "model.safetensors.index.json"},
-        {"transformer", "diffusion_pytorch_model.safetensors.index.json"}}) {
-    const auto manifest = ReadJson(root / component / filename);
+       {std::pair{"text_encoder", "model.safetensors"},
+        {"transformer", "diffusion_pytorch_model.safetensors"}}) {
+    const auto single = root / component / filename;
+    if (std::filesystem::exists(single)) {
+      Load(single, std::string(component) + ".");
+      continue;
+    }
+    const auto manifest =
+        ReadJson(root / component / (std::string(filename) + ".index.json"));
     const auto* weight_map = manifest.find("weight_map");
     if (!weight_map || !weight_map->is_object())
       throw std::runtime_error("missing safetensors weight map");
@@ -217,21 +262,20 @@ Weights::Weights(const std::filesystem::path& root) {
 
 void Weights::Load(const std::filesystem::path& path,
                    const std::string& prefix) {
-  const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  struct stat st{};
-  if (fd < 0)
-    throw std::runtime_error("cannot open " + path.string());
-  if (fstat(fd, &st) != 0 || st.st_size < 8) {
-    close(fd);
-    throw std::runtime_error("invalid safetensors file " + path.string());
+  std::string open_error;
+  auto mapped = std::make_shared<platform::ReadOnlyMappedFile>(
+      platform::ReadOnlyMappedFile::Open(path, &open_error));
+  if (!mapped->valid() || mapped->size() < 8) {
+    throw std::runtime_error(open_error.empty()
+                                 ? "invalid safetensors file " + path.string()
+                                 : "cannot open " + path.string() + ": " +
+                                       open_error);
   }
-  const auto size = static_cast<std::size_t>(st.st_size);
-  void* data = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-  close(fd);
-  if (data == MAP_FAILED)
-    throw std::runtime_error("cannot map " + path.string());
-  auto owner =
-      std::shared_ptr<void>(data, [size](void* p) { munmap(p, size); });
+  const auto size = mapped->size();
+  const void* data = mapped->data();
+  // Retain the handle backing the mapping: reopening the pathname could read
+  // a replacement file with different tensor contents or offsets.
+  const auto file = mapped->PlatformHandle();
   std::uint64_t header_size;
   std::memcpy(&header_size, data, 8);
   if (!header_size || header_size > (32U << 20U) || header_size > size - 8)
@@ -270,6 +314,8 @@ void Weights::Load(const std::filesystem::path& path,
       throw std::runtime_error("invalid tensor extent " + name);
     weight.data = static_cast<const char*>(data) + 8 + header_size + begin;
     weight.bytes = bytes;
+    weight.file = static_cast<std::uint32_t>(files_.size());
+    weight.offset = 8 + header_size + begin;
     ranges.emplace_back(begin, end);
     if (!weights_.emplace(prefix + name, std::move(weight)).second)
       throw std::runtime_error("duplicate tensor " + name);
@@ -283,8 +329,12 @@ void Weights::Load(const std::filesystem::path& path,
   }
   if (cursor != payload_size)
     throw std::runtime_error("unexpected safetensors data");
-  mappings_.push_back(std::move(owner));
+  mappings_.push_back(std::move(mapped));
   regions_.emplace_back(static_cast<const std::byte*>(data), size);
+  files_.push_back({.data = data,
+                    .size = size,
+                    .file_descriptor = file,
+                    .source_path = path});
 }
 
 void Weights::Prefetch(std::string_view prefix) const {
@@ -303,6 +353,15 @@ void Weights::Prefetch(std::string_view prefix) const {
     if (end > begin)
       core::PrefaultMappedRange(region.data() + begin, end - begin);
   }
+}
+
+std::vector<std::pair<std::string_view, const Weight*>> Weights::Group(
+    std::string_view prefix) const {
+  std::vector<std::pair<std::string_view, const Weight*>> group;
+  for (auto it = weights_.lower_bound(prefix);
+       it != weights_.end() && it->first.starts_with(prefix); ++it)
+    group.emplace_back(it->first, &it->second);
+  return group;
 }
 
 const Weight& Weights::Get(std::string_view name) const {

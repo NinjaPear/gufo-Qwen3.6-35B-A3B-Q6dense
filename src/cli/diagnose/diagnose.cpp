@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/extension_diagnostics.hpp"
 #include "src/core/diagnostics/allocation_benchmark.h"
 #include "src/core/diagnostics/artifact_validator.h"
 #include "src/core/diagnostics/bandwidth.h"
@@ -56,7 +57,7 @@ void PrintDiagnoseHelp(std::string_view program_name) {
       << "  --output <path>              Write command output to specified "
          "file\n"
       << "  --section <name>             Diagnostic section to run: all, "
-         "inventory, platform, gpu\n"
+         "inventory, platform, gpu, extensions\n"
       << "  -h, --help                   Print help information\n";
 }
 
@@ -107,14 +108,16 @@ diagnostics::DiagnosticReport CollectDiagnostics(
   if (section == "all" || section == "platform" || section == "inventory") {
     diagnostics::DiagnosticCheck check;
     check.name = "platform";
-    if (inventory.cpu.architecture == "x86_64") {
+    const std::string& target = inventory.toolchain.target_platform;
+    check.details["targetArchitecture"] = target;
+    if (target == "x86_64-linux" || target == "x86_64-windows") {
       check.status = diagnostics::DiagnosticStatus::kPass;
-      check.message = "Supported architecture: Linux x86-64";
-      check.details["targetArchitecture"] = "x86_64-linux";
+      check.message =
+          "Supported architecture: " + inventory.toolchain.os_name + " x86-64";
     } else {
       check.status = diagnostics::DiagnosticStatus::kFail;
-      check.message =
-          "Unsupported target platform: only Linux x86-64 is supported";
+      check.message = "Unsupported target platform " + target +
+                      ": only Linux and Windows x86-64 are supported";
       report.AddError("Unsupported platform architecture detected");
     }
     report.AddCheck(std::move(check));
@@ -126,6 +129,7 @@ diagnostics::DiagnosticReport CollectDiagnostics(
     sys_check.name = "system";
     sys_check.status = diagnostics::DiagnosticStatus::kPass;
     sys_check.message = "Host operating system and kernel identified";
+    sys_check.details["osName"] = inventory.toolchain.os_name;
     sys_check.details["kernelRelease"] = inventory.toolchain.kernel_release;
     report.AddCheck(std::move(sys_check));
 
@@ -321,7 +325,7 @@ int RunDiagnose(std::span<const char* const> args) {
   }
 
   if (section != "all" && section != "inventory" && section != "platform" &&
-      section != "gpu") {
+      section != "gpu" && section != "extensions") {
     std::cerr << "Error: unknown diagnostic section '" << section << "'\n";
     return 2;
   }
@@ -405,9 +409,17 @@ int RunDiagnose(std::span<const char* const> args) {
     return 0;
   }
 
+  if (section == "extensions") {
+    OutputContent(ExtensionDiagnostics(json_mode), output_file);
+    return 0;
+  }
+
   // Handle default diagnostics report
   const auto report = CollectDiagnostics(diagnostics::LinuxSysfs(), section);
-  const std::string content = json_mode ? report.ToJson() : report.ToHuman();
+  const std::string content =
+      json_mode ? report.ToJson()
+                : report.ToHuman() +
+                      (section == "all" ? ExtensionDiagnostics(false) : "");
   OutputContent(content, output_file);
 
   if (report.Status() == diagnostics::DiagnosticStatus::kFail) {

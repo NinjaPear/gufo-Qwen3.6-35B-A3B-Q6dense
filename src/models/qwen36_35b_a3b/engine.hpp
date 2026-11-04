@@ -12,9 +12,9 @@
 
 #include "src/core/sampling.hpp"
 #include "src/core/session_mode.hpp"
-#include "src/models/qwen/tokenizer.hpp"
-#include "src/models/qwen/vision/encoder.hpp"
-#include "src/models/qwen/vision/prompt.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
+#include "src/families/qwen/vision/encoder.hpp"
+#include "src/families/qwen/vision/prompt.hpp"
 #include "src/models/qwen36_35b_a3b/config.hpp"
 #include "src/models/qwen36_35b_a3b/mtp_policy.hpp"
 #include "src/models/qwen36_35b_a3b/mtp_sampling.hpp"

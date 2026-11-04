@@ -16,8 +16,13 @@ prompt caching.
 
 This is an exhaustive list of functionalities and features offered by the gufo cli, the mapping between features and flags is not documented here and should be discovered using the `--help` command to avoid divergences between the implementation and the documentation.
 
-The supported modalities are LLM, image, video, and audio (TTS, ASR).
+The supported model types are LLM, image, video, audio (TTS, ASR), text
+embeddings and decision models.
+`gufo serve embedding` provides [EmbeddingGemma 2 text embeddings](SERVER.md#embeddings).
 `gufo serve image` provides [Qwen-Image-2.1 generation and editing](models/qwen-image-2.1/README.md).
+
+For Nix command generation and deployment validation, see
+[Nix serving from extension metadata](model-extensions/serving.md).
 
 ### LLM or text
 
@@ -31,6 +36,9 @@ The supported modalities are LLM, image, video, and audio (TTS, ASR).
 
 - `context` — maximum context capacity; memory use depends on the model and
   the number of resident sessions.
+- `enableYarn` — Qwen3.8-Flash-Next only: allow a `context` above the native
+  262144 tokens through static YaRN, which applies to every request. Required
+  above 262144 and rejected at or below it.
 - `prefillChunk` — prompt tokens processed between active decode steps in
   HTTP serving. Model runtimes choose their own internal prefill batch sizes.
 - `maxTokens` — maximum number of tokens a request may generate. In practice:
@@ -82,10 +90,16 @@ The supported modalities are LLM, image, video, and audio (TTS, ASR).
 
 - `cacheDisk` — enable an on-disk cache of computed prompt state, reused
   across requests and restarts. In practice: repeated or shared prompts get
-  much faster; costs disk space.
-- `cacheDiskBytes` — the maximum size of that cache on disk.
-- `cacheDiskStagingBytes` — scratch space used while writing new cache
-  entries. Must fit alongside `cacheDiskBytes`.
+  much faster; costs disk space. Give each Qwen27B or Flash-Next server its own
+  directory: one server owns it, and a second one fails at
+  startup.
+- `cacheDiskBytes` — the maximum size of that cache on disk. Qwen27B and Flash-Next also
+  count unfinished writes, and lowering it removes its oldest checkpoints
+  (by creation) at the next start.
+- `cacheDiskStagingBytes` — RAM used to move cache entries to and from disk.
+  Qwen27B and Flash-Next stream entries of any size through a 1 MiB buffer by default;
+  other models need it to hold a whole entry. See
+  [the server guide](SERVER.md) for the defaults.
 
 **Speculative decoding**
 
@@ -112,14 +126,25 @@ seed. Speed depends on acceptance and verification cost.
 
 - `maxPending` — maximum requests waiting in the queue. Over the limit,
   clients wait or are refused rather than exhausting memory.
-- `maxPendingPerClient` — the same cap but per client, so one client cannot
-  hog the whole queue.
+- `maxPendingPerClient` — the same cap but per client IP. It defaults to
+  `maxPending`; set it lower so one client cannot hog the whole queue.
 - `requestTimeoutMs` — requests are killed after this many milliseconds. In
   practice: prevents stuck requests from holding GPU sessions forever.
+- `stallTimeoutMs` — the server exits as `device_lost` when generation makes
+  no progress for this many milliseconds, so the service manager restarts
+  it. Off unless set; at least 60000.
 - `maxOutputBytes` — maximum response size per request.
 - `maxBufferedOutputBytes` — maximum generated-but-not-yet-delivered output
   buffered for one request; protects against slow clients.
 - `maxBufferedOutputTotal` — the same buffer budget across all requests.
+
+**Diagnostics**
+
+- `trace` — a file that receives every text request body, the prompt as the
+  model reads it, the raw generated text and the reply sent back, as JSON
+  Lines. In practice: turn it on to see why a client received broken output,
+  then delete the file, because it holds whole conversations. See
+  [content trace](SERVER.md#content-trace).
 
 **Hardware**
 
@@ -143,6 +168,23 @@ per audio chunk, so long files do not require one enormous context. The
 standalone `gufo transcribe` command also uses `--model` and `--context`;
 `--prompt` supplies optional transcription hints.
 
+Models that take an audio projector sidecar (an mmproj GGUF) accept
+`--mmproj` on `serve tts`, `serve asr`, `transcribe` and `speak`; without it
+the model's provider looks up its own. `transcribe --live` feeds the audio
+in 100 ms pieces to models with live transcription and prints text as it is
+decoded. `gufo speak` synthesizes speech (`--mode tts`) or answers a written
+or spoken message in interleaved text and speech (`--mode chat`) or in text
+(`--mode text`, optionally `--reasoning` and `--tools`) with speech models
+that provide it.
+
+### Decisions
+
+`gufo serve decision --model PATH [--mmproj GGUF]` serves decision models
+at `POST /v1/systemone`; `gufo decide --model PATH --request request.json`
+(or `--jsonl` on standard input) answers the same requests without HTTP.
+`--context` bounds the complete decision prompt (default 8192). Request and
+response shapes belong to the model.
+
 **Voices**
 
 - `voices` — named voice presets built from reference WAVs. Each entry is
@@ -164,33 +206,52 @@ gufo serve tts \
   --voice-lang narrator_ita=italian
 ```
 
+### Embeddings
+
+Use `gufo serve embedding --model DIR` to serve the EmbeddingGemma 2 text embedding model, `google/embeddinggemma-2`, at `POST /v1/embeddings`.  The model has 768 dimensions, an 8192-token context, and BF16 weights.  The process loads one checkpoint and refuses to start when `DIR` is not an EmbeddingGemma 2 checkpoint.
+
+- `model` (`-m`) is the EmbeddingGemma 2 model directory
+- `servedModelName` is the model ID that clients send and `/v1/models` reports, `embeddinggemma-2` by default
+- `defaultPromptName` names a prompt from the checkpoint's `config_sentence_transformers.json` that prefixes text inputs of requests without `prompt_name`; image-only and audio-only inputs stay unprefixed; none by default
+
+The command takes the shared server options but not `--sessions` or `--context`, because concurrent text requests share device batches on one encoder and the model fixes the context window.  The [server guide](SERVER.md#embeddings) lists the request fields, the limits, and the task prefixes the model expects.
+
+```sh
+gufo serve --port 8080 embedding --model ./models/embeddinggemma-2
+```
+
 ### Server options (all modalities)
 
 These apply to every modality, before or after the subcommand:
 
 - `host` / `port` — where to listen (`-i` / `-p`). In practice: set
   `--host 0.0.0.0` if you serve from inside a container, or the published
-  port will not answer.
+  port will not answer. Use `--host ::` to listen on IPv6 and IPv4 together.
 - `sessions` (`-j`) — preallocated GPU request sessions. In practice: more
   sessions means more requests can compute at once, at the cost of memory
-  per session. This option applies to LLM serving; image and speech servers
-  use their own bounded queues.
+  per session. This option applies to LLM serving; image and speech servers use
+  their own bounded queues. The embedding server packs waiting text requests
+  into shared device batches and runs each request with images in its own
+  batch. `--max-connections` bounds the waiting requests.
 - `maxConnections` — maximum simultaneous HTTP connections. In practice:
-  clients beyond the limit queue or are refused instead of piling up.
+  clients beyond the limit queue or are refused instead of piling up. A
+  connection stops counting once its response is fully written, so a client
+  that reads its reply and reconnects immediately is not refused while the
+  server is still closing the old connection. Connections that are only
+  closing can briefly add to the count of open sockets.
 - `maxRequestBytes` — maximum request body size. In practice: matters mostly
   for ASR, since requests carry whole audio files (the audio benchmark used
   32 MiB).
-- `apiKey` — if set, requests require `Authorization: Bearer <key>`, including
-  health checks. Browser CORS preflight (`OPTIONS`) remains unauthenticated.
 - `logLevel` (`--log-level <error|warn|info|debug>`, default `info`) — how much
   the server logs. In practice: `debug` is the level that explains a stalled
   client, because it also shows health polls, admission refusals with the limit
   that rejected them, and cache candidate decisions. `verbose` (`-v`) is
   shorthand for `--log-level=debug`; passing both is a usage error. The tier is
   a threshold all the way down, and the `event=listening` startup confirmation
-  is INFO-tier, so `warn` and `error` boot and stop silently. Prompt text,
-  message bodies and the API key are never logged at any level; debug admission
-  lines do name the client by the peer IP address of its connection. See
+  is INFO-tier, so `warn` and `error` boot and stop silently. Prompt text and
+  message bodies are never logged at any level; only the
+  separate, opt-in `trace` file records content. Debug admission lines do name
+  the client by the peer IP address of its connection. See
   [server logs](SERVER.md#troubleshooting-logs).
 
 ## Commands
@@ -203,6 +264,8 @@ gufo eval
 gufo bench
 gufo video
 gufo transcribe
+gufo speak
+gufo decide
 gufo diagnose
 ```
 
@@ -210,7 +273,8 @@ gufo diagnose
 conversation. `prompt` executes one request and exits. `eval` grades the pinned
 DS4 capability questions through an already running OpenAI-compatible server.
 `bench` measures model execution, `video` runs MiniMax H3 generation,
-`transcribe` runs native Qwen3-ASR-1.7B speech recognition, and `diagnose` runs
+`transcribe` runs speech recognition, `speak` runs speech synthesis and voice
+chat, `decide` answers decision requests, and `diagnose` runs
 non-interactive system and hardware diagnostics.
 
 All commands support `--help` and `--version`. Unknown options and invalid

@@ -24,10 +24,21 @@ public:
   [[nodiscard]] static std::unique_ptr<BlasLt> Create(hipStream_t stream,
                                                       std::string* error_msg);
 
+  /// Prepare descriptors and load the solution library without launching a
+  /// GEMM or reading model data. Gemm uses the same exact-shape plan.
+  [[nodiscard]] bool Prepare(hipDataType type, int m, int n, int k,
+                             std::string* error_msg);
   /// Row-major out[n][m] = input[n][k] * weights[m][k]^T.
   [[nodiscard]] bool Gemm(const void* weights, const void* input, float* out,
                           hipDataType type, int m, int n, int k,
                           std::string* error_msg);
+  /// Gemm through the library kernel even where Gemm runs its own kernel
+  /// (benchmarks compare the two).
+  [[nodiscard]] bool LibraryGemm(const void* weights, const void* input,
+                                 float* out, hipDataType type, int m, int n,
+                                 int k, std::string* error_msg);
+  /// Whether Gemm runs its own position-invariant kernel for this shape.
+  [[nodiscard]] static bool UsesOwnKernel(hipDataType type, int m, int k);
 
 private:
   BlasLt() = default;
@@ -35,6 +46,9 @@ private:
   struct Plan;
   std::unique_ptr<Plan> MakePlan(hipDataType type, int m, int n, int k,
                                  std::string* error_msg) const;
+  Plan* FindPlan(hipDataType type, int m, int n, int k, std::string* error_msg);
+  bool Run(Plan& plan, const void* weights, const void* input, float* out,
+           std::string* error_msg);
 
   hipblasLtHandle_t handle_{nullptr};
   hipStream_t stream_{nullptr};

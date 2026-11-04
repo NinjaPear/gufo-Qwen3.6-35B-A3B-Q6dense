@@ -2,7 +2,12 @@
 // Use the production CLI for generation and the session test for replay.
 //
 // gpu_probe --model FIRST_SHARD.gguf --prompt TEXT [--reference]
-//           [--batch T] [--context N] [--dump logits.bin]
+//           [--batch T] [--context N] [--yarn-factor F] [--dump logits.bin]
+//           [--logit-rows N] [--nll nll.bin]
+// The dump holds the last 64 rows of the final prefill pass, or with
+// --logit-rows the last N rows of every pass in position order. --nll
+// writes each position's negative log likelihood of the next prompt token
+// (float32, tokens - 1 values) and prints the mean.
 // Independent predictor oracle: --mtp-model MTP.gguf --mtp-audit
 // MTP cost calibration: --mtp-model MTP.gguf --cost-audit C (0 = all)
 //                      [--depth N] (default: 0, 4096, 32768)
@@ -18,12 +23,15 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
-#include "src/models/qwen/tokenizer.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
+#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
@@ -39,7 +47,8 @@ void AuditMtp(q::rocm::Executor& executor, const q::rocm::DeviceModel& device,
 void AuditMtpCosts(q::rocm::Executor& executor,
                    const gufo::tokenization::QwenTokenizer& tokenizer,
                    std::span<const std::uint32_t> depths,
-                   std::uint32_t concurrency);
+                   std::span<const std::uint32_t> concurrencies,
+                   bool sampled_head);
 
 namespace {
 
@@ -82,6 +91,8 @@ int main(int argc, char** argv) {
   std::string model_path;
   std::string prompt = "The capital of France is";
   std::string dump_path;
+  std::uint32_t every_pass_rows = 0;  ///< --logit-rows: rows kept per pass
+  std::string nll_path;
   std::string mtp_path;
   std::string decode_text;
   std::string decode_ids_path;
@@ -89,10 +100,12 @@ int main(int argc, char** argv) {
   bool mtp_audit = false;
   bool reference = false;
   bool cost_audit = false;
-  std::uint32_t cost_concurrency = 0;
+  bool sampled_head = false;
+  std::vector<std::uint32_t> cost_concurrencies;
   std::optional<std::uint32_t> cost_depth;
   std::uint32_t batch = 512;
   std::uint32_t context = 4096;
+  float yarn_factor = 1.0F;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     auto next = [&]() -> std::string {
@@ -104,17 +117,29 @@ int main(int argc, char** argv) {
       mtp_path = next();
     } else if (arg == "--mtp-audit") {
       mtp_audit = true;
+    } else if (arg == "--sampled-head") {
+      sampled_head = true;
     } else if (arg == "--cost-audit") {
       cost_audit = true;
       const auto value = next();
-      const auto [end, ec] = std::from_chars(
-          value.data(), value.data() + value.size(), cost_concurrency);
-      if (ec != std::errc{} || end != value.data() + value.size() ||
-          (cost_concurrency != 0 && cost_concurrency != 1 &&
-           cost_concurrency != 2 && cost_concurrency != 4 &&
-           cost_concurrency != 6 && cost_concurrency != 8)) {
-        std::fprintf(stderr, "--cost-audit requires C=0/1/2/4/6/8 (0 = all)\n");
-        return 2;
+      if (value != "0") {
+        const char* begin = value.data();
+        const char* finish = begin + value.size();
+        do {
+          std::uint32_t concurrency = 0;
+          const auto [end, ec] = std::from_chars(begin, finish, concurrency);
+          if (ec != std::errc{} || (end != finish && *end != ',') ||
+              (concurrency != 1 && concurrency != 2 && concurrency != 4 &&
+               concurrency != 6 && concurrency != 8) ||
+              (end != finish && end + 1 == finish)) {
+            std::fprintf(stderr,
+                         "--cost-audit requires 0 (all) or a list of "
+                         "1,2,4,6,8\n");
+            return 2;
+          }
+          cost_concurrencies.push_back(concurrency);
+          begin = end == finish ? finish : end + 1;
+        } while (begin != finish);
       }
     } else if (arg == "--depth") {
       const auto value = next();
@@ -157,8 +182,30 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s requires a positive integer\n", arg.c_str());
         return 2;
       }
+    } else if (arg == "--yarn-factor") {
+      const auto value = next();
+      const auto [end, ec] = std::from_chars(
+          value.data(), value.data() + value.size(), yarn_factor);
+      if (ec != std::errc{} || end != value.data() + value.size() ||
+          !(yarn_factor >= 1.0F)) {
+        std::fprintf(stderr, "--yarn-factor requires a number >= 1\n");
+        return 2;
+      }
     } else if (arg == "--dump") {
       dump_path = next();
+    } else if (arg == "--logit-rows") {
+      const auto value = next();
+      std::uint32_t rows = 0;
+      const auto [end, ec] =
+          std::from_chars(value.data(), value.data() + value.size(), rows);
+      if (ec != std::errc{} || end != value.data() + value.size() ||
+          rows == 0) {
+        std::fprintf(stderr, "--logit-rows requires a positive integer\n");
+        return 2;
+      }
+      every_pass_rows = rows;
+    } else if (arg == "--nll") {
+      nll_path = next();
     } else {
       std::fprintf(stderr, "unknown argument %s\n", arg.c_str());
       return 2;
@@ -180,12 +227,22 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "MTP audits require --mtp-model\n");
     return 2;
   }
+  if (!nll_path.empty() && (every_pass_rows != 0 || !dump_path.empty())) {
+    std::fprintf(stderr, "--nll cannot be combined with logit dumps\n");
+    return 2;
+  }
+  if ((every_pass_rows != 0 || !nll_path.empty()) &&
+      (reference || decode || cost_audit || mtp_audit)) {
+    std::fprintf(stderr,
+                 "--logit-rows and --nll apply to plain prefill runs only\n");
+    return 2;
+  }
   if (cost_audit && (mtp_audit || reference || !dump_path.empty())) {
     std::fprintf(stderr, "--cost-audit cannot be combined with other probes\n");
     return 2;
   }
-  if (cost_depth && !cost_audit) {
-    std::fprintf(stderr, "--depth requires --cost-audit\n");
+  if ((cost_depth || sampled_head) && !cost_audit) {
+    std::fprintf(stderr, "--depth and --sampled-head require --cost-audit\n");
     return 2;
   }
   std::string error;
@@ -204,6 +261,17 @@ int main(int argc, char** argv) {
   if (!tokenizer) {
     std::fprintf(stderr, "tokenizer failed: %s\n", error.c_str());
     return 1;
+  }
+  if (yarn_factor != 1.0F) {
+    const q::RopeScaling scaling{
+        .factor = yarn_factor,
+        .original_context = weights->config.context_length};
+    if (!q::ValidateRopeScaling(scaling, weights->config.context_length,
+                                &error)) {
+      std::fprintf(stderr, "invalid YaRN factor: %s\n", error.c_str());
+      return 2;
+    }
+    weights->config.rope_scaling = scaling;
   }
   const auto& c = weights->config;
   if (cost_depth &&
@@ -241,9 +309,25 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "upload failed: %s\n", error.c_str());
     return 1;
   }
+  if (sampled_head) {
+    std::vector<std::int32_t> specials;
+    for (std::uint32_t id = q::kMtpDraftVocab; id < c.vocab_size; ++id)
+      if (tokenizer->IsSpecialToken(id))
+        specials.push_back(id);
+    if (!device->SetDraftVocab(q::kMtpDraftVocab, std::move(specials),
+                               &error)) {
+      std::fprintf(stderr, "draft vocabulary failed: %s\n", error.c_str());
+      return 1;
+    }
+  }
   q::rocm::Executor::Options options;
   options.max_batch = batch;
-  options.max_logit_rows = std::min<std::uint32_t>(batch, 64);
+  options.max_context = context;
+  options.max_logit_rows =
+      !nll_path.empty()
+          ? batch
+          : std::min<std::uint32_t>(
+                batch, every_pass_rows != 0 ? every_pass_rows : 64);
   if (mtp_audit || cost_audit)
     options.max_speculative = 8;
 
@@ -263,7 +347,8 @@ int main(int argc, char** argv) {
       std::span<const std::uint32_t> selected_depths = depths;
       if (cost_depth)
         selected_depths = std::span(&*cost_depth, 1);
-      AuditMtpCosts(*executor, *tokenizer, selected_depths, cost_concurrency);
+      AuditMtpCosts(*executor, *tokenizer, selected_depths, cost_concurrencies,
+                    sampled_head);
       return 0;
     } catch (const std::exception& e) {
       std::fprintf(stderr, "cost audit failed: %s\n", e.what());
@@ -315,24 +400,70 @@ int main(int argc, char** argv) {
   }
 
   std::vector<float> gpu_logits;
+  std::vector<float> nll;  ///< --nll: per-position next-token NLL
   std::size_t logit_rows = 0;
   for (std::size_t off = 0; off < tokens.size(); off += batch) {
     const std::size_t n = std::min<std::size_t>(batch, tokens.size() - off);
     const auto rows = static_cast<std::uint32_t>(
         std::min<std::size_t>(n, options.max_logit_rows));
     std::vector<float> out(static_cast<std::size_t>(rows) * c.vocab_size);
+    // Name the following chunk as Session::Feed does, so its n-gram read
+    // overlaps this one.
+    const std::size_t next =
+        std::min<std::size_t>(batch, tokens.size() - off - n);
     if (!executor->Forward(
             *session, std::span<const std::int32_t>(tokens.data() + off, n),
-            rows, out.data(), q::rocm::Executor::ForwardMode::kPrefill,
-            &error)) {
+            rows, out.data(), q::rocm::Executor::ForwardMode::kPrefill, &error,
+            nullptr,
+            std::span<const std::int32_t>(tokens.data() + off + n, next))) {
       std::fprintf(stderr, "prefill failed: %s\n", error.c_str());
       return 1;
     }
     const bool last = off + n == tokens.size();
-    if (last) {
+    if (!nll_path.empty()) {
+      // Row i predicts token off + i + 1; rows split across threads.
+      const std::size_t scored = last ? n - 1 : n;
+      nll.resize(off + scored);
+      const unsigned workers =
+          std::max(1U, std::min(16U, std::thread::hardware_concurrency()));
+      std::vector<std::thread> pool;
+      for (unsigned w = 0; w < workers; ++w) {
+        pool.emplace_back([&, w] {
+          for (std::size_t i = w; i < scored; i += workers) {
+            const float* row = out.data() + i * c.vocab_size;
+            const float peak = *std::max_element(row, row + c.vocab_size);
+            double sum = 0.0;
+            for (std::size_t v = 0; v < c.vocab_size; ++v)
+              sum += std::exp(static_cast<double>(row[v]) - peak);
+            const auto target = static_cast<std::size_t>(tokens[off + i + 1]);
+            nll[off + i] = static_cast<float>(
+                std::log(sum) - (static_cast<double>(row[target]) - peak));
+          }
+        });
+      }
+      for (auto& t : pool)
+        t.join();
+    } else if (every_pass_rows != 0) {
+      gpu_logits.insert(gpu_logits.end(), out.begin(), out.end());
+      logit_rows += rows;
+    } else if (last) {
       gpu_logits = std::move(out);
       logit_rows = rows;
     }
+  }
+  if (!nll_path.empty()) {
+    std::ofstream file(nll_path, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(nll.data()),
+               static_cast<std::streamsize>(nll.size() * sizeof(float)));
+    if (!file) {
+      std::fprintf(stderr, "cannot write %s\n", nll_path.c_str());
+      return 1;
+    }
+    const double total = std::accumulate(nll.begin(), nll.end(), 0.0);
+    std::printf("nll %zu positions mean %.6f ppl %.4f\n", nll.size(),
+                total / static_cast<double>(nll.size()),
+                std::exp(total / static_cast<double>(nll.size())));
+    return 0;
   }
   if (decode) {
     // Matched-token decode: feed a fixed continuation one token at a time
@@ -381,6 +512,29 @@ int main(int argc, char** argv) {
     if (!dump) {
       std::fprintf(stderr, "cannot write logit dump %s\n", dump_path.c_str());
       return 1;
+    }
+    if (every_pass_rows != 0) {
+      // Which rows the dump holds: f32_reference.py checks it against the
+      // fixture, since another batch can give the same row count.
+      // FNV-1a over the token ids' little-endian bytes: the fixture's
+      // tokens.json must hold the same ids, not only the same count.
+      std::uint64_t ids_hash = 0xCBF29CE484222325ULL;
+      for (const std::int32_t id : tokens) {
+        const auto bits = static_cast<std::uint32_t>(id);
+        for (int byte = 0; byte < 4; ++byte) {
+          ids_hash ^= (bits >> (8 * byte)) & 0xFFU;
+          ids_hash *= 0x100000001B3ULL;
+        }
+      }
+      std::ofstream meta(dump_path + ".json");
+      meta << "{\"tokens\": " << tokens.size() << ", \"ids_fnv1a\": \""
+           << std::hex << ids_hash << std::dec << "\", \"batch\": " << batch
+           << ", \"rows_per_pass\": " << every_pass_rows
+           << ", \"rows\": " << logit_rows << "}\n";
+      if (!meta) {
+        std::fprintf(stderr, "cannot write %s.json\n", dump_path.c_str());
+        return 1;
+      }
     }
   }
 
